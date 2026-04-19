@@ -1,0 +1,41 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer MatrixBuffer {
+    uint matrix_data[];
+};
+
+layout(std430, binding = 1) readonly buffer VectorBuffer {
+    uint vector_data[];
+};
+
+layout(std430, binding = 2) writeonly buffer OutputBuffer {
+    float output_data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+    uint packed_cols;
+} pc;
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+
+    float sum = 0.0;
+    uint row_offset = row * pc.packed_cols;
+    for (uint pair_idx = 0; pair_idx < pc.packed_cols; ++pair_idx) {
+        vec2 m = unpackHalf2x16(matrix_data[row_offset + pair_idx]);
+        vec2 v = unpackHalf2x16(vector_data[pair_idx]);
+        uint col0 = pair_idx * 2;
+        sum += m.x * v.x;
+        if (col0 + 1 < pc.cols) {
+            sum += m.y * v.y;
+        }
+    }
+    output_data[row] = sum;
+}
