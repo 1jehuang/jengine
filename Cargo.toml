@@ -47,3 +47,7 @@ harness = false
 [[bench]]
 name = "repack_ops"
 harness = false
+
+[[bench]]
+name = "packed_io"
+harness = false
