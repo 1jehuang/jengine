@@ -2,7 +2,7 @@ use crate::cpu::block::{YarnRope, build_yarn_rope, rope_cos_sin};
 use crate::cpu::primitives::{argmax, swiglu};
 use crate::gpu::packed_matvec::run_packed_ternary_matvec_with_output;
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
-use crate::model::tokenizer::TokenizerRuntime;
+use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
 use crate::runtime::weights::{WeightError, WeightStore};
@@ -125,6 +125,19 @@ pub struct DecodeMetrics {
 }
 
 impl DecodeMetrics {
+    pub fn generated_tokens_per_second(&self) -> f64 {
+        let seconds = self.total_duration.as_secs_f64();
+        if self.generated_tokens == 0 || seconds <= f64::EPSILON {
+            0.0
+        } else {
+            self.generated_tokens as f64 / seconds
+        }
+    }
+
+    pub fn total_sequence_tokens(&self) -> usize {
+        self.prompt_tokens + self.generated_tokens
+    }
+
     pub fn summarize(&self) -> String {
         format!(
             "prompt_tokens={} generated_tokens={} total_ms={:.3} embed_ms={:.3} norm_ms={:.3} qkv_ms={:.3} attention_ms={:.3} mlp_ms={:.3} logits_ms={:.3}",
@@ -137,6 +150,40 @@ impl DecodeMetrics {
             self.attention_duration.as_secs_f64() * 1_000.0,
             self.mlp_duration.as_secs_f64() * 1_000.0,
             self.logits_duration.as_secs_f64() * 1_000.0,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryReport {
+    pub prompt_tokens: usize,
+    pub generated_tokens: usize,
+    pub total_sequence_tokens: usize,
+    pub estimated_model_fp16_bytes: usize,
+    pub kv_cache_bytes_per_token_fp16: usize,
+    pub kv_cache_bytes_per_token_runtime_f32: usize,
+    pub kv_cache_total_bytes_fp16: usize,
+    pub kv_cache_total_bytes_runtime_f32: usize,
+    pub estimated_runtime_working_set_bytes: usize,
+}
+
+impl MemoryReport {
+    pub fn summarize(&self) -> String {
+        format!(
+            "prompt_tokens={} generated_tokens={} total_sequence_tokens={} model_fp16_bytes={} ({}) kv_per_token_fp16={} ({}) kv_per_token_runtime_f32={} ({}) kv_total_runtime_f32={} ({}) working_set_bytes={} ({})",
+            self.prompt_tokens,
+            self.generated_tokens,
+            self.total_sequence_tokens,
+            self.estimated_model_fp16_bytes,
+            human_bytes(self.estimated_model_fp16_bytes),
+            self.kv_cache_bytes_per_token_fp16,
+            human_bytes(self.kv_cache_bytes_per_token_fp16),
+            self.kv_cache_bytes_per_token_runtime_f32,
+            human_bytes(self.kv_cache_bytes_per_token_runtime_f32),
+            self.kv_cache_total_bytes_runtime_f32,
+            human_bytes(self.kv_cache_total_bytes_runtime_f32),
+            self.estimated_runtime_working_set_bytes,
+            human_bytes(self.estimated_runtime_working_set_bytes),
         )
     }
 }
@@ -200,6 +247,40 @@ impl ReferenceModel {
             &model.assets.tokenizer_json,
         )?);
         Ok(model)
+    }
+
+    pub fn prompt_analysis(&self, prompt: &str) -> Result<PromptAnalysis, ReferenceError> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
+        Ok(tokenizer.analyze_prompt(prompt)?)
+    }
+
+    pub fn tokenizer_diagnostics(&self) -> Option<TokenizerDiagnostics> {
+        self.tokenizer.as_ref().map(TokenizerRuntime::diagnostics)
+    }
+
+    pub fn memory_report(&self, prompt_tokens: usize, generated_tokens: usize) -> MemoryReport {
+        let total_sequence_tokens = prompt_tokens + generated_tokens;
+        let estimated_model_fp16_bytes = self.config.approx_fp16_bytes();
+        let kv_cache_bytes_per_token_fp16 = self.config.kv_cache_bytes_per_token(1, 2);
+        let kv_cache_bytes_per_token_runtime_f32 = self.config.kv_cache_bytes_per_token(1, 4);
+        let kv_cache_total_bytes_fp16 = self.config.kv_cache_bytes(total_sequence_tokens, 1, 2);
+        let kv_cache_total_bytes_runtime_f32 =
+            self.config.kv_cache_bytes(total_sequence_tokens, 1, 4);
+        MemoryReport {
+            prompt_tokens,
+            generated_tokens,
+            total_sequence_tokens,
+            estimated_model_fp16_bytes,
+            kv_cache_bytes_per_token_fp16,
+            kv_cache_bytes_per_token_runtime_f32,
+            kv_cache_total_bytes_fp16,
+            kv_cache_total_bytes_runtime_f32,
+            estimated_runtime_working_set_bytes: estimated_model_fp16_bytes
+                + kv_cache_total_bytes_runtime_f32,
+        }
     }
 
     pub fn generate_greedy(
@@ -784,6 +865,17 @@ impl ReferenceModel {
     }
 }
 
+fn human_bytes(bytes: usize) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.2} {}", UNITS[unit])
+}
+
 fn weighted_rms_norm(input: &[f32], weight: &[f32], epsilon: f32) -> Vec<f32> {
     assert_eq!(
         input.len(),
@@ -1060,6 +1152,17 @@ mod tests {
             .expect("hybrid decode should succeed");
         assert!(result.total_duration > Duration::ZERO);
         assert!(result.summarize().contains("qproj_gpu_ms="));
+    }
+
+    #[test]
+    fn reports_memory_estimates_on_synthetic_model() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let model = ReferenceModel::load_from_root(dir.path()).expect("model should load");
+        let report = model.memory_report(3, 2);
+        assert_eq!(report.total_sequence_tokens, 5);
+        assert!(report.kv_cache_total_bytes_runtime_f32 > 0);
+        assert!(report.summarize().contains("working_set_bytes="));
     }
 
     use std::time::Duration;

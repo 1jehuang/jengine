@@ -69,6 +69,22 @@ impl PromptAnalysis {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenizerDiagnostics {
+    pub source_path: PathBuf,
+    pub vocab_size: usize,
+}
+
+impl TokenizerDiagnostics {
+    pub fn summarize(&self) -> String {
+        format!(
+            "tokenizer_source={} vocab_size={}",
+            self.source_path.display(),
+            self.vocab_size,
+        )
+    }
+}
+
 pub struct TokenizerRuntime {
     source_path: PathBuf,
     tokenizer: Tokenizer,
@@ -110,6 +126,13 @@ impl TokenizerRuntime {
 
     pub fn vocab_size(&self) -> usize {
         self.tokenizer.get_vocab_size(false)
+    }
+
+    pub fn diagnostics(&self) -> TokenizerDiagnostics {
+        TokenizerDiagnostics {
+            source_path: self.source_path.clone(),
+            vocab_size: self.vocab_size(),
+        }
     }
 
     pub fn encode(&self, prompt: &str) -> Result<Vec<u32>, TokenizerLoadError> {

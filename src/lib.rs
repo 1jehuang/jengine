@@ -3,6 +3,7 @@
 pub mod cpu;
 pub mod gpu;
 pub mod model;
+pub mod report;
 pub mod runtime;
 
 /// Returns the project name.
