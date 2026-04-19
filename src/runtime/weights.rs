@@ -41,6 +41,32 @@ impl From<safetensors::SafeTensorError> for WeightError {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadProgress {
+    pub file_bytes: u64,
+    pub header_bytes: usize,
+    pub total_tensors: usize,
+    pub available_tensors: usize,
+    pub max_complete_layer: Option<usize>,
+    pub next_missing_tensor: Option<String>,
+}
+
+impl DownloadProgress {
+    pub fn summarize(&self) -> String {
+        format!(
+            "file_bytes={} header_bytes={} available_tensors={} total_tensors={} max_complete_layer={:?} next_missing_tensor={}",
+            self.file_bytes,
+            self.header_bytes,
+            self.available_tensors,
+            self.total_tensors,
+            self.max_complete_layer,
+            self.next_missing_tensor
+                .clone()
+                .unwrap_or_else(|| "<none>".to_string()),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WeightProbe {
     pub tensor_count: usize,
@@ -67,6 +93,66 @@ pub struct WeightStore {
 }
 
 impl WeightStore {
+    pub fn download_progress(path: impl AsRef<Path>) -> Result<DownloadProgress, WeightError> {
+        let path = path.as_ref();
+        let file_bytes = fs::metadata(path)?.len();
+        let mut file = fs::File::open(path)?;
+        let mut len_buf = [0u8; 8];
+        use std::io::Read;
+        file.read_exact(&mut len_buf)?;
+        let header_len = u64::from_le_bytes(len_buf) as usize;
+        let mut header_buf = vec![0u8; header_len];
+        file.read_exact(&mut header_buf)?;
+        let header: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&header_buf).map_err(|error| {
+                WeightError::Shape(format!("invalid safetensors header: {error}"))
+            })?;
+
+        let mut available_tensors = 0usize;
+        let mut total_tensors = 0usize;
+        let mut max_complete_layer = None;
+        let mut next_missing_tensor = None;
+
+        for (name, info) in &header {
+            if name == "__metadata__" {
+                continue;
+            }
+            total_tensors += 1;
+            let offsets = info
+                .get("data_offsets")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| WeightError::Shape(format!("tensor {name} missing data_offsets")))?;
+            let end = offsets[1].as_u64().ok_or_else(|| {
+                WeightError::Shape(format!("tensor {name} has invalid end offset"))
+            })?;
+            let abs_end = 8u64 + header_len as u64 + end;
+            if abs_end <= file_bytes {
+                available_tensors += 1;
+                if let Some(layer) = name.strip_prefix("model.layers.")
+                    && let Some(layer_id) = layer
+                        .split('.')
+                        .next()
+                        .and_then(|value| value.parse::<usize>().ok())
+                {
+                    max_complete_layer = Some(
+                        max_complete_layer.map_or(layer_id, |current: usize| current.max(layer_id)),
+                    );
+                }
+            } else if next_missing_tensor.is_none() {
+                next_missing_tensor = Some(name.clone());
+            }
+        }
+
+        Ok(DownloadProgress {
+            file_bytes,
+            header_bytes: header_len,
+            total_tensors,
+            available_tensors,
+            max_complete_layer,
+            next_missing_tensor,
+        })
+    }
+
     pub fn load_from_assets(paths: &BonsaiAssetPaths) -> Result<Self, WeightError> {
         Self::load_from_file(&paths.safetensors_path)
     }
