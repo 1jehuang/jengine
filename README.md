@@ -2,24 +2,33 @@
 
 A Rust inference runtime for compact LLMs.
 
-## Vision
+## Immediate goal
 
-Jengine is intended to be a local-first inference engine with a strong systems focus:
+Get the smallest PrismML Bonsai model, `Ternary-Bonsai-1.7B`, running locally today with:
 
-- Rust runtime core
-- custom GPU backend
-- Vulkan compute path
-- compact-model friendly
-- experimental ternary-weight support
+- a correct CPU reference path first
+- validation against known model metadata
+- measurable benchmarks at every layer
+- profiling and live analysis built in from the start
 
-## Initial scope
+## Strategy
 
-- model loading
-- weight conversion / packing
-- CPU reference kernels
-- Vulkan GPU backend
-- validation and benchmarking
+Jengine will be built in layers:
+
+1. application / CLI
+2. inference runtime
+3. CPU reference backend
+4. GPU backend
+5. Vulkan interface
+
+We will get correctness first on CPU, then repack and accelerate.
+
+## Docs
+
+- `docs/PLAN.md` - execution plan and milestones
+- `docs/QUALITY_GATES.md` - required checks for every code chunk
+- `docs/BONSAI_1_7B.md` - concrete model notes and constraints
 
 ## Status
 
-Project scaffold.
+Planning and tooling scaffold is in place.
