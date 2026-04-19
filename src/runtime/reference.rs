@@ -1,5 +1,6 @@
 use crate::cpu::block::{YarnRope, build_yarn_rope, rope_cos_sin};
 use crate::cpu::primitives::{argmax, swiglu};
+use crate::gpu::packed_matvec::run_packed_ternary_matvec_with_output;
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::TokenizerRuntime;
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
@@ -70,6 +71,31 @@ pub struct ProjectionComparison {
     pub mean_abs_diff: f32,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct HybridDecodeMetrics {
+    pub total_duration: Duration,
+    pub q_proj_pack_duration: Duration,
+    pub q_proj_gpu_compile_duration: Duration,
+    pub q_proj_gpu_upload_duration: Duration,
+    pub q_proj_gpu_duration: Duration,
+    pub q_proj_gpu_download_duration: Duration,
+    pub output_text: String,
+}
+
+impl HybridDecodeMetrics {
+    pub fn summarize(&self) -> String {
+        format!(
+            "total_ms={:.3} qproj_pack_ms={:.3} qproj_gpu_compile_ms={:.3} qproj_gpu_upload_ms={:.3} qproj_gpu_ms={:.3} qproj_gpu_download_ms={:.3} output={}",
+            self.total_duration.as_secs_f64() * 1_000.0,
+            self.q_proj_pack_duration.as_secs_f64() * 1_000.0,
+            self.q_proj_gpu_compile_duration.as_secs_f64() * 1_000.0,
+            self.q_proj_gpu_upload_duration.as_secs_f64() * 1_000.0,
+            self.q_proj_gpu_duration.as_secs_f64() * 1_000.0,
+            self.q_proj_gpu_download_duration.as_secs_f64() * 1_000.0,
+            self.output_text,
+        )
+    }
+}
 impl ProjectionComparison {
     pub fn summarize(&self) -> String {
         format!(
@@ -126,6 +152,16 @@ pub struct DecodeResult {
 struct LayerCache {
     keys: Vec<f32>,
     values: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct HybridQProjCache {
+    layer_idx: usize,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    code_words: Vec<u32>,
+    scales: Vec<f32>,
 }
 
 pub struct ReferenceModel {
@@ -322,6 +358,129 @@ impl ReferenceModel {
         ))
     }
 
+    pub fn benchmark_hybrid_qproj_decode(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        layer_idx: usize,
+    ) -> Result<HybridDecodeMetrics, ReferenceError> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
+        let prompt_ids = tokenizer
+            .encode(prompt)?
+            .into_iter()
+            .map(|id| id as usize)
+            .collect::<Vec<_>>();
+        if prompt_ids.is_empty() {
+            return Err(ReferenceError::Decode(
+                "prompt encoded to zero tokens".to_string(),
+            ));
+        }
+
+        let tensor_name = format!("model.layers.{layer_idx}.self_attn.q_proj.weight");
+        let values = self.weights.load_vector_f32(&tensor_name)?;
+        let pack_started = Instant::now();
+        let (packed, _) = pack_ternary_g128(
+            &values,
+            vec![self.config.hidden_size, self.config.hidden_size],
+            1e-3,
+        )
+        .map_err(|error| ReferenceError::Decode(format!("pack failed: {error}")))?;
+        let q_proj_pack_duration = pack_started.elapsed();
+        let code_words = packed
+            .packed_codes
+            .chunks(4)
+            .map(|chunk| {
+                let mut word = 0u32;
+                for (i, byte) in chunk.iter().enumerate() {
+                    word |= (*byte as u32) << (i * 8);
+                }
+                word
+            })
+            .collect::<Vec<_>>();
+        let hybrid = HybridQProjCache {
+            layer_idx,
+            rows: self.config.hidden_size,
+            cols: self.config.hidden_size,
+            group_size: packed.group_size,
+            code_words,
+            scales: packed.scales,
+        };
+
+        let total_started = Instant::now();
+        let mut metrics = DecodeMetrics {
+            prompt_tokens: prompt_ids.len(),
+            generated_tokens: 0,
+            total_duration: Duration::ZERO,
+            embedding_duration: Duration::ZERO,
+            norm_duration: Duration::ZERO,
+            qkv_duration: Duration::ZERO,
+            attention_duration: Duration::ZERO,
+            mlp_duration: Duration::ZERO,
+            logits_duration: Duration::ZERO,
+        };
+        let mut cache = (0..self.config.num_hidden_layers)
+            .map(|_| LayerCache {
+                keys: Vec::new(),
+                values: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut compile = Duration::ZERO;
+        let mut upload = Duration::ZERO;
+        let mut gpu = Duration::ZERO;
+        let mut download = Duration::ZERO;
+        let mut last_logits = Vec::new();
+
+        for (position, &token_id) in prompt_ids.iter().enumerate() {
+            let (logits, c, u, g, d) = self.forward_step_hybrid_qproj(
+                token_id,
+                position,
+                &mut cache,
+                &mut metrics,
+                &hybrid,
+            )?;
+            last_logits = logits;
+            compile += c;
+            upload += u;
+            gpu += g;
+            download += d;
+        }
+        let mut output_ids = prompt_ids.clone();
+        for generation_index in 0..max_new_tokens {
+            let next_token = argmax(&last_logits).ok_or_else(|| {
+                ReferenceError::Decode("argmax failed on empty logits".to_string())
+            })?;
+            output_ids.push(next_token);
+            metrics.generated_tokens += 1;
+            let (logits, c, u, g, d) = self.forward_step_hybrid_qproj(
+                next_token,
+                prompt_ids.len() + generation_index,
+                &mut cache,
+                &mut metrics,
+                &hybrid,
+            )?;
+            last_logits = logits;
+            compile += c;
+            upload += u;
+            gpu += g;
+            download += d;
+        }
+        let output_text =
+            tokenizer.decode(&output_ids.iter().map(|id| *id as u32).collect::<Vec<_>>())?;
+
+        Ok(HybridDecodeMetrics {
+            total_duration: total_started.elapsed(),
+            q_proj_pack_duration,
+            q_proj_gpu_compile_duration: compile,
+            q_proj_gpu_upload_duration: upload,
+            q_proj_gpu_duration: gpu,
+            q_proj_gpu_download_duration: download,
+            output_text,
+        })
+    }
+
     fn forward_step(
         &self,
         token_id: usize,
@@ -459,6 +618,169 @@ impl ReferenceModel {
             .matvec_f16("model.embed_tokens.weight", &hidden)?;
         metrics.logits_duration += started_at.elapsed();
         Ok(logits)
+    }
+
+    fn forward_step_hybrid_qproj(
+        &self,
+        token_id: usize,
+        position: usize,
+        cache: &mut [LayerCache],
+        metrics: &mut DecodeMetrics,
+        hybrid: &HybridQProjCache,
+    ) -> Result<(Vec<f32>, Duration, Duration, Duration, Duration), ReferenceError> {
+        let started_at = Instant::now();
+        let mut hidden = self
+            .weights
+            .embedding_lookup("model.embed_tokens.weight", token_id)?;
+        metrics.embedding_duration += started_at.elapsed();
+
+        let (cos, sin) = rope_cos_sin(&self.rope, &[position]);
+        let mut compile = Duration::ZERO;
+        let mut upload = Duration::ZERO;
+        let mut gpu = Duration::ZERO;
+        let mut download = Duration::ZERO;
+
+        for (layer_idx, layer_cache) in cache
+            .iter_mut()
+            .enumerate()
+            .take(self.config.num_hidden_layers)
+        {
+            let prefix = format!("model.layers.{layer_idx}");
+            let residual = hidden.clone();
+
+            let started_at = Instant::now();
+            let input_norm_weight = self
+                .weights
+                .load_vector_f32(&format!("{prefix}.input_layernorm.weight"))?;
+            let mut hidden_states =
+                weighted_rms_norm(&hidden, &input_norm_weight, self.config.rms_norm_eps as f32);
+            metrics.norm_duration += started_at.elapsed();
+
+            let started_at = Instant::now();
+            let mut q = if layer_idx == hybrid.layer_idx {
+                let (out, report) = run_packed_ternary_matvec_with_output(
+                    &hybrid.code_words,
+                    &hybrid.scales,
+                    hybrid.group_size,
+                    hybrid.rows,
+                    hybrid.cols,
+                    &hidden_states,
+                    None,
+                )
+                .map_err(|error| {
+                    ReferenceError::Decode(format!("gpu packed q_proj failed: {error}"))
+                })?;
+                compile += report.compile_duration;
+                upload += report.upload_duration;
+                gpu += report.gpu_duration;
+                download += report.download_duration;
+                out
+            } else {
+                self.weights
+                    .matvec_f16(&format!("{prefix}.self_attn.q_proj.weight"), &hidden_states)?
+            };
+            let mut k = self
+                .weights
+                .matvec_f16(&format!("{prefix}.self_attn.k_proj.weight"), &hidden_states)?;
+            let v = self
+                .weights
+                .matvec_f16(&format!("{prefix}.self_attn.v_proj.weight"), &hidden_states)?;
+            metrics.qkv_duration += started_at.elapsed();
+
+            let started_at = Instant::now();
+            let q_norm_weight = self
+                .weights
+                .load_vector_f32(&format!("{prefix}.self_attn.q_norm.weight"))?;
+            let k_norm_weight = self
+                .weights
+                .load_vector_f32(&format!("{prefix}.self_attn.k_norm.weight"))?;
+            apply_head_rms_norm_weighted(
+                &mut q,
+                self.config.num_attention_heads,
+                self.config.head_dim,
+                &q_norm_weight,
+                self.config.rms_norm_eps as f32,
+            );
+            apply_head_rms_norm_weighted(
+                &mut k,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+                &k_norm_weight,
+                self.config.rms_norm_eps as f32,
+            );
+            apply_rotary_single(
+                &mut q,
+                &mut k,
+                &cos,
+                &sin,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+            );
+            metrics.norm_duration += started_at.elapsed();
+
+            let started_at = Instant::now();
+            layer_cache.keys.extend_from_slice(&k);
+            layer_cache.values.extend_from_slice(&v);
+            let attn = attention_single_query(
+                &q,
+                &layer_cache.keys,
+                &layer_cache.values,
+                position + 1,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+            );
+            let attn_output = self
+                .weights
+                .matvec_f16(&format!("{prefix}.self_attn.o_proj.weight"), &attn)?;
+            hidden = residual
+                .iter()
+                .zip(attn_output.iter())
+                .map(|(left, right)| left + right)
+                .collect();
+            metrics.attention_duration += started_at.elapsed();
+
+            let residual = hidden.clone();
+            let started_at = Instant::now();
+            let post_norm_weight = self
+                .weights
+                .load_vector_f32(&format!("{prefix}.post_attention_layernorm.weight"))?;
+            hidden_states =
+                weighted_rms_norm(&hidden, &post_norm_weight, self.config.rms_norm_eps as f32);
+            metrics.norm_duration += started_at.elapsed();
+
+            let started_at = Instant::now();
+            let gate = self
+                .weights
+                .matvec_f16(&format!("{prefix}.mlp.gate_proj.weight"), &hidden_states)?;
+            let up = self
+                .weights
+                .matvec_f16(&format!("{prefix}.mlp.up_proj.weight"), &hidden_states)?;
+            let mlp = swiglu(&gate, &up);
+            let down = self
+                .weights
+                .matvec_f16(&format!("{prefix}.mlp.down_proj.weight"), &mlp)?;
+            hidden = residual
+                .iter()
+                .zip(down.iter())
+                .map(|(left, right)| left + right)
+                .collect();
+            metrics.mlp_duration += started_at.elapsed();
+        }
+
+        let started_at = Instant::now();
+        let final_norm_weight = self.weights.load_vector_f32("model.norm.weight")?;
+        let hidden =
+            weighted_rms_norm(&hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
+        metrics.norm_duration += started_at.elapsed();
+
+        let started_at = Instant::now();
+        let logits = self
+            .weights
+            .matvec_f16("model.embed_tokens.weight", &hidden)?;
+        metrics.logits_duration += started_at.elapsed();
+        Ok((logits, compile, upload, gpu, download))
     }
 }
 
@@ -726,6 +1048,18 @@ mod tests {
         assert_eq!(result.metrics.generated_tokens, 1);
         assert!(result.metrics.logits_duration > Duration::ZERO);
         assert!(result.metrics.summarize().contains("generated_tokens=1"));
+    }
+
+    #[test]
+    fn benchmarks_hybrid_qproj_decode_on_synthetic_model() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let model = ReferenceModel::load_from_root(dir.path()).expect("model should load");
+        let result = model
+            .benchmark_hybrid_qproj_decode("tok2", 1, 0)
+            .expect("hybrid decode should succeed");
+        assert!(result.total_duration > Duration::ZERO);
+        assert!(result.summarize().contains("qproj_gpu_ms="));
     }
 
     use std::time::Duration;

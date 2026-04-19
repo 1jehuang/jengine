@@ -12,7 +12,9 @@ pub struct GpuPackedMatvecReport {
     pub rows: usize,
     pub cols: usize,
     pub compile_duration: Duration,
+    pub upload_duration: Duration,
     pub gpu_duration: Duration,
+    pub download_duration: Duration,
     pub max_abs_diff: f32,
     pub mean_abs_diff: f32,
 }
@@ -20,11 +22,13 @@ pub struct GpuPackedMatvecReport {
 impl GpuPackedMatvecReport {
     pub fn summarize(&self) -> String {
         format!(
-            "rows={} cols={} compile_ms={:.3} gpu_ms={:.3} max_abs_diff={:.6} mean_abs_diff={:.6}",
+            "rows={} cols={} compile_ms={:.3} upload_ms={:.3} gpu_ms={:.3} download_ms={:.3} max_abs_diff={:.6} mean_abs_diff={:.6}",
             self.rows,
             self.cols,
             self.compile_duration.as_secs_f64() * 1_000.0,
+            self.upload_duration.as_secs_f64() * 1_000.0,
             self.gpu_duration.as_secs_f64() * 1_000.0,
+            self.download_duration.as_secs_f64() * 1_000.0,
             self.max_abs_diff,
             self.mean_abs_diff,
         )
@@ -94,6 +98,27 @@ pub fn run_packed_ternary_matvec(
     input: &[f32],
     reference: &[f32],
 ) -> Result<GpuPackedMatvecReport, GpuPackedMatvecError> {
+    let (_, report) = run_packed_ternary_matvec_with_output(
+        code_words,
+        scales,
+        group_size,
+        rows,
+        cols,
+        input,
+        Some(reference),
+    )?;
+    Ok(report)
+}
+
+pub fn run_packed_ternary_matvec_with_output(
+    code_words: &[u32],
+    scales: &[f32],
+    group_size: usize,
+    rows: usize,
+    cols: usize,
+    input: &[f32],
+    reference: Option<&[f32]>,
+) -> Result<(Vec<f32>, GpuPackedMatvecReport), GpuPackedMatvecError> {
     let compile_started = Instant::now();
     let shader_path = compile_shader(Path::new("shaders/packed_ternary_matvec.comp"))?;
     let compile_duration = compile_started.elapsed();
@@ -152,10 +177,12 @@ pub fn run_packed_ternary_matvec(
         vk::BufferUsageFlags::STORAGE_BUFFER,
     )?;
 
+    let upload_started = Instant::now();
     write_u32_buffer(&device, code_buffer.memory, code_words)?;
     write_f32_buffer(&device, scale_buffer.memory, scales)?;
     write_u32_buffer(&device, vector_buffer.memory, &vector_words)?;
     zero_buffer(&device, output_buffer.memory, output_bytes)?;
+    let upload_duration = upload_started.elapsed();
 
     let descriptor_layout_bindings = [
         vk::DescriptorSetLayoutBinding::default()
@@ -317,8 +344,13 @@ pub fn run_packed_ternary_matvec(
     }
     let gpu_duration = gpu_started.elapsed();
 
+    let download_started = Instant::now();
     let gpu_output = read_f32_buffer(&device, output_buffer.memory, rows)?;
-    let (max_abs_diff, mean_abs_diff) = compare_outputs(reference, &gpu_output);
+    let download_duration = download_started.elapsed();
+    let (max_abs_diff, mean_abs_diff) = match reference {
+        Some(reference) => compare_outputs(reference, &gpu_output),
+        None => (0.0, 0.0),
+    };
 
     unsafe {
         device.destroy_fence(fence, None);
@@ -337,14 +369,19 @@ pub fn run_packed_ternary_matvec(
     }
     let _ = std::fs::remove_file(shader_path);
 
-    Ok(GpuPackedMatvecReport {
-        rows,
-        cols,
-        compile_duration,
-        gpu_duration,
-        max_abs_diff,
-        mean_abs_diff,
-    })
+    Ok((
+        gpu_output,
+        GpuPackedMatvecReport {
+            rows,
+            cols,
+            compile_duration,
+            upload_duration,
+            gpu_duration,
+            download_duration,
+            max_abs_diff,
+            mean_abs_diff,
+        },
+    ))
 }
 
 #[derive(Debug, Clone, Copy)]
