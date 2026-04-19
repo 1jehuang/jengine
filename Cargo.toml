@@ -43,3 +43,7 @@ harness = false
 [[bench]]
 name = "end_to_end_reference"
 harness = false
+
+[[bench]]
+name = "repack_ops"
+harness = false
