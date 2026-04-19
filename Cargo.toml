@@ -51,3 +51,7 @@ harness = false
 [[bench]]
 name = "packed_io"
 harness = false
+
+[[bench]]
+name = "packed_matvec"
+harness = false

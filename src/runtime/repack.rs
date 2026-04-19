@@ -177,6 +177,43 @@ pub fn unpack_ternary_g128(packed: &PackedTernaryTensor) -> Result<Vec<f32>, Rep
     Ok(values)
 }
 
+pub fn matvec_packed_ternary(
+    packed: &PackedTernaryTensor,
+    input: &[f32],
+) -> Result<Vec<f32>, RepackError> {
+    if packed.shape.len() != 2 {
+        return Err(RepackError::Shape(
+            "packed matvec requires a rank-2 tensor".to_string(),
+        ));
+    }
+    let rows = packed.shape[0];
+    let cols = packed.shape[1];
+    if input.len() != cols {
+        return Err(RepackError::Shape(format!(
+            "input length {} does not match packed tensor columns {}",
+            input.len(),
+            cols
+        )));
+    }
+    let mut output = vec![0.0f32; rows];
+    for (row, out) in output.iter_mut().enumerate().take(rows) {
+        let mut sum = 0.0f32;
+        for (col, input_value) in input.iter().enumerate().take(cols) {
+            let element_index = row * cols + col;
+            let scale = packed.scales[element_index / packed.group_size];
+            let value = match get_code(&packed.packed_codes, element_index) {
+                0 => 0.0,
+                1 => scale,
+                2 => -scale,
+                _ => 0.0,
+            };
+            sum += value * input_value;
+        }
+        *out = sum;
+    }
+    Ok(output)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct GroupAnalysis {
     scale: f32,
@@ -230,8 +267,8 @@ fn get_code(bytes: &[u8], element_index: usize) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        TERNARY_G128_GROUP_SIZE, analyze_ternary_packability, pack_ternary_g128,
-        unpack_ternary_g128,
+        TERNARY_G128_GROUP_SIZE, analyze_ternary_packability, matvec_packed_ternary,
+        pack_ternary_g128, unpack_ternary_g128,
     };
 
     #[test]
@@ -268,5 +305,14 @@ mod tests {
         assert_eq!(report.groups, 1);
         assert_eq!(report.perfect_groups, 1);
         assert_eq!(report.zero_only_groups, 0);
+    }
+
+    #[test]
+    fn computes_reference_packed_matvec() {
+        let values = vec![1.0f32, 0.0, -1.0, 0.0, 1.0, -1.0];
+        let input = vec![2.0f32, 3.0, 4.0];
+        let (packed, _) = pack_ternary_g128(&values, vec![2, 3], 1e-6).unwrap();
+        let output = matvec_packed_ternary(&packed, &input).unwrap();
+        assert_eq!(output, vec![-2.0, -1.0]);
     }
 }
