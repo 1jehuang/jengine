@@ -3,6 +3,7 @@ use crate::cpu::primitives::{argmax, swiglu};
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::TokenizerRuntime;
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
+use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
 use crate::runtime::weights::{WeightError, WeightStore};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -55,6 +56,32 @@ impl From<crate::model::tokenizer::TokenizerLoadError> for ReferenceError {
 impl From<WeightError> for ReferenceError {
     fn from(value: WeightError) -> Self {
         Self::Weight(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProjectionComparison {
+    pub layer_idx: usize,
+    pub token_id: usize,
+    pub dense_duration: Duration,
+    pub pack_duration: Duration,
+    pub packed_duration: Duration,
+    pub max_abs_diff: f32,
+    pub mean_abs_diff: f32,
+}
+
+impl ProjectionComparison {
+    pub fn summarize(&self) -> String {
+        format!(
+            "layer={} token_id={} dense_ms={:.3} pack_ms={:.3} packed_ms={:.3} max_abs_diff={:.6} mean_abs_diff={:.6}",
+            self.layer_idx,
+            self.token_id,
+            self.dense_duration.as_secs_f64() * 1_000.0,
+            self.pack_duration.as_secs_f64() * 1_000.0,
+            self.packed_duration.as_secs_f64() * 1_000.0,
+            self.max_abs_diff,
+            self.mean_abs_diff,
+        )
     }
 }
 
@@ -228,6 +255,71 @@ impl ReferenceModel {
             output_text,
             metrics,
         })
+    }
+
+    pub fn compare_qproj_dense_vs_packed(
+        &self,
+        layer_idx: usize,
+        token_id: usize,
+    ) -> Result<ProjectionComparison, ReferenceError> {
+        let hidden_states = self.layer_input_hidden(token_id, layer_idx)?;
+        let tensor_name = format!("model.layers.{layer_idx}.self_attn.q_proj.weight");
+
+        let started_at = Instant::now();
+        let dense = self.weights.matvec_f16(&tensor_name, &hidden_states)?;
+        let dense_duration = started_at.elapsed();
+
+        let values = self.weights.load_vector_f32(&tensor_name)?;
+        let started_at = Instant::now();
+        let (packed, _) = pack_ternary_g128(
+            &values,
+            vec![self.config.hidden_size, self.config.hidden_size],
+            1e-3,
+        )
+        .map_err(|error| ReferenceError::Decode(format!("pack failed: {error}")))?;
+        let pack_duration = started_at.elapsed();
+
+        let started_at = Instant::now();
+        let packed_out = matvec_packed_ternary(&packed, &hidden_states)
+            .map_err(|error| ReferenceError::Decode(format!("packed matvec failed: {error}")))?;
+        let packed_duration = started_at.elapsed();
+
+        let mut max_abs_diff = 0.0f32;
+        let mut sum_abs_diff = 0.0f32;
+        for (left, right) in dense.iter().zip(packed_out.iter()) {
+            let diff = (left - right).abs();
+            max_abs_diff = max_abs_diff.max(diff);
+            sum_abs_diff += diff;
+        }
+        let mean_abs_diff = sum_abs_diff / dense.len() as f32;
+
+        Ok(ProjectionComparison {
+            layer_idx,
+            token_id,
+            dense_duration,
+            pack_duration,
+            packed_duration,
+            max_abs_diff,
+            mean_abs_diff,
+        })
+    }
+
+    fn layer_input_hidden(
+        &self,
+        token_id: usize,
+        layer_idx: usize,
+    ) -> Result<Vec<f32>, ReferenceError> {
+        let hidden = self
+            .weights
+            .embedding_lookup("model.embed_tokens.weight", token_id)?;
+        let input_norm_weight = self
+            .weights
+            .load_vector_f32(&format!("model.layers.{layer_idx}.input_layernorm.weight"))?;
+        Ok(weighted_rms_norm(
+            &hidden,
+            &input_norm_weight,
+            self.config.rms_norm_eps as f32,
+        ))
     }
 
     fn forward_step(
