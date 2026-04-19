@@ -1,5 +1,7 @@
 //! Jengine: a Rust inference runtime for compact LLMs.
 
+pub mod model;
+
 /// Returns the project name.
 pub fn name() -> &'static str {
     "jengine"
