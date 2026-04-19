@@ -39,3 +39,7 @@ harness = false
 [[bench]]
 name = "block_components"
 harness = false
+
+[[bench]]
+name = "end_to_end_reference"
+harness = false
