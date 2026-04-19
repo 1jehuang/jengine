@@ -2,6 +2,7 @@
 
 pub mod cpu;
 pub mod model;
+pub mod runtime;
 
 /// Returns the project name.
 pub fn name() -> &'static str {
