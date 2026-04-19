@@ -1,5 +1,6 @@
 //! Jengine: a Rust inference runtime for compact LLMs.
 
+pub mod cpu;
 pub mod model;
 
 /// Returns the project name.
