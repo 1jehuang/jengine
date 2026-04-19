@@ -1,6 +1,7 @@
 //! Jengine: a Rust inference runtime for compact LLMs.
 
 pub mod cpu;
+pub mod gpu;
 pub mod model;
 pub mod runtime;
 
