@@ -34,3 +34,7 @@ harness = false
 [[bench]]
 name = "cpu_primitives"
 harness = false
+
+[[bench]]
+name = "block_components"
+harness = false
