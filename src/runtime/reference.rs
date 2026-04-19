@@ -105,13 +105,13 @@ pub struct ReferenceModel {
     pub assets: BonsaiAssetPaths,
     pub config: BonsaiModelConfig,
     pub generation_config: GenerationConfig,
-    pub tokenizer: TokenizerRuntime,
+    pub tokenizer: Option<TokenizerRuntime>,
     pub weights: WeightStore,
     rope: YarnRope,
 }
 
 impl ReferenceModel {
-    pub fn load_from_root(root: impl AsRef<Path>) -> Result<Self, ReferenceError> {
+    pub fn load_core_from_root(root: impl AsRef<Path>) -> Result<Self, ReferenceError> {
         let assets = BonsaiAssetPaths::from_root(root)?;
         let config = serde_json::from_str::<BonsaiModelConfig>(&std::fs::read_to_string(
             &assets.config_json,
@@ -119,17 +119,24 @@ impl ReferenceModel {
         let generation_config = serde_json::from_str::<GenerationConfig>(
             &std::fs::read_to_string(&assets.generation_config_json)?,
         )?;
-        let tokenizer = TokenizerRuntime::load_from_file(&assets.tokenizer_json)?;
         let weights = WeightStore::load_from_assets(&assets)?;
         let rope = build_yarn_rope(&config);
         Ok(Self {
             assets,
             config,
             generation_config,
-            tokenizer,
+            tokenizer: None,
             weights,
             rope,
         })
+    }
+
+    pub fn load_from_root(root: impl AsRef<Path>) -> Result<Self, ReferenceError> {
+        let mut model = Self::load_core_from_root(root)?;
+        model.tokenizer = Some(TokenizerRuntime::load_from_file(
+            &model.assets.tokenizer_json,
+        )?);
+        Ok(model)
     }
 
     pub fn generate_greedy(
@@ -137,8 +144,11 @@ impl ReferenceModel {
         prompt: &str,
         max_new_tokens: usize,
     ) -> Result<DecodeResult, ReferenceError> {
-        let prompt_ids = self
+        let tokenizer = self
             .tokenizer
+            .as_ref()
+            .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
+        let prompt_ids = tokenizer
             .encode(prompt)?
             .into_iter()
             .map(|id| id as usize)
@@ -202,9 +212,16 @@ impl ReferenceModel {
         }
 
         metrics.total_duration = started_at.elapsed();
-        let output_text = self
-            .tokenizer
-            .decode(&output_ids.iter().map(|id| *id as u32).collect::<Vec<_>>())?;
+        let output_text = match &self.tokenizer {
+            Some(tokenizer) => {
+                tokenizer.decode(&output_ids.iter().map(|id| *id as u32).collect::<Vec<_>>())?
+            }
+            None => output_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
 
         Ok(DecodeResult {
             output_token_ids: output_ids,
