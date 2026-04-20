@@ -6,6 +6,7 @@ use crate::gpu::packed_matvec::{
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
+use crate::runtime::packed_model::{PackedModelError, PackedModelStore};
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
 use crate::runtime::weights::{WeightError, WeightStore};
 use std::cell::RefCell;
@@ -21,6 +22,7 @@ pub enum ReferenceError {
     Json(serde_json::Error),
     Tokenizer(crate::model::tokenizer::TokenizerLoadError),
     Weight(WeightError),
+    PackedModel(PackedModelError),
     Decode(String),
 }
 
@@ -32,6 +34,7 @@ impl std::fmt::Display for ReferenceError {
             Self::Json(error) => write!(f, "JSON error: {error}"),
             Self::Tokenizer(error) => write!(f, "tokenizer error: {error}"),
             Self::Weight(error) => write!(f, "weight error: {error}"),
+            Self::PackedModel(error) => write!(f, "packed model error: {error}"),
             Self::Decode(message) => write!(f, "decode error: {message}"),
         }
     }
@@ -62,6 +65,11 @@ impl From<crate::model::tokenizer::TokenizerLoadError> for ReferenceError {
 impl From<WeightError> for ReferenceError {
     fn from(value: WeightError) -> Self {
         Self::Weight(value)
+    }
+}
+impl From<PackedModelError> for ReferenceError {
+    fn from(value: PackedModelError) -> Self {
+        Self::PackedModel(value)
     }
 }
 
@@ -351,6 +359,7 @@ pub struct ReferenceModel {
     pub generation_config: GenerationConfig,
     pub tokenizer: Option<TokenizerRuntime>,
     pub weights: WeightStore,
+    packed_model: Option<PackedModelStore>,
     rope: YarnRope,
     cached_hybrid_qproj: RefCell<HashMap<usize, Rc<HybridQProjCache>>>,
     cached_hybrid_qproj_gpu: RefCell<HashMap<usize, Rc<RefCell<CachedGpuPackedMatvecRunner>>>>,
@@ -375,6 +384,7 @@ impl ReferenceModel {
             generation_config,
             tokenizer: None,
             weights,
+            packed_model: None,
             rope,
             cached_hybrid_qproj: RefCell::new(HashMap::new()),
             cached_hybrid_qproj_gpu: RefCell::new(HashMap::new()),
@@ -385,6 +395,29 @@ impl ReferenceModel {
 
     pub fn load_from_root(root: impl AsRef<Path>) -> Result<Self, ReferenceError> {
         let mut model = Self::load_core_from_root(root)?;
+        model.tokenizer = Some(TokenizerRuntime::load_from_file(
+            &model.assets.tokenizer_json,
+        )?);
+        Ok(model)
+    }
+
+    pub fn load_core_from_root_with_packed_artifact(
+        root: impl AsRef<Path>,
+        artifact_dir: impl AsRef<Path>,
+    ) -> Result<Self, ReferenceError> {
+        let mut model = Self::load_core_from_root(root)?;
+        model.packed_model = Some(PackedModelStore::load_from_artifact_dir(
+            artifact_dir,
+            &model.config,
+        )?);
+        Ok(model)
+    }
+
+    pub fn load_from_root_with_packed_artifact(
+        root: impl AsRef<Path>,
+        artifact_dir: impl AsRef<Path>,
+    ) -> Result<Self, ReferenceError> {
+        let mut model = Self::load_core_from_root_with_packed_artifact(root, artifact_dir)?;
         model.tokenizer = Some(TokenizerRuntime::load_from_file(
             &model.assets.tokenizer_json,
         )?);
@@ -445,7 +478,11 @@ impl ReferenceModel {
     }
 
     fn packed_cache_bytes(&self) -> usize {
-        let mut total = 0usize;
+        let mut total = self
+            .packed_model
+            .as_ref()
+            .map(|packed| packed.unpacked_cache_bytes())
+            .unwrap_or(0);
         let generic = self.cached_projection_packed.borrow();
         for cache in generic.values() {
             total += cache.code_words.len() * std::mem::size_of::<u32>();
@@ -476,6 +513,37 @@ impl ReferenceModel {
             }
         }
         total
+    }
+
+    fn load_vector_f32_resolved(&self, name: &str) -> Result<Vec<f32>, ReferenceError> {
+        if let Some(packed) = &self.packed_model
+            && let Some(values) = packed.load_vector_f32(name)?
+        {
+            return Ok(values);
+        }
+        Ok(self.weights.load_vector_f32(name)?)
+    }
+
+    fn embedding_lookup_resolved(
+        &self,
+        name: &str,
+        token_id: usize,
+    ) -> Result<Vec<f32>, ReferenceError> {
+        if let Some(packed) = &self.packed_model
+            && let Some(values) = packed.embedding_lookup(name, token_id)?
+        {
+            return Ok(values);
+        }
+        Ok(self.weights.embedding_lookup(name, token_id)?)
+    }
+
+    fn matvec_f16_resolved(&self, name: &str, input: &[f32]) -> Result<Vec<f32>, ReferenceError> {
+        if let Some(packed) = &self.packed_model
+            && let Some(values) = packed.matvec_f32(name, input)?
+        {
+            return Ok(values);
+        }
+        Ok(self.weights.matvec_f16(name, input)?)
     }
 
     fn activation_working_bytes(&self) -> usize {
@@ -641,12 +709,10 @@ impl ReferenceModel {
         token_id: usize,
         layer_idx: usize,
     ) -> Result<Vec<f32>, ReferenceError> {
-        let hidden = self
-            .weights
-            .embedding_lookup("model.embed_tokens.weight", token_id)?;
-        let input_norm_weight = self
-            .weights
-            .load_vector_f32(&format!("model.layers.{layer_idx}.input_layernorm.weight"))?;
+        let hidden = self.embedding_lookup_resolved("model.embed_tokens.weight", token_id)?;
+        let input_norm_weight = self.load_vector_f32_resolved(&format!(
+            "model.layers.{layer_idx}.input_layernorm.weight"
+        ))?;
         Ok(weighted_rms_norm(
             &hidden,
             &input_norm_weight,
@@ -1529,9 +1595,7 @@ impl ReferenceModel {
         metrics: &mut DecodeMetrics,
     ) -> Result<Vec<f32>, ReferenceError> {
         let started_at = Instant::now();
-        let mut hidden = self
-            .weights
-            .embedding_lookup("model.embed_tokens.weight", token_id)?;
+        let mut hidden = self.embedding_lookup_resolved("model.embed_tokens.weight", token_id)?;
         metrics.embedding_duration += started_at.elapsed();
 
         let (cos, sin) = rope_cos_sin(&self.rope, &[position]);
@@ -1545,32 +1609,32 @@ impl ReferenceModel {
             let residual = hidden.clone();
 
             let started_at = Instant::now();
-            let input_norm_weight = self
-                .weights
-                .load_vector_f32(&format!("{prefix}.input_layernorm.weight"))?;
+            let input_norm_weight =
+                self.load_vector_f32_resolved(&format!("{prefix}.input_layernorm.weight"))?;
             let mut hidden_states =
                 weighted_rms_norm(&hidden, &input_norm_weight, self.config.rms_norm_eps as f32);
             metrics.norm_duration += started_at.elapsed();
 
             let started_at = Instant::now();
-            let mut q = self
-                .weights
-                .matvec_f16(&format!("{prefix}.self_attn.q_proj.weight"), &hidden_states)?;
-            let mut k = self
-                .weights
-                .matvec_f16(&format!("{prefix}.self_attn.k_proj.weight"), &hidden_states)?;
-            let v = self
-                .weights
-                .matvec_f16(&format!("{prefix}.self_attn.v_proj.weight"), &hidden_states)?;
+            let mut q = self.matvec_f16_resolved(
+                &format!("{prefix}.self_attn.q_proj.weight"),
+                &hidden_states,
+            )?;
+            let mut k = self.matvec_f16_resolved(
+                &format!("{prefix}.self_attn.k_proj.weight"),
+                &hidden_states,
+            )?;
+            let v = self.matvec_f16_resolved(
+                &format!("{prefix}.self_attn.v_proj.weight"),
+                &hidden_states,
+            )?;
             metrics.qkv_duration += started_at.elapsed();
 
             let started_at = Instant::now();
-            let q_norm_weight = self
-                .weights
-                .load_vector_f32(&format!("{prefix}.self_attn.q_norm.weight"))?;
-            let k_norm_weight = self
-                .weights
-                .load_vector_f32(&format!("{prefix}.self_attn.k_norm.weight"))?;
+            let q_norm_weight =
+                self.load_vector_f32_resolved(&format!("{prefix}.self_attn.q_norm.weight"))?;
+            let k_norm_weight =
+                self.load_vector_f32_resolved(&format!("{prefix}.self_attn.k_norm.weight"))?;
             apply_head_rms_norm_weighted(
                 &mut q,
                 self.config.num_attention_heads,
@@ -1608,9 +1672,8 @@ impl ReferenceModel {
                 self.config.num_key_value_heads,
                 self.config.head_dim,
             );
-            let attn_output = self
-                .weights
-                .matvec_f16(&format!("{prefix}.self_attn.o_proj.weight"), &attn)?;
+            let attn_output =
+                self.matvec_f16_resolved(&format!("{prefix}.self_attn.o_proj.weight"), &attn)?;
             hidden = residual
                 .iter()
                 .zip(attn_output.iter())
@@ -1621,23 +1684,18 @@ impl ReferenceModel {
             let residual = hidden.clone();
             let started_at = Instant::now();
             let post_norm_weight = self
-                .weights
-                .load_vector_f32(&format!("{prefix}.post_attention_layernorm.weight"))?;
+                .load_vector_f32_resolved(&format!("{prefix}.post_attention_layernorm.weight"))?;
             hidden_states =
                 weighted_rms_norm(&hidden, &post_norm_weight, self.config.rms_norm_eps as f32);
             metrics.norm_duration += started_at.elapsed();
 
             let started_at = Instant::now();
             let gate = self
-                .weights
-                .matvec_f16(&format!("{prefix}.mlp.gate_proj.weight"), &hidden_states)?;
-            let up = self
-                .weights
-                .matvec_f16(&format!("{prefix}.mlp.up_proj.weight"), &hidden_states)?;
+                .matvec_f16_resolved(&format!("{prefix}.mlp.gate_proj.weight"), &hidden_states)?;
+            let up =
+                self.matvec_f16_resolved(&format!("{prefix}.mlp.up_proj.weight"), &hidden_states)?;
             let mlp = swiglu(&gate, &up);
-            let down = self
-                .weights
-                .matvec_f16(&format!("{prefix}.mlp.down_proj.weight"), &mlp)?;
+            let down = self.matvec_f16_resolved(&format!("{prefix}.mlp.down_proj.weight"), &mlp)?;
             hidden = residual
                 .iter()
                 .zip(down.iter())
@@ -1647,15 +1705,13 @@ impl ReferenceModel {
         }
 
         let started_at = Instant::now();
-        let final_norm_weight = self.weights.load_vector_f32("model.norm.weight")?;
+        let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
         let hidden =
             weighted_rms_norm(&hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
         metrics.norm_duration += started_at.elapsed();
 
         let started_at = Instant::now();
-        let logits = self
-            .weights
-            .matvec_f16("model.embed_tokens.weight", &hidden)?;
+        let logits = self.matvec_f16_resolved("model.embed_tokens.weight", &hidden)?;
         metrics.logits_duration += started_at.elapsed();
         Ok(logits)
     }
@@ -2169,6 +2225,7 @@ fn attention_single_query(
 #[cfg(test)]
 mod tests {
     use super::ReferenceModel;
+    use crate::runtime::packed_model::write_packed_model_artifact;
     use half::f16;
     use safetensors::tensor::{Dtype, TensorView, serialize};
     use std::collections::BTreeMap;
@@ -2362,6 +2419,26 @@ mod tests {
         assert_eq!(report.total_sequence_tokens, 5);
         assert!(report.kv_cache_total_bytes_runtime_f32 > 0);
         assert!(report.summarize().contains("working_set_bytes="));
+    }
+
+    #[test]
+    fn runs_end_to_end_greedy_decode_from_packed_artifact_on_synthetic_model() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let result = model
+            .generate_greedy("tok2", 1)
+            .expect("packed-first decode should succeed");
+
+        assert_eq!(result.output_token_ids, vec![2, 2]);
+        assert_eq!(result.output_text, "tok2 tok2");
+        let report = model.memory_report(1, 1);
+        assert!(report.packed_cache_bytes > 0);
     }
 
     use std::time::Duration;

@@ -1,11 +1,15 @@
+use crate::cpu::primitives::matvec;
 use crate::model::config::BonsaiModelConfig;
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::packed::{PackedIoError, PackedTensorFile};
 use crate::runtime::repack::{pack_ternary_g128, unpack_ternary_g128};
 use crate::runtime::weights::{WeightError, WeightStore};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MANIFEST_VERSION: u32 = 1;
@@ -92,6 +96,127 @@ pub struct PackedModelBenchReport {
     pub packed_total_bytes: u64,
     pub source_file_bytes: u64,
     pub entry_count: usize,
+}
+
+#[derive(Debug)]
+pub struct PackedModelStore {
+    pub artifact_dir: PathBuf,
+    pub manifest: PackedModelManifest,
+    entries_by_name: HashMap<String, PackedModelTensorEntry>,
+    unpacked_cache: RefCell<HashMap<String, Rc<Vec<f32>>>>,
+}
+
+impl PackedModelStore {
+    pub fn load_from_artifact_dir(
+        artifact_dir: impl AsRef<Path>,
+        config: &BonsaiModelConfig,
+    ) -> Result<Self, PackedModelError> {
+        let artifact_dir = artifact_dir.as_ref().to_path_buf();
+        let manifest = load_packed_model_manifest(artifact_dir.join("manifest.json"))?;
+        validate_packed_model_manifest(&manifest, config)?;
+        let entries_by_name = manifest
+            .entries
+            .iter()
+            .cloned()
+            .map(|entry| (entry.name.clone(), entry))
+            .collect::<HashMap<_, _>>();
+        Ok(Self {
+            artifact_dir,
+            manifest,
+            entries_by_name,
+            unpacked_cache: RefCell::new(HashMap::new()),
+        })
+    }
+
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.entries_by_name.contains_key(name)
+    }
+
+    pub fn load_vector_f32(&self, name: &str) -> Result<Option<Vec<f32>>, PackedModelError> {
+        let Some(entry) = self.entries_by_name.get(name) else {
+            return Ok(None);
+        };
+        if let Some(cached) = self.unpacked_cache.borrow().get(name) {
+            return Ok(Some((**cached).clone()));
+        }
+        let packed = PackedTensorFile::read_from_path(self.artifact_dir.join(&entry.rel_path))?;
+        let unpacked = unpack_ternary_g128(&packed.tensor)
+            .map_err(|error| PackedModelError::Encode(format!("{}: {error}", entry.name)))?;
+        self.unpacked_cache
+            .borrow_mut()
+            .insert(name.to_string(), Rc::new(unpacked.clone()));
+        Ok(Some(unpacked))
+    }
+
+    pub fn embedding_lookup(
+        &self,
+        name: &str,
+        token_id: usize,
+    ) -> Result<Option<Vec<f32>>, PackedModelError> {
+        let Some(entry) = self.entries_by_name.get(name) else {
+            return Ok(None);
+        };
+        if entry.shape.len() != 2 {
+            return Err(PackedModelError::Encode(format!(
+                "{name}: embedding lookup requires rank-2 tensor"
+            )));
+        }
+        let vocab = entry.shape[0];
+        let hidden = entry.shape[1];
+        if token_id >= vocab {
+            return Err(PackedModelError::Encode(format!(
+                "{name}: token_id {token_id} out of range for vocab {vocab}"
+            )));
+        }
+        let values = self.load_vector_f32(name)?.ok_or_else(|| {
+            PackedModelError::Encode(format!("{name}: tensor disappeared during packed load"))
+        })?;
+        let start = token_id * hidden;
+        Ok(Some(values[start..start + hidden].to_vec()))
+    }
+
+    pub fn matvec_f32(
+        &self,
+        name: &str,
+        input: &[f32],
+    ) -> Result<Option<Vec<f32>>, PackedModelError> {
+        let Some(entry) = self.entries_by_name.get(name) else {
+            return Ok(None);
+        };
+        if entry.shape.len() != 2 {
+            return Err(PackedModelError::Encode(format!(
+                "{name}: matvec requires rank-2 tensor"
+            )));
+        }
+        let rows = entry.shape[0];
+        let cols = entry.shape[1];
+        if input.len() != cols {
+            return Err(PackedModelError::Encode(format!(
+                "{name}: input length {} does not match cols {cols}",
+                input.len()
+            )));
+        }
+        let values = self.load_vector_f32(name)?.ok_or_else(|| {
+            PackedModelError::Encode(format!("{name}: tensor disappeared during packed load"))
+        })?;
+        Ok(Some(matvec(&values, rows, cols, input)))
+    }
+
+    pub fn packed_total_bytes(&self) -> usize {
+        self.manifest
+            .entries
+            .iter()
+            .map(|entry| entry.total_file_bytes as usize)
+            .sum()
+    }
+
+    pub fn unpacked_cache_bytes(&self) -> usize {
+        self.unpacked_cache
+            .borrow()
+            .values()
+            .map(|values| values.len() * std::mem::size_of::<f32>())
+            .sum()
+    }
 }
 
 impl PackedModelBenchReport {
@@ -396,9 +521,9 @@ fn sanitize_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        benchmark_packed_model_artifact, build_artifact_layout, build_packable_tensor_specs,
-        load_packed_model_manifest, validate_packed_model_artifact, validate_packed_model_manifest,
-        write_packed_model_artifact,
+        PackedModelStore, benchmark_packed_model_artifact, build_artifact_layout,
+        build_packable_tensor_specs, load_packed_model_manifest, validate_packed_model_artifact,
+        validate_packed_model_manifest, write_packed_model_artifact,
     };
     use crate::model::config::BonsaiModelConfig;
     use std::fs;
@@ -509,5 +634,105 @@ mod tests {
         assert_eq!(validation.checked_entries, 8);
         assert_eq!(validation.max_abs_diff, 0.0);
         assert_eq!(bench.entry_count, 8);
+    }
+
+    #[test]
+    fn loads_packed_model_store_and_reuses_cached_unpack() {
+        let root = tempdir().expect("tempdir should be created");
+        fs::write(root.path().join("config.json"), r#"{
+            "vocab_size": 4,
+            "max_position_embeddings": 32,
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 2,
+            "hidden_act": "silu",
+            "rms_norm_eps": 0.000001,
+            "rope_theta": 10000.0,
+            "rope_scaling": {"rope_type": "yarn", "factor": 1.0, "original_max_position_embeddings": 32},
+            "attention_bias": false,
+            "tie_word_embeddings": true,
+            "architectures": ["Qwen3ForCausalLM"],
+            "pad_token_id": 0,
+            "eos_token_id": 3,
+            "model_type": "qwen3"
+        }"#).unwrap();
+        fs::write(root.path().join("generation_config.json"), "{}").unwrap();
+        fs::write(root.path().join("tokenizer.json"), "{}").unwrap();
+        fs::write(root.path().join("tokenizer_config.json"), "{}").unwrap();
+
+        let mut header = serde_json::Map::new();
+        header.insert(
+            "model.embed_tokens.weight".to_string(),
+            serde_json::json!({"dtype":"F16","shape":[4,4],"data_offsets":[0,32]}),
+        );
+        header.insert(
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            serde_json::json!({"dtype":"F16","shape":[4,4],"data_offsets":[32,64]}),
+        );
+        header.insert(
+            "model.layers.0.self_attn.k_proj.weight".to_string(),
+            serde_json::json!({"dtype":"F16","shape":[2,4],"data_offsets":[64,80]}),
+        );
+        header.insert(
+            "model.layers.0.self_attn.v_proj.weight".to_string(),
+            serde_json::json!({"dtype":"F16","shape":[2,4],"data_offsets":[80,96]}),
+        );
+        header.insert(
+            "model.layers.0.self_attn.o_proj.weight".to_string(),
+            serde_json::json!({"dtype":"F16","shape":[4,4],"data_offsets":[96,128]}),
+        );
+        header.insert(
+            "model.layers.0.mlp.gate_proj.weight".to_string(),
+            serde_json::json!({"dtype":"F16","shape":[8,4],"data_offsets":[128,192]}),
+        );
+        header.insert(
+            "model.layers.0.mlp.up_proj.weight".to_string(),
+            serde_json::json!({"dtype":"F16","shape":[8,4],"data_offsets":[192,256]}),
+        );
+        header.insert(
+            "model.layers.0.mlp.down_proj.weight".to_string(),
+            serde_json::json!({"dtype":"F16","shape":[4,8],"data_offsets":[256,320]}),
+        );
+        let header_bytes = serde_json::to_vec(&header).unwrap();
+        let mut safetensors = Vec::new();
+        safetensors.extend_from_slice(&(header_bytes.len() as u64).to_le_bytes());
+        safetensors.extend_from_slice(&header_bytes);
+        safetensors.resize(8 + header_bytes.len() + 320, 0);
+        fs::write(root.path().join("model.safetensors"), safetensors).unwrap();
+
+        let out = tempdir().expect("tempdir should be created");
+        let (_manifest, _summary) = write_packed_model_artifact(root.path(), out.path()).unwrap();
+        let config = BonsaiModelConfig::from_json_str(
+            &fs::read_to_string(root.path().join("config.json")).unwrap(),
+        )
+        .unwrap();
+        let store = PackedModelStore::load_from_artifact_dir(out.path(), &config).unwrap();
+        assert!(store.has_tensor("model.embed_tokens.weight"));
+        let first = store
+            .load_vector_f32("model.embed_tokens.weight")
+            .unwrap()
+            .unwrap();
+        let second = store
+            .load_vector_f32("model.embed_tokens.weight")
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, second);
+        assert!(store.unpacked_cache_bytes() > 0);
+        let embed = store
+            .embedding_lookup("model.embed_tokens.weight", 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(embed.len(), 4);
+        let matvec = store
+            .matvec_f32(
+                "model.layers.0.self_attn.q_proj.weight",
+                &[0.0, 0.0, 0.0, 0.0],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(matvec.len(), 4);
     }
 }
