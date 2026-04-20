@@ -212,4 +212,5 @@ Every milestone is expected to keep these green:
 - `docs/AUTOMATION_WORKFLOWS.md` - quick CI, regression, and local profiling scripts
 - `docs/BACKEND_REASSESSMENT.md` - why Vulkan still fits and where to narrow the internal boundary
 - `docs/PACKED_RUNTIME_ARCHITECTURE.md` - packed-artifact runtime dataflow and ownership model
+- `docs/PACKED_RUNTIME_POLICY.md` - LM head and precision decisions for the packed-first runtime
 - `docs/VULKAN_PLAN.md` - Vulkan backend plan based on measured hotspots
