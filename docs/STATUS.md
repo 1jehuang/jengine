@@ -145,6 +145,24 @@ Still, this is useful because it confirms the latest packed path structure and d
 
 The key conclusion from the new attention-only sample is that attention-side offload alone is **not** beating the current combined packed path here.
 
+### Xe2-relevant Vulkan capabilities are present on this Intel iGPU
+
+A new local hardware probe now confirms that the Lunar Lake iGPU exposes the key Vulkan features we would want for a more Xe2-friendly kernel path:
+
+- subgroup size: `32`
+- subgroup size control: `true`
+- compute full subgroups: `true`
+- min subgroup size: `16`
+- max subgroup size: `32`
+- integer dot product: `true`
+- shader float16: `true`
+- shader int8: `true`
+- `VK_KHR_cooperative_matrix`: `true`
+- `VK_KHR_shader_integer_dot_product`: `true`
+- `VK_EXT_subgroup_size_control`: `true`
+
+That does **not** prove a better kernel will be faster yet, but it does mean the hardware and driver are exposing the right building blocks. So an Xe2/XMX-oriented shader path is now a credible engineering direction rather than a speculative one.
+
 ### Cached q_proj warm hybrid vs dense
 
 From the latest real one-token run:
@@ -168,7 +186,8 @@ From the latest real one-token run:
 6. After removing full logits-vector download from the hybrid logits path, `qkv+gu+logits` became the first remaining dense-hotspot experiment with median wins across all three sampled layers
 7. Chunked packed capture now works around the `rc=143` kill window and confirms the latest path shapes, with chunked upper bounds of `12212.554 ms` for combined at `57` dispatches and `17779.632 ms` for attention-only at `29` dispatches
 8. The new chunked attention-only capture shows that attention-side offload alone is still losing badly to the current combined packed path here
-9. The next meaningful wins now come from reducing dense-side work and synchronization overhead, not from merely making runner reuse exist at all
+9. The Intel Lunar Lake Vulkan stack does expose cooperative matrix, integer dot, subgroup size control, and float16/int8 features, so an Xe2-oriented kernel path is plausible and worth active investigation
+10. The next meaningful wins now come from reducing dense-side work and synchronization overhead, not from merely making runner reuse exist at all
 
 ## Best next step
 

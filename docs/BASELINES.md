@@ -381,6 +381,43 @@ Current interpretation:
 - the result points directly at output-side handling and download avoidance as the strongest next dense-side lead
 - the next follow-up should determine whether this win survives in a fuller packed-first decode path and not just this one-layer hybrid slice
 
+## Xe2 capability probe
+
+### Real Intel Lunar Lake Vulkan feature report
+
+Command shape:
+
+```bash
+cargo run --quiet --bin vulkan_xe2_report
+```
+
+Observed sample on this machine:
+
+- device: `Intel(R) Graphics (LNL)`
+- Vulkan API: `1.4.335`
+- subgroup size: `32`
+- subgroup size control: `true`
+- compute full subgroups: `true`
+- min subgroup size: `16`
+- max subgroup size: `32`
+- integer dot product: `true`
+- shader float16: `true`
+- shader int8: `true`
+- storage buffer 8-bit: `true`
+- storage buffer 16-bit: `true`
+- `VK_KHR_cooperative_matrix`: `true`
+- `VK_KHR_shader_integer_dot_product`: `true`
+- `VK_EXT_subgroup_size_control`: `true`
+- `VK_KHR_shader_float16_int8`: `true`
+- `VK_KHR_8bit_storage`: `true`
+- `VK_KHR_16bit_storage`: `true`
+
+Current interpretation:
+
+- the hardware and driver expose the right Vulkan building blocks for a more Xe2-friendly kernel strategy
+- that makes subgroup-tuned or cooperative-matrix-oriented experimentation a real next option rather than pure speculation
+- the repo still needs actual alternative shader experiments to prove whether those capabilities translate into materially better packed throughput
+
 ## Chunked packed capture workarounds
 
 ### Real combined and attention-only packed step upper bounds via 7-layer chunk chaining
