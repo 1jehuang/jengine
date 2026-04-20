@@ -543,6 +543,32 @@ Current interpretation:
 - simply turning `down_proj` into another standalone packed projection is not the right next fix in the broader packed path
 - but the MLP sub-breakdown shows `down_proj` is still the dominant subcomponent inside the MLP stage, so the real fix likely needs a more structural redesign around that tail rather than naive standalone offload
 
+### Real `down_proj` tensor microbenchmark
+
+Command shapes:
+
+```bash
+cargo run --quiet --bin compare_packed_matvec -- \
+  /home/jeremy/models/bonsai-1.7b/model.safetensors \
+  model.layers.0.mlp.down_proj.weight 2048 6144
+
+cargo run --quiet --bin vulkan_packed_matvec -- \
+  /home/jeremy/models/bonsai-1.7b/model.safetensors \
+  model.layers.0.mlp.down_proj.weight 2048 6144
+```
+
+Observed sample:
+
+- dense CPU: `123.933 ms`
+- packed CPU: `133.083 ms`
+- packed GPU kernel: `0.869 ms`
+
+Current interpretation:
+
+- the raw packed GPU kernel for `down_proj` is dramatically faster than either CPU path on the real tensor
+- that means the current broader packed-path regressions are dominated by integration overhead and staging, not by the kernel math itself
+- so the next MLP-side redesign should focus on structural integration around `down_proj`, not on abandoning GPU help for that tensor entirely
+
 ## Chunked packed capture workarounds
 
 ### Real combined and attention-only packed step upper bounds via 7-layer chunk chaining
