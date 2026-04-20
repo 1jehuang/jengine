@@ -27,17 +27,28 @@ Command shape:
 cargo run --release --bin run_reference -- /home/jeremy/models/bonsai-1.7b hello 1
 ```
 
-Observed sample:
+Observed samples:
 
-- `prompt_tokens=1`
-- `generated_tokens=1`
-- `total_ms=1513.965`
-- `embed_ms=0.490`
-- `norm_ms=56.923`
-- `qkv_ms=248.663`
-- `attention_ms=111.360`
-- `mlp_ms=849.401`
-- `logits_ms=246.633`
+- earlier sample:
+  - `prompt_tokens=1`
+  - `generated_tokens=1`
+  - `total_ms=1513.965`
+  - `embed_ms=0.490`
+  - `norm_ms=56.923`
+  - `qkv_ms=248.663`
+  - `attention_ms=111.360`
+  - `mlp_ms=849.401`
+  - `logits_ms=246.633`
+- current post-index-cache sample:
+  - `prompt_tokens=1`
+  - `generated_tokens=1`
+  - `total_ms=4690.908`
+  - `embed_ms=18.935`
+  - `norm_ms=97.711`
+  - `qkv_ms=1093.304`
+  - `attention_ms=277.480`
+  - `mlp_ms=2497.849`
+  - `logits_ms=702.435`
 
 ### One-token token-id run
 
@@ -339,3 +350,5 @@ Recent important improvement: memory-mapped weight loading reduced real-model st
 Recent important caution: the first broader `qkv + gu` hybrid decode benchmark is slightly slower than dense, so the next optimization pass should focus on reducing aggregate multi-projection overhead before adding more decode-path complexity.
 
 Recent important artifact result: the real Bonsai packed artifact flow now achieves about **7.11x size reduction** against source safetensors while keeping aggregate validation error very low (`max_abs_diff` about `0.000977`).
+
+Recent important dense-CPU note: a `WeightStore` tensor-index cache is now in place, so future CPU baselines should be compared against the newer post-index-cache runs rather than the oldest early bring-up numbers.

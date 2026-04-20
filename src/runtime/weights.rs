@@ -2,7 +2,8 @@ use crate::runtime::assets::BonsaiAssetPaths;
 use half::f16;
 use memmap2::Mmap;
 use rayon::prelude::*;
-use safetensors::tensor::{Dtype, SafeTensors};
+use safetensors::tensor::Dtype;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -95,8 +96,17 @@ enum WeightStorage {
     Mapped(Mmap),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorIndexEntry {
+    dtype: Dtype,
+    shape: Vec<usize>,
+    data_start: usize,
+    data_end: usize,
+}
+
 pub struct WeightStore {
     storage: WeightStorage,
+    tensors: BTreeMap<String, TensorIndexEntry>,
 }
 
 impl WeightStore {
@@ -167,15 +177,19 @@ impl WeightStore {
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, WeightError> {
         let file = fs::File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
+        let tensors = parse_tensor_index(&mmap)?;
         Ok(Self {
             storage: WeightStorage::Mapped(mmap),
+            tensors,
         })
     }
 
     #[cfg(test)]
     fn from_bytes(bytes: Vec<u8>) -> Self {
+        let tensors = parse_tensor_index(&bytes).expect("test fixture tensor index should build");
         Self {
             storage: WeightStorage::Owned(bytes),
+            tensors,
         }
     }
 
@@ -189,12 +203,7 @@ impl WeightStore {
 
     pub fn probe(&self) -> Result<WeightProbe, WeightError> {
         let started_at = Instant::now();
-        let tensors = SafeTensors::deserialize(self.as_bytes())?;
-        let mut names = tensors
-            .names()
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect::<Vec<_>>();
+        let mut names = self.tensors.keys().cloned().collect::<Vec<_>>();
         names.sort();
         Ok(WeightProbe {
             tensor_count: names.len(),
@@ -208,19 +217,13 @@ impl WeightStore {
     }
 
     pub fn load_vector_f32(&self, name: &str) -> Result<Vec<f32>, WeightError> {
-        let tensors = SafeTensors::deserialize(self.as_bytes())?;
-        let tensor = tensors
-            .tensor(name)
-            .map_err(|_| WeightError::MissingTensor(name.to_string()))?;
-        decode_f16_tensor(tensor.data(), tensor.dtype(), tensor.shape())
+        let tensor = self.tensor_entry(name)?;
+        decode_f16_tensor(self.tensor_bytes(tensor), tensor.dtype, &tensor.shape)
     }
 
     pub fn embedding_lookup(&self, name: &str, token_id: usize) -> Result<Vec<f32>, WeightError> {
-        let tensors = SafeTensors::deserialize(self.as_bytes())?;
-        let tensor = tensors
-            .tensor(name)
-            .map_err(|_| WeightError::MissingTensor(name.to_string()))?;
-        let shape = tensor.shape();
+        let tensor = self.tensor_entry(name)?;
+        let shape = &tensor.shape;
         if shape.len() != 2 {
             return Err(WeightError::Shape(format!(
                 "embedding tensor {name} must be rank-2"
@@ -233,12 +236,12 @@ impl WeightStore {
                 "token_id {token_id} out of range for {name}"
             )));
         }
-        match tensor.dtype() {
+        match tensor.dtype {
             Dtype::F16 => {
                 let row_bytes = cols * 2;
                 let start = token_id * row_bytes;
                 let end = start + row_bytes;
-                let row = &tensor.data()[start..end];
+                let row = &self.tensor_bytes(tensor)[start..end];
                 Ok(row
                     .chunks_exact(2)
                     .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
@@ -249,11 +252,8 @@ impl WeightStore {
     }
 
     pub fn matvec_f16(&self, name: &str, input: &[f32]) -> Result<Vec<f32>, WeightError> {
-        let tensors = SafeTensors::deserialize(self.as_bytes())?;
-        let tensor = tensors
-            .tensor(name)
-            .map_err(|_| WeightError::MissingTensor(name.to_string()))?;
-        let shape = tensor.shape();
+        let tensor = self.tensor_entry(name)?;
+        let shape = &tensor.shape;
         if shape.len() != 2 {
             return Err(WeightError::Shape(format!(
                 "matrix tensor {name} must be rank-2"
@@ -268,10 +268,10 @@ impl WeightStore {
                 input.len()
             )));
         }
-        match tensor.dtype() {
+        match tensor.dtype {
             Dtype::F16 => {
                 let row_bytes = cols * 2;
-                let data = tensor.data();
+                let data = self.tensor_bytes(tensor);
                 let output = (0..rows)
                     .into_par_iter()
                     .map(|row| {
@@ -291,6 +291,96 @@ impl WeightStore {
             }
             dtype => Err(WeightError::UnsupportedDtype(dtype)),
         }
+    }
+
+    fn tensor_entry(&self, name: &str) -> Result<&TensorIndexEntry, WeightError> {
+        self.tensors
+            .get(name)
+            .ok_or_else(|| WeightError::MissingTensor(name.to_string()))
+    }
+
+    fn tensor_bytes<'a>(&'a self, entry: &TensorIndexEntry) -> &'a [u8] {
+        &self.as_bytes()[entry.data_start..entry.data_end]
+    }
+}
+
+fn parse_tensor_index(bytes: &[u8]) -> Result<BTreeMap<String, TensorIndexEntry>, WeightError> {
+    if bytes.len() < 8 {
+        return Err(WeightError::Shape("safetensors file too small".to_string()));
+    }
+    let header_len = u64::from_le_bytes(bytes[..8].try_into().expect("header bytes")) as usize;
+    let header_start = 8;
+    let header_end = header_start + header_len;
+    if header_end > bytes.len() {
+        return Err(WeightError::Shape(
+            "safetensors header extends past file end".to_string(),
+        ));
+    }
+    let header: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&bytes[header_start..header_end])
+            .map_err(|error| WeightError::Shape(format!("invalid safetensors header: {error}")))?;
+
+    let mut tensors = BTreeMap::new();
+    for (name, info) in header {
+        if name == "__metadata__" {
+            continue;
+        }
+        let dtype = parse_dtype(
+            info.get("dtype")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| WeightError::Shape(format!("tensor {name} missing dtype")))?,
+        )?;
+        let shape =
+            info.get("shape")
+                .and_then(|value| value.as_array())
+                .ok_or_else(|| WeightError::Shape(format!("tensor {name} missing shape")))?
+                .iter()
+                .map(|value| {
+                    value.as_u64().map(|value| value as usize).ok_or_else(|| {
+                        WeightError::Shape(format!("tensor {name} has invalid shape"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        let offsets = info
+            .get("data_offsets")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| WeightError::Shape(format!("tensor {name} missing data_offsets")))?;
+        let start = offsets[0]
+            .as_u64()
+            .ok_or_else(|| WeightError::Shape(format!("tensor {name} has invalid start offset")))?
+            as usize;
+        let end = offsets[1]
+            .as_u64()
+            .ok_or_else(|| WeightError::Shape(format!("tensor {name} has invalid end offset")))?
+            as usize;
+        let abs_start = header_end + start;
+        let abs_end = header_end + end;
+        if abs_end > bytes.len() || abs_start > abs_end {
+            return Err(WeightError::Shape(format!(
+                "tensor {name} offsets extend past file end"
+            )));
+        }
+        tensors.insert(
+            name,
+            TensorIndexEntry {
+                dtype,
+                shape,
+                data_start: abs_start,
+                data_end: abs_end,
+            },
+        );
+    }
+    Ok(tensors)
+}
+
+fn parse_dtype(value: &str) -> Result<Dtype, WeightError> {
+    match value {
+        "F16" => Ok(Dtype::F16),
+        "F32" => Ok(Dtype::F32),
+        "BF16" => Ok(Dtype::BF16),
+        other => Err(WeightError::Shape(format!(
+            "unsupported tensor dtype string: {other}"
+        ))),
     }
 }
 
