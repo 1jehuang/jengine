@@ -194,6 +194,17 @@ Two plausible designs are:
 
 Until one of those exists, shared context alone cannot eliminate CPU-visible intermediate activation traffic.
 
+In the current runtime, the first realistic real decode boundary for this is likely:
+
+- **GPU final_norm -> GPU logits**
+
+because the other obvious packed consumers are still preceded by CPU producers:
+
+- `attention_core -> o_proj`
+- `swiglu -> down_proj`
+
+So a GPU producer stage is still needed before the resident chaining path can remove a real decode-time CPU-visible activation hop.
+
 ### Milestone 3: GPU-native logits and token selection
 
 Move logits projection and token selection fully onto the GPU.
