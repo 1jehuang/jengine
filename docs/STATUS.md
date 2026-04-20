@@ -70,7 +70,28 @@ From the latest real packed-artifact release runs:
 - short-context packed `mlp`: `14441.214 ms`, about `0.069 tok/s`
 - short-context packed `combined`: `11873.378 ms`, about `0.084 tok/s`
 
+### `o_proj` hybrid experiment did not beat `qkv+gu`
+
+Real one-token cached hybrid comparisons on layers `0`, `14`, and `27` all kept `qkv+gu` ahead of `qkvo+gu`:
+
+- layer `0`: `qkv+gu` `1310.133 ms`, `qkvo+gu` `1338.556 ms`
+- layer `14`: `qkv+gu` `1386.601 ms`, `qkvo+gu` `1393.474 ms`
+- layer `27`: `qkv+gu` `1393.079 ms`, `qkvo+gu` `1395.680 ms`
+
+So `o_proj` offload is not the next obvious decode-side win on this stack. The next dense-hotspot focus should shift toward `down_proj` and logits.
+
+### `down_proj` hybrid experiment also failed to produce a clear win
+
+Real one-token cached hybrid comparisons on layers `0`, `14`, and `27` showed `qkv+gud` mostly trailing `qkv+gu` and only edging it out by noise-level margin once:
+
+- layer `0`: `qkv+gu` `1313.025 ms`, `qkv+gud` `1319.966 ms`
+- layer `14`: `qkv+gu` `1348.146 ms`, `qkv+gud` `1359.994 ms`
+- layer `27`: `qkv+gu` `1438.766 ms`, `qkv+gud` `1436.803 ms`
+
+So `down_proj` also does not look like the next clean decode-side win in the current hybrid form. That leaves logits and larger packed-first execution changes as the more promising next dense-side directions.
+
 ### Cached q_proj warm hybrid vs dense
+
 From the latest real one-token run:
 
 - dense total: `9822.266 ms`
@@ -87,7 +108,9 @@ From the latest real one-token run:
 1. The dominant cost in the first decode-wide attribution sample is still non-offloaded dense work, not GPU bandwidth saturation
 2. Host-side orchestration and per-dispatch overhead still matter, but they are now smaller after resident-runner reuse and a tensor-name caching pass that reduced the rebuilt combined one-token step from `10938.667 ms` to `10077.689 ms`
 3. Raw GPU upload, compute, and download time are still much smaller than total packed wall time, and measured decode-wide bandwidth is far below the hardware ceiling
-4. The next meaningful wins now come from reducing dense-side work and synchronization overhead, not from merely making runner reuse exist at all
+4. The `o_proj` hybrid experiment did not beat `qkv+gu` on layers `0`, `14`, or `27`, so broadening attention-side offload blindly is not the next win
+5. The follow-up `down_proj` hybrid experiment also failed to produce a clear end-to-end gain, so logits and larger packed-first execution changes now look like the better dense-side bets
+6. The next meaningful wins now come from reducing dense-side work and synchronization overhead, not from merely making runner reuse exist at all
 
 ## Best next step
 
@@ -96,6 +119,7 @@ The most valuable next milestone is:
 - further batch work in the packed decode path so each dispatch covers more useful projection work
 - reuse compiled pipelines and runner state more aggressively across end-to-end decode steps
 - reduce host-side launch overhead enough to move the combined short-context path meaningfully above the current `0.084 tok/s`
+- focus the next dense-hotspot experiments on logits and broader packed-first execution changes, since neither the `o_proj` nor `down_proj` hybrid experiments produced a clean win
 - separately stabilize `attention`-only short-context capture so it can be tracked alongside `mlp` and `combined`
 
 ## Success bar for next milestone

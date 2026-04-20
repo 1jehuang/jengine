@@ -298,6 +298,61 @@ Current interpretation:
   - cached runner initialization footprint across more projections
   - transfer / execution overhead once more projections participate
 
+### Real cached `qkv + gu` vs `qkvo + gu` layer samples
+
+Command shape:
+
+```bash
+JENGINE_NO_HEARTBEAT=1 ./target/release/bench_hybrid_qkv_gu \
+  /home/jeremy/models/bonsai-1.7b hello 1 <layer> <variant>
+```
+
+Observed samples:
+
+- layer `0`
+  - `qkv+gu`: `1310.133 ms`
+  - `qkvo+gu`: `1338.556 ms`
+- layer `14`
+  - `qkv+gu`: `1386.601 ms`
+  - `qkvo+gu`: `1393.474 ms`
+- layer `27`
+  - `qkv+gu`: `1393.079 ms`
+  - `qkvo+gu`: `1395.680 ms`
+
+Current interpretation:
+
+- `qkv+gu` remains slightly faster than `qkvo+gu` on early, middle, and late sampled layers
+- `o_proj` offload is therefore not the next obvious decode-side win on this stack
+- the next dense-hotspot experiments should shift toward `down_proj` and logits
+
+### Real cached `qkv + gu` vs `qkv + gud` layer samples
+
+Command shape:
+
+```bash
+JENGINE_NO_HEARTBEAT=1 ./target/release/bench_hybrid_qkv_gu \
+  /home/jeremy/models/bonsai-1.7b hello 1 <layer> <variant>
+```
+
+Observed samples:
+
+- layer `0`
+  - `qkv+gu`: `1313.025 ms`
+  - `qkv+gud`: `1319.966 ms`
+- layer `14`
+  - `qkv+gu`: `1348.146 ms`
+  - `qkv+gud`: `1359.994 ms`
+- layer `27`
+  - `qkv+gu`: `1438.766 ms`
+  - `qkv+gud`: `1436.803 ms`
+
+Current interpretation:
+
+- `qkv+gud` does not produce a clear end-to-end win over `qkv+gu`
+- the tiny layer `27` edge is within noise compared with the losses on layers `0` and `14`
+- `down_proj` therefore does not look like the next clean hybrid decode-side win either
+- the next dense-hotspot experiments should bias toward logits and larger packed-first execution changes
+
 ## Packed layer sweep baselines
 
 ### Real all-layer packed projection sweep
