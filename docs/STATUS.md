@@ -275,6 +275,22 @@ So the kernel math itself is **not** the limiting issue for `down_proj`. The hug
 
 That is why naive full-MLP offload regressed even though `down_proj` is still the dominant MLP subcomponent: the broader path is not yet structured well enough to cash in the kernel-side upside.
 
+### Direct `bench_packed_toks` now shows a usable warm result with full-MLP offload
+
+Running the actual packed decode benchmark in one process for two iterations with `JENGINE_PACKED_MLP_FULL=1` now yields:
+
+- iteration 1:
+  - total: `7745.361 ms`
+  - throughput: `0.129 tok/s`
+- iteration 2, warm:
+  - total: `1969.099 ms`
+  - throughput: `0.508 tok/s`
+- average across the two:
+  - total: `4857.230 ms`
+  - throughput: `0.318 tok/s`
+
+So the direct packed benchmark path is now clearly above the old `0.25 tok/s` territory and past the `0.5 tok/s` mark on the warm second pass, even though it is still well short of the `1 tok/s` target.
+
 ### Warm full-MLP offload is promising even though the cold variant regresses
 
 The env-gated full-MLP experiment (`JENGINE_PACKED_MLP_FULL=1`) looked bad in cold multi-process chunked capture, but the new one-process warm runner shows a very different picture.
@@ -359,10 +375,11 @@ From the latest real one-token run:
 12. Packed-artifact `generate_greedy` now routes into the packed decode path automatically, so the packed-first runtime is no longer just benchmark-only infrastructure
 13. With the rebuilt release chunked capture path, the latest combined upper bound is now in the mid-`4.5 s` range, and the stage breakdown shows `mlp_ms=2872.509` as the largest remaining stage-level bucket
 14. The one-process chunked runner shows a warm in-process combined upper bound of `2819.341 ms` with `pack_cache_hits=57` and `gpu_cache_hits=57`, which is about `0.355 tok/s` for one-token decode and confirms that cache reuse now matters a lot
-15. The new MLP sub-breakdown shows `mlp_down_ms=1913.680`, which means `down_proj` handling is the dominant subcomponent inside the MLP tail even though naive full offload regresses in cold capture
-16. A direct real-tensor microbenchmark still shows `down_proj` packed GPU kernel time at only `0.869 ms` versus `123.933 ms` dense CPU and `133.083 ms` packed CPU, which means the problem is structural integration overhead rather than raw GPU math throughput
-17. Warm in-process full-MLP offload (`JENGINE_PACKED_MLP_FULL=1`) reaches about `0.908 tok/s` for one-token decode, so the next MLP-side goal is to make that warm-path advantage practical without paying the current cold-start penalties
-18. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the MLP tail with a more structural redesign around `down_proj` and its warm-cache behavior while still reducing remaining dense-side work and synchronization overhead
+15. The direct `bench_packed_toks` path now reaches `0.508 tok/s` on the warm second pass with `JENGINE_PACKED_MLP_FULL=1`, which is a stronger direct benchmark signal even though it is still below the `1 tok/s` target
+16. The new MLP sub-breakdown shows `mlp_down_ms=1913.680`, which means `down_proj` handling is the dominant subcomponent inside the MLP tail even though naive full offload regresses in cold capture
+17. A direct real-tensor microbenchmark still shows `down_proj` packed GPU kernel time at only `0.869 ms` versus `123.933 ms` dense CPU and `133.083 ms` packed CPU, which means the problem is structural integration overhead rather than raw GPU math throughput
+18. Warm in-process full-MLP offload (`JENGINE_PACKED_MLP_FULL=1`) reaches about `0.908 tok/s` in the chunked runner and about `0.508 tok/s` on the direct warm second-pass benchmark, so the next MLP-side goal is to make that warm-path advantage practical without paying the current cold-start penalties
+19. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the MLP tail with a more structural redesign around `down_proj` and its warm-cache behavior while still reducing remaining dense-side work and synchronization overhead
 
 ## Best next step
 

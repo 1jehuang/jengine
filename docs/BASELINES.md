@@ -545,6 +545,33 @@ Current interpretation:
 - the warm in-process upper bound is about `0.355 tok/s` for one-token decode
 - compile and weight upload effectively disappear on the warm pass, but the MLP tail is still the main remaining runtime bucket
 
+### Direct warm `bench_packed_toks` sample
+
+Command shape:
+
+```bash
+JENGINE_NO_HEARTBEAT=1 JENGINE_PACKED_MLP_FULL=1 ./target/release/bench_packed_toks \
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model hello 1 2 combined
+```
+
+Observed sample:
+
+- iteration 1:
+  - total: `7745.361 ms`
+  - throughput: `0.129 tok/s`
+- iteration 2, warm:
+  - total: `1969.099 ms`
+  - throughput: `0.508 tok/s`
+- average:
+  - total: `4857.230 ms`
+  - throughput: `0.318 tok/s`
+
+Current interpretation:
+
+- the direct packed decode benchmark now clearly clears the old sub-`0.25 tok/s` territory
+- the warm second pass is above `0.5 tok/s`, which is a meaningful step toward the current `1 tok/s` target
+- the gap between the warm chunked upper bound and the direct benchmark still points at broader end-to-end decode overhead outside the isolated chunk plan
+
 ### Chunked MLP-only packed upper bound
 
 Using the same helper on the `mlp` variant now produces:
