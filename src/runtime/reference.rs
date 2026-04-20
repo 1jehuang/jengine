@@ -3916,6 +3916,10 @@ mod tests {
                 .expect("packed model should load");
         let prompt_ids = [2usize];
         let expected_dispatches = packed.config.num_hidden_layers * 2 + 1;
+        let kv_rows = packed.config.num_key_value_heads * packed.config.head_dim;
+        let expected_download_bytes = packed.config.num_hidden_layers
+            * (packed.config.hidden_size + (2 * kv_rows) + (2 * packed.config.intermediate_size))
+            * std::mem::size_of::<f32>();
 
         let first = packed
             .benchmark_packed_step_from_token_ids(&prompt_ids, true, true)
@@ -3926,6 +3930,8 @@ mod tests {
 
         assert_eq!(first.dispatch_count, expected_dispatches);
         assert_eq!(second.dispatch_count, expected_dispatches);
+        assert_eq!(first.download_bytes, expected_download_bytes);
+        assert_eq!(second.download_bytes, expected_download_bytes);
         assert!(first.weight_upload_bytes > 0);
         assert!(first.weight_upload_duration > Duration::ZERO);
         assert!(first.compile_duration > Duration::ZERO);
