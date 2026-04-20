@@ -146,6 +146,23 @@ Build a long-lived decode session that keeps resident:
 
 The CPU should submit a tiny per-token request instead of rebuilding decode state each step.
 
+### Milestone 1a: shared Vulkan context prerequisite
+
+A direct attempt to make packed runners share a single Vulkan context exposed an important implementation blocker:
+
+- the current packed runner implementation was originally built around one isolated Vulkan instance/device/queue per runner
+- resident outputs can stay on-GPU inside one runner, but cannot yet be safely chained across runners
+- a first all-at-once shared-context prototype currently triggers Vulkan-side instability in synthetic packed decode tests
+
+So the safe next step is to stage this refactor more carefully:
+
+1. extract an explicit reusable packed Vulkan context type
+2. make runner construction optionally accept that context without changing decode behavior
+3. validate multiple runners on one shared device with synthetic micro-tests
+4. only then wire the shared context into decode-session caches
+
+This shared-context refactor is a prerequisite for true GPU-resident hidden-state flow across projections.
+
 ### Milestone 2: GPU-resident hidden and residual flow
 
 Keep the following on GPU across the one-token path:
