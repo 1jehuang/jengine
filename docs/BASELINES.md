@@ -636,6 +636,43 @@ Current interpretation:
 - the attention sub-breakdown shows that almost all of that attention-side cost is the `o_proj` part, not the attention core itself
 - that means the next direct end-to-end improvement likely needs a better `o_proj` integration path while keeping the MLP-side warm-path gains intact
 
+### Direct prewarmed full-attention + full-MLP `bench_packed_toks` sample
+
+Command shape:
+
+```bash
+JENGINE_NO_HEARTBEAT=1 JENGINE_PREWARM_PACKED=1 JENGINE_PACKED_ATTENTION_FULL=1 JENGINE_PACKED_MLP_FULL=1 ./target/release/bench_packed_toks \
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model hello 1 2 combined
+```
+
+Observed sample:
+
+- iteration 1:
+  - total: `622.446 ms`
+  - throughput: `1.607 tok/s`
+  - attention: `33.072 ms`
+    - `attention_query`: `0.316 ms`
+    - `attention_oproj`: `32.667 ms`
+  - mlp: `147.030 ms`
+    - `mlp_down`: `48.184 ms`
+- iteration 2, warm:
+  - total: `289.158 ms`
+  - throughput: `3.458 tok/s`
+  - attention: `24.014 ms`
+    - `attention_query`: `0.283 ms`
+    - `attention_oproj`: `23.723 ms`
+  - mlp: `115.806 ms`
+    - `mlp_down`: `42.167 ms`
+- average:
+  - total: `455.802 ms`
+  - throughput: `2.532 tok/s`
+
+Current interpretation:
+
+- once both full attention and full MLP offload are enabled on the warm direct path, the packed benchmark decisively clears the old `1 tok/s` target
+- even the first measured prewarmed iteration is above `1.6 tok/s`
+- the warm second pass is above `3 tok/s`, which shows that the packed runtime can now reach genuine multi-token-per-second territory on this hardware when the right warm-path structure is in place
+
 ### Real `o_proj` tensor microbenchmark
 
 Command shapes:

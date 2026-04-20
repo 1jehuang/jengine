@@ -8,9 +8,9 @@ These are the near-term practical targets for packed decode on this machine, usi
 
 The packed runtime architecture is now in place, and the benchmark harnesses can now capture `mlp` and `combined` short-context runs reliably after adding staged progress output.
 
-A paired-dispatch optimization also reduced the combined packed decode path from `140` GPU dispatches per one-token step or prefill span down to `84`.
+A paired-dispatch optimization also reduced the combined packed decode path from `140` GPU dispatches per one-token step or prefill span down to `84`, and later work brought the current warm direct path down to much more usable territory.
 
-The `attention`-only short-context run is still slow enough that this harness may terminate it before the final summary prints, so its tok/s number is not yet stable here.
+The old `1 tok/s` near-term target has now been cleared on the direct warm path, so the next benchmark target should move into stable multi-token-per-second territory.
 
 ## Latest measured short-context samples
 
@@ -18,53 +18,51 @@ Command shape:
 
 ```bash
 ./target/release/bench_packed_toks \
-  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model hello 1 1 <variant>
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model hello 1 2 combined
 ```
 
 Observed samples:
 
-- `mlp`
-  - total: `14441.214 ms`
-  - throughput: `0.069 tok/s`
-  - dispatches: `56`
-- `combined`
+- earlier `combined` sample:
   - total: `11873.378 ms`
   - throughput: `0.084 tok/s`
-  - dispatches: `168`
-- `attention`
-  - run still terminates in this harness before the final summary is emitted
-  - staged progress confirms the decode work is running, but the result is not yet stable enough to record as a baseline here
+- warm full-MLP sample:
+  - iteration 2: `1969.099 ms`, `0.508 tok/s`
+- prewarmed full-attention + full-MLP sample:
+  - iteration 1: `622.446 ms`, `1.607 tok/s`
+  - iteration 2: `289.158 ms`, `3.458 tok/s`
+  - average: `455.802 ms`, `2.532 tok/s`
 
-So the immediate target should remain modest and concrete.
+So the benchmark is no longer merely crawling. The direct warm path is now in genuine multi-token-per-second territory when the warm-path structure is preserved.
 
 ## Near-term target
 
 ### Functional target
 
 - the packed short-context benchmark harness must run successfully for:
-  - `mlp`
   - `combined`
-- the `attention`-only variant still needs a more stable capture path in this harness
+- historical `attention`-only / `mlp`-only captures are now less interesting than the stronger direct warm combined path, so the next practical focus should stay on the direct combined benchmark and its warm-path structure
 
 ### Performance target
 
-For short-context local packed decode on this hardware, target:
+For short-context local packed decode on this hardware, target next:
 
-- **at least `1.0 tok/s`** for the `combined` packed path on a short prompt once stable benchmark harvesting is working
+- **at least `4.0 tok/s`** on the direct warm `combined` packed path
+- and improve the first measured prewarmed iteration further above the current `1.607 tok/s`
 
-This is a deliberately conservative near-term target. It is not the final ceiling target.
+This is the new near-term target after clearing the older `1.0 tok/s` milestone.
 
 ## Why this target
 
-- the current measured `combined` short-context run is only about `0.084 tok/s`, so there is still a large gap to close
-- a conservative `1.0 tok/s` target still represents a clear and meaningful packed-runtime win on this hardware
-- the paired-dispatch reduction already removed a chunk of obvious overhead, so the next improvements should come from further orchestration and batching work rather than just adding more projections
+- the packed direct warm path now already clears the old `1.0 tok/s` milestone, reaching `3.458 tok/s` on the warm second pass of the strongest current configuration
+- the next useful benchmark question is therefore not whether packed decode can break `1 tok/s`, but whether it can sustain and stabilize multi-token-per-second behavior on the direct path
+- the main remaining gap is now in preserving the best warm-path structure for the direct benchmark rather than proving viability at all
 
-## Next target after first clean win
+## Next target after first clean multi-token/s win
 
-After the first reproducible short-context win at or above `1.0 tok/s`, update this document with:
+After the first reproducible direct warm combined result at or above `4.0 tok/s`, update this document with:
 
-- a stable measured `attention` tok/s capture
-- refreshed `mlp` tok/s
-- refreshed `combined` tok/s
-- the next target, likely in the multi-token-per-second range above `1.0 tok/s`
+- refreshed direct first-iteration prewarmed tok/s
+- refreshed direct warm second-pass tok/s
+- a new practical target beyond `4 tok/s`
+- and, once stable enough, an updated practical ceiling estimate for this Intel Arc iGPU

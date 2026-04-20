@@ -481,12 +481,33 @@ impl PackedDecodeMetrics {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PackedDispatchTrace {
+    pub index: usize,
+    pub operation: String,
+    pub stage: String,
+    pub tensor_name: String,
+    pub rows: usize,
+    pub cols: usize,
+    pub pack_cache_hit: bool,
+    pub gpu_cache_hit: bool,
+    pub compile_ms: f64,
+    pub weight_upload_ms: f64,
+    pub activation_upload_ms: f64,
+    pub gpu_ms: f64,
+    pub download_ms: f64,
+    pub weight_upload_bytes: usize,
+    pub activation_upload_bytes: usize,
+    pub download_bytes: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PackedDecodeResult {
     pub output_token_ids: Vec<usize>,
     pub output_text: String,
     pub decode_metrics: DecodeMetrics,
     pub metrics: PackedDecodeMetrics,
+    pub dispatch_trace: Vec<PackedDispatchTrace>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -538,9 +559,18 @@ struct PackedGpuSessionMetrics {
     download_bytes: usize,
 }
 
+struct PreparedProjectionRunner {
+    packed: Rc<PackedProjectionCache>,
+    compile_duration: Duration,
+    weight_upload_duration: Duration,
+    pack_cache_hit: bool,
+    gpu_cache_hit: bool,
+}
+
 struct PackedGpuSession<'a> {
     model: &'a ReferenceModel,
     metrics: PackedGpuSessionMetrics,
+    dispatch_trace: Vec<PackedDispatchTrace>,
 }
 
 impl<'a> PackedGpuSession<'a> {
@@ -548,6 +578,7 @@ impl<'a> PackedGpuSession<'a> {
         Self {
             model,
             metrics: PackedGpuSessionMetrics::default(),
+            dispatch_trace: Vec::new(),
         }
     }
 
@@ -558,8 +589,7 @@ impl<'a> PackedGpuSession<'a> {
         cols: usize,
         input: &[f32],
     ) -> Result<Vec<f32>, ReferenceError> {
-        let (packed, weight_upload_duration, gpu_cache_hit) =
-            self.prepare_projection_runner(tensor_name, rows, cols)?;
+        let prepared = self.prepare_projection_runner(tensor_name, rows, cols)?;
 
         let (output, report) = self
             .model
@@ -573,13 +603,34 @@ impl<'a> PackedGpuSession<'a> {
             .map_err(|error| {
                 ReferenceError::Decode(format!("gpu projection failed for {tensor_name}: {error}"))
             })?;
+        let weight_upload_bytes = usize::from(!prepared.gpu_cache_hit)
+            * (prepared.packed.code_words.len() * std::mem::size_of::<u32>()
+                + prepared.packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        let download_bytes = rows * std::mem::size_of::<f32>();
         self.account_projection_report(
-            &packed,
+            &prepared.packed,
             cols,
-            weight_upload_duration,
-            gpu_cache_hit,
+            prepared.weight_upload_duration,
+            prepared.gpu_cache_hit,
             &report,
-            rows * std::mem::size_of::<f32>(),
+            download_bytes,
+        );
+        self.push_dispatch_trace(
+            tensor_name,
+            "single",
+            rows,
+            cols,
+            prepared.pack_cache_hit,
+            prepared.gpu_cache_hit,
+            prepared.compile_duration,
+            prepared.weight_upload_duration,
+            report.upload_duration,
+            report.gpu_duration,
+            report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            download_bytes,
         );
         Ok(output)
     }
@@ -591,8 +642,7 @@ impl<'a> PackedGpuSession<'a> {
         cols: usize,
         input: &[f32],
     ) -> Result<usize, ReferenceError> {
-        let (packed, weight_upload_duration, gpu_cache_hit) =
-            self.prepare_projection_runner(tensor_name, rows, cols)?;
+        let prepared = self.prepare_projection_runner(tensor_name, rows, cols)?;
         let (argmax_index, report) = self
             .model
             .cached_projection_gpu
@@ -605,12 +655,32 @@ impl<'a> PackedGpuSession<'a> {
             .map_err(|error| {
                 ReferenceError::Decode(format!("gpu projection failed for {tensor_name}: {error}"))
             })?;
+        let weight_upload_bytes = usize::from(!prepared.gpu_cache_hit)
+            * (prepared.packed.code_words.len() * std::mem::size_of::<u32>()
+                + prepared.packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
         self.account_projection_report(
-            &packed,
+            &prepared.packed,
             cols,
-            weight_upload_duration,
-            gpu_cache_hit,
+            prepared.weight_upload_duration,
+            prepared.gpu_cache_hit,
             &report,
+            0,
+        );
+        self.push_dispatch_trace(
+            tensor_name,
+            "argmax",
+            rows,
+            cols,
+            prepared.pack_cache_hit,
+            prepared.gpu_cache_hit,
+            prepared.compile_duration,
+            prepared.weight_upload_duration,
+            report.upload_duration,
+            report.gpu_duration,
+            report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
             0,
         );
         Ok(argmax_index)
@@ -621,7 +691,7 @@ impl<'a> PackedGpuSession<'a> {
         tensor_name: &str,
         rows: usize,
         cols: usize,
-    ) -> Result<(Rc<PackedProjectionCache>, Duration, bool), ReferenceError> {
+    ) -> Result<PreparedProjectionRunner, ReferenceError> {
         let (packed, pack_duration, pack_cache_hit) =
             self.model
                 .get_or_create_projection_cache(tensor_name, rows, cols)?;
@@ -633,7 +703,69 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.weight_upload_duration += weight_upload_duration;
         self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
-        Ok((packed, weight_upload_duration, gpu_cache_hit))
+        Ok(PreparedProjectionRunner {
+            packed,
+            compile_duration,
+            weight_upload_duration,
+            pack_cache_hit,
+            gpu_cache_hit,
+        })
+    }
+
+    fn push_dispatch_trace(
+        &mut self,
+        tensor_name: &str,
+        operation: &str,
+        rows: usize,
+        cols: usize,
+        pack_cache_hit: bool,
+        gpu_cache_hit: bool,
+        compile_duration: Duration,
+        weight_upload_duration: Duration,
+        activation_upload_duration: Duration,
+        gpu_duration: Duration,
+        download_duration: Duration,
+        weight_upload_bytes: usize,
+        activation_upload_bytes: usize,
+        download_bytes: usize,
+    ) {
+        let stage = if tensor_name == "model.embed_tokens.weight" {
+            if operation == "argmax" {
+                "logits_argmax".to_string()
+            } else {
+                "logits".to_string()
+            }
+        } else if tensor_name.contains("self_attn.o_proj") {
+            "attention_oproj".to_string()
+        } else if tensor_name.contains("self_attn")
+            || tensor_name.contains("concat::model.layers") && tensor_name.contains("self_attn")
+        {
+            "attention_qkv".to_string()
+        } else if tensor_name.contains("mlp.down_proj") {
+            "mlp_down".to_string()
+        } else if tensor_name.contains("mlp") {
+            "mlp_gu".to_string()
+        } else {
+            "packed_dispatch".to_string()
+        };
+        self.dispatch_trace.push(PackedDispatchTrace {
+            index: self.dispatch_trace.len() + 1,
+            operation: operation.to_string(),
+            stage,
+            tensor_name: tensor_name.to_string(),
+            rows,
+            cols,
+            pack_cache_hit,
+            gpu_cache_hit,
+            compile_ms: compile_duration.as_secs_f64() * 1_000.0,
+            weight_upload_ms: weight_upload_duration.as_secs_f64() * 1_000.0,
+            activation_upload_ms: activation_upload_duration.as_secs_f64() * 1_000.0,
+            gpu_ms: gpu_duration.as_secs_f64() * 1_000.0,
+            download_ms: download_duration.as_secs_f64() * 1_000.0,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            download_bytes,
+        });
     }
 
     fn account_projection_report(
@@ -716,6 +848,27 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.download_bytes += (first_rows + second_rows) * std::mem::size_of::<f32>();
 
         let (first, second) = combined.split_at(first_rows);
+        let weight_upload_bytes = usize::from(!gpu_cache_hit)
+            * (packed.code_words.len() * std::mem::size_of::<u32>()
+                + packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        let download_bytes = (first_rows + second_rows) * std::mem::size_of::<f32>();
+        self.push_dispatch_trace(
+            &pair_key,
+            "pair",
+            first_rows + second_rows,
+            cols,
+            pack_cache_hit,
+            gpu_cache_hit,
+            compile_duration,
+            weight_upload_duration,
+            report.upload_duration,
+            report.gpu_duration,
+            report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            download_bytes,
+        );
         Ok((first.to_vec(), second.to_vec()))
     }
 
@@ -780,6 +933,27 @@ impl<'a> PackedGpuSession<'a> {
 
         let (first, tail) = combined.split_at(first_rows);
         let (second, third) = tail.split_at(second_rows);
+        let weight_upload_bytes = usize::from(!gpu_cache_hit)
+            * (packed.code_words.len() * std::mem::size_of::<u32>()
+                + packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        let download_bytes = (first_rows + second_rows + third_rows) * std::mem::size_of::<f32>();
+        self.push_dispatch_trace(
+            &triplet_key,
+            "triplet",
+            first_rows + second_rows + third_rows,
+            cols,
+            pack_cache_hit,
+            gpu_cache_hit,
+            compile_duration,
+            weight_upload_duration,
+            report.upload_duration,
+            report.gpu_duration,
+            report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            download_bytes,
+        );
         Ok((first.to_vec(), second.to_vec(), third.to_vec()))
     }
 }
@@ -2819,6 +2993,7 @@ impl ReferenceModel {
             output_text,
             decode_metrics: metrics,
             metrics: packed_metrics,
+            dispatch_trace: session.dispatch_trace,
         })
     }
 
