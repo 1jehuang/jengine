@@ -418,6 +418,31 @@ Current interpretation:
 - that makes subgroup-tuned or cooperative-matrix-oriented experimentation a real next option rather than pure speculation
 - the repo still needs actual alternative shader experiments to prove whether those capabilities translate into materially better packed throughput
 
+### First Xe2-oriented packed shader microbenchmark
+
+Command shape:
+
+```bash
+cargo run --quiet --bin vulkan_packed_matvec -- \
+  /home/jeremy/models/bonsai-1.7b/model.safetensors \
+  model.layers.0.self_attn.q_proj.weight 2048 2048
+
+JENGINE_PACKED_SHADER_VARIANT=xe2_32 cargo run --quiet --bin vulkan_packed_matvec -- \
+  /home/jeremy/models/bonsai-1.7b/model.safetensors \
+  model.layers.0.self_attn.q_proj.weight 2048 2048
+```
+
+Observed repeated medians:
+
+- default packed shader: `1.248 ms` GPU
+- `xe2_32` packed shader: `1.244 ms` GPU
+
+Current interpretation:
+
+- a subgroup-aligned 32-thread local size is technically fine on this hardware
+- but the observed improvement is only about `0.3%`, which is too small to treat as a meaningful win
+- so the first Xe2-oriented tweak is inconclusive, and larger kernel changes would still be needed to move the overall runtime materially
+
 ## Chunked packed capture workarounds
 
 ### Real combined and attention-only packed step upper bounds via 7-layer chunk chaining

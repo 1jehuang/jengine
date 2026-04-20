@@ -136,6 +136,7 @@ pub struct CachedGpuPackedMatvecRunner {
     cols: usize,
     group_size: usize,
     packed_cols: usize,
+    workgroup_size: u32,
     descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     shader_module: vk::ShaderModule,
@@ -199,7 +200,8 @@ impl CachedGpuPackedMatvecRunner {
         cols: usize,
     ) -> Result<(Self, Duration), GpuPackedMatvecError> {
         let compile_started = Instant::now();
-        let shader_path = compile_shader(Path::new("shaders/packed_ternary_matvec.comp"))?;
+        let (shader_source, workgroup_size) = packed_shader_variant();
+        let shader_path = compile_shader(Path::new(shader_source))?;
 
         let entry = unsafe { Entry::load()? };
         let app_name = CString::new("jengine-packed-matvec")?;
@@ -381,6 +383,7 @@ impl CachedGpuPackedMatvecRunner {
             cols,
             group_size,
             packed_cols,
+            workgroup_size,
             descriptor_set_layout,
             pipeline_layout,
             shader_module,
@@ -572,8 +575,12 @@ impl CachedGpuPackedMatvecRunner {
                 0,
                 push_bytes,
             );
-            self.device
-                .cmd_dispatch(self.command_buffer, self.rows.div_ceil(64) as u32, 1, 1);
+            self.device.cmd_dispatch(
+                self.command_buffer,
+                self.rows.div_ceil(self.workgroup_size as usize) as u32,
+                1,
+                1,
+            );
             self.device.end_command_buffer(self.command_buffer)?;
         }
         Ok(())
@@ -610,17 +617,31 @@ struct BufferAllocation {
     size: u64,
 }
 
+fn packed_shader_variant() -> (&'static str, u32) {
+    match std::env::var("JENGINE_PACKED_SHADER_VARIANT")
+        .ok()
+        .as_deref()
+    {
+        Some("xe2_32") => ("shaders/packed_ternary_matvec_xe2_32.comp", 32),
+        _ => ("shaders/packed_ternary_matvec.comp", 64),
+    }
+}
+
 fn compile_shader(path: &Path) -> Result<PathBuf, GpuPackedMatvecError> {
     let temp_dir = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".tmp"));
     std::fs::create_dir_all(&temp_dir)?;
-    let out = temp_dir.join("jengine-packed-matvec.spv");
+    let shader_stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("jengine-packed-matvec");
+    let out = temp_dir.join(format!("{shader_stem}.spv"));
     if shader_cache_is_fresh(path, &out)? {
         return Ok(out);
     }
     let tmp = temp_dir.join(format!(
-        "jengine-packed-matvec-{}-{}.tmp.spv",
+        "{shader_stem}-{}-{}.tmp.spv",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
