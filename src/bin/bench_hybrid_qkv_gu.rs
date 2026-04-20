@@ -95,6 +95,18 @@ fn main() {
                     .expect("hybrid qkv+gud decode should succeed")
             }),
         ),
+        "qkv+gu+logits" => (
+            "qkv+gu+logits",
+            run_stage("hybrid_qkv_gu_logits", || {
+                model
+                    .benchmark_cached_hybrid_qkv_gu_logits_decode(
+                        &prompt,
+                        max_new_tokens,
+                        layer_idx,
+                    )
+                    .expect("hybrid qkv+gu+logits decode should succeed")
+            }),
+        ),
         other => panic!("unsupported variant: {other}"),
     };
 

@@ -1837,6 +1837,7 @@ impl ReferenceModel {
             layer_idx,
             false,
             false,
+            false,
         )
     }
 
@@ -1851,6 +1852,7 @@ impl ReferenceModel {
             max_new_tokens,
             layer_idx,
             true,
+            false,
             false,
         )
     }
@@ -1867,6 +1869,23 @@ impl ReferenceModel {
             layer_idx,
             false,
             true,
+            false,
+        )
+    }
+
+    pub fn benchmark_cached_hybrid_qkv_gu_logits_decode(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        layer_idx: usize,
+    ) -> Result<HybridProjectionDecodeMetrics, ReferenceError> {
+        self.benchmark_cached_hybrid_attention_mlp_decode(
+            prompt,
+            max_new_tokens,
+            layer_idx,
+            false,
+            false,
+            true,
         )
     }
 
@@ -1877,6 +1896,7 @@ impl ReferenceModel {
         layer_idx: usize,
         use_o_proj: bool,
         use_down_proj: bool,
+        use_logits_proj: bool,
     ) -> Result<HybridProjectionDecodeMetrics, ReferenceError> {
         let tokenizer = self
             .tokenizer
@@ -1892,6 +1912,7 @@ impl ReferenceModel {
         let gate_name = format!("{prefix}.mlp.gate_proj.weight");
         let up_name = format!("{prefix}.mlp.up_proj.weight");
         let down_name = format!("{prefix}.mlp.down_proj.weight");
+        let logits_name = "model.embed_tokens.weight";
 
         let hidden_rows = self.config.hidden_size;
         let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
@@ -1966,6 +1987,22 @@ impl ReferenceModel {
             None
         };
 
+        let logits_gpu = if use_logits_proj {
+            let (logits_packed, pack, _) = self.get_or_create_projection_cache(
+                logits_name,
+                self.config.vocab_size,
+                hidden_rows,
+            )?;
+            let (logits_gpu, compile, weight_upload, _) =
+                self.get_or_create_projection_gpu(logits_name, &logits_packed)?;
+            pack_duration += pack;
+            compile_duration += compile;
+            upload_duration += weight_upload;
+            Some(logits_gpu)
+        } else {
+            None
+        };
+
         let total_started = Instant::now();
         let mut metrics = DecodeMetrics {
             prompt_tokens: prompt_ids.len(),
@@ -1998,6 +2035,7 @@ impl ReferenceModel {
                 &gate_gpu,
                 &up_gpu,
                 down_gpu.as_ref(),
+                logits_gpu.as_ref(),
             )?;
             last_logits = logits;
             upload += u;
@@ -2024,6 +2062,7 @@ impl ReferenceModel {
                 &gate_gpu,
                 &up_gpu,
                 down_gpu.as_ref(),
+                logits_gpu.as_ref(),
             )?;
             last_logits = logits;
             upload += u;
@@ -2034,11 +2073,20 @@ impl ReferenceModel {
             tokenizer.decode(&output_ids.iter().map(|id| *id as u32).collect::<Vec<_>>())?;
 
         Ok(HybridProjectionDecodeMetrics {
-            enabled_projections: match (use_o_proj, use_down_proj) {
-                (false, false) => "qkv+gu".to_string(),
-                (true, false) => "qkvo+gu".to_string(),
-                (false, true) => "qkv+gud".to_string(),
-                (true, true) => "qkvo+gud".to_string(),
+            enabled_projections: {
+                let mut label = if use_o_proj {
+                    "qkvo".to_string()
+                } else {
+                    "qkv".to_string()
+                };
+                label.push_str("+gu");
+                if use_down_proj {
+                    label.push('d');
+                }
+                if use_logits_proj {
+                    label.push_str("+logits");
+                }
+                label
             },
             total_duration: total_started.elapsed(),
             pack_duration,
@@ -3088,6 +3136,7 @@ impl ReferenceModel {
         gate_gpu: &Rc<RefCell<CachedGpuPackedMatvecRunner>>,
         up_gpu: &Rc<RefCell<CachedGpuPackedMatvecRunner>>,
         down_gpu: Option<&Rc<RefCell<CachedGpuPackedMatvecRunner>>>,
+        logits_gpu: Option<&Rc<RefCell<CachedGpuPackedMatvecRunner>>>,
     ) -> Result<(Vec<f32>, Duration, Duration, Duration), ReferenceError> {
         let started_at = Instant::now();
         let mut hidden = self
@@ -3316,9 +3365,19 @@ impl ReferenceModel {
         metrics.norm_duration += started_at.elapsed();
 
         let started_at = Instant::now();
-        let logits = self
-            .weights
-            .matvec_f16("model.embed_tokens.weight", &hidden)?;
+        let logits = if let Some(logits_gpu) = logits_gpu {
+            let (out, report) = logits_gpu
+                .borrow_mut()
+                .run_with_output(&hidden, None)
+                .map_err(|error| ReferenceError::Decode(format!("gpu logits failed: {error}")))?;
+            upload += report.upload_duration;
+            gpu += report.gpu_duration;
+            download += report.download_duration;
+            out
+        } else {
+            self.weights
+                .matvec_f16("model.embed_tokens.weight", &hidden)?
+        };
         metrics.logits_duration += started_at.elapsed();
         Ok((logits, upload, gpu, download))
     }

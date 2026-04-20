@@ -353,6 +353,34 @@ Current interpretation:
 - `down_proj` therefore does not look like the next clean hybrid decode-side win either
 - the next dense-hotspot experiments should bias toward logits and larger packed-first execution changes
 
+### Real cached `qkv + gu` vs `qkv + gu + logits` layer samples
+
+Command shape:
+
+```bash
+JENGINE_NO_HEARTBEAT=1 ./target/release/bench_hybrid_qkv_gu \
+  /home/jeremy/models/bonsai-1.7b hello 1 <layer> <variant>
+```
+
+Observed three-sample medians:
+
+- layer `0`
+  - `qkv+gu`: `1378.146 ms`
+  - `qkv+gu+logits`: `1388.570 ms`
+- layer `14`
+  - `qkv+gu`: `1451.116 ms`
+  - `qkv+gu+logits`: `1623.055 ms`
+- layer `27`
+  - `qkv+gu`: `1466.605 ms`
+  - `qkv+gu+logits`: `1344.904 ms`
+
+Current interpretation:
+
+- logits offload is mixed rather than universally better
+- it regresses the middle sampled layer and is roughly neutral-to-slightly-worse on the early sampled layer
+- but it produces a real win on the late sampled layer, unlike the `o_proj` and `down_proj` experiments
+- that makes logits worth deeper follow-up, especially if output-side transfer and synchronization overhead can be reduced
+
 ## Packed layer sweep baselines
 
 ### Real all-layer packed projection sweep
