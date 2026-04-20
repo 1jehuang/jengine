@@ -386,6 +386,9 @@ pub struct PackedDecodeMetrics {
     pub norm_duration: Duration,
     pub qkv_duration: Duration,
     pub attention_duration: Duration,
+    pub attention_query_duration: Duration,
+    pub attention_oproj_duration: Duration,
+    pub attention_residual_duration: Duration,
     pub mlp_duration: Duration,
     pub mlp_swiglu_duration: Duration,
     pub mlp_down_duration: Duration,
@@ -439,13 +442,16 @@ impl PackedDecodeMetrics {
 
     pub fn summarize(&self) -> String {
         format!(
-            "enabled={} total_ms={:.3} embed_ms={:.3} norm_ms={:.3} qkv_ms={:.3} attention_ms={:.3} mlp_ms={:.3} mlp_swiglu_ms={:.3} mlp_down_ms={:.3} mlp_residual_ms={:.3} logits_ms={:.3} pack_ms={:.3} compile_ms={:.3} weight_upload_ms={:.3} activation_upload_ms={:.3} upload_ms={:.3} gpu_ms={:.3} download_ms={:.3} non_offloaded_dense_ms={:.3} orchestration_ms={:.3} pack_cache_hits={} gpu_cache_hits={} dispatch_count={} weight_upload_bytes={} activation_upload_bytes={} upload_bytes={} download_bytes={} streamed_bytes={} e2e_gbps={:.3} stream_window_gbps={:.3} output={}",
+            "enabled={} total_ms={:.3} embed_ms={:.3} norm_ms={:.3} qkv_ms={:.3} attention_ms={:.3} attention_query_ms={:.3} attention_oproj_ms={:.3} attention_residual_ms={:.3} mlp_ms={:.3} mlp_swiglu_ms={:.3} mlp_down_ms={:.3} mlp_residual_ms={:.3} logits_ms={:.3} pack_ms={:.3} compile_ms={:.3} weight_upload_ms={:.3} activation_upload_ms={:.3} upload_ms={:.3} gpu_ms={:.3} download_ms={:.3} non_offloaded_dense_ms={:.3} orchestration_ms={:.3} pack_cache_hits={} gpu_cache_hits={} dispatch_count={} weight_upload_bytes={} activation_upload_bytes={} upload_bytes={} download_bytes={} streamed_bytes={} e2e_gbps={:.3} stream_window_gbps={:.3} output={}",
             self.enabled_projections,
             self.total_duration.as_secs_f64() * 1_000.0,
             self.embedding_duration.as_secs_f64() * 1_000.0,
             self.norm_duration.as_secs_f64() * 1_000.0,
             self.qkv_duration.as_secs_f64() * 1_000.0,
             self.attention_duration.as_secs_f64() * 1_000.0,
+            self.attention_query_duration.as_secs_f64() * 1_000.0,
+            self.attention_oproj_duration.as_secs_f64() * 1_000.0,
+            self.attention_residual_duration.as_secs_f64() * 1_000.0,
             self.mlp_duration.as_secs_f64() * 1_000.0,
             self.mlp_swiglu_duration.as_secs_f64() * 1_000.0,
             self.mlp_down_duration.as_secs_f64() * 1_000.0,
@@ -498,6 +504,13 @@ impl PackedDecodeValidationReport {
             self.enabled_projections, self.prompt_tokens, self.max_abs_diff, self.mean_abs_diff,
         )
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PackedAttentionStageMetrics {
+    query_duration: Duration,
+    oproj_duration: Duration,
+    residual_duration: Duration,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -808,10 +821,16 @@ impl ReferenceModel {
         std::env::var_os("JENGINE_PACKED_MLP_FULL").is_some()
     }
 
+    fn packed_use_attention_full() -> bool {
+        std::env::var_os("JENGINE_PACKED_ATTENTION_FULL").is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn finish_packed_decode_metrics(
         enabled_projections: String,
         total_duration: Duration,
         decode_metrics: &DecodeMetrics,
+        attention_stage_metrics: &PackedAttentionStageMetrics,
         mlp_stage_metrics: &PackedMlpStageMetrics,
         non_offloaded_dense_duration: Duration,
         session: &PackedGpuSession<'_>,
@@ -833,6 +852,9 @@ impl ReferenceModel {
             norm_duration: decode_metrics.norm_duration,
             qkv_duration: decode_metrics.qkv_duration,
             attention_duration: decode_metrics.attention_duration,
+            attention_query_duration: attention_stage_metrics.query_duration,
+            attention_oproj_duration: attention_stage_metrics.oproj_duration,
+            attention_residual_duration: attention_stage_metrics.residual_duration,
             mlp_duration: decode_metrics.mlp_duration,
             mlp_swiglu_duration: mlp_stage_metrics.swiglu_duration,
             mlp_down_duration: mlp_stage_metrics.down_duration,
@@ -2347,6 +2369,7 @@ impl ReferenceModel {
         let mut cache = self.allocate_layer_cache_vec(prompt_ids.len());
         let mut session = PackedGpuSession::new(self);
         let mut non_offloaded_dense_duration = Duration::ZERO;
+        let mut attention_stage_metrics = PackedAttentionStageMetrics::default();
         let mut mlp_stage_metrics = PackedMlpStageMetrics::default();
         for (position, &token_id) in prompt_ids.iter().enumerate() {
             let _ = self.forward_step_packed_decode(
@@ -2354,6 +2377,7 @@ impl ReferenceModel {
                 position,
                 &mut cache,
                 &mut metrics,
+                &mut attention_stage_metrics,
                 &mut mlp_stage_metrics,
                 &mut non_offloaded_dense_duration,
                 &mut session,
@@ -2367,6 +2391,7 @@ impl ReferenceModel {
             Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
             total_started.elapsed(),
             &metrics,
+            &attention_stage_metrics,
             &mlp_stage_metrics,
             non_offloaded_dense_duration,
             &session,
@@ -2406,6 +2431,7 @@ impl ReferenceModel {
         };
         let mut session = PackedGpuSession::new(self);
         let mut non_offloaded_dense_duration = Duration::ZERO;
+        let mut attention_stage_metrics = PackedAttentionStageMetrics::default();
         let mut mlp_stage_metrics = PackedMlpStageMetrics::default();
         let mut hidden = if let Some(hidden_in) = hidden_in {
             hidden_in.to_vec()
@@ -2495,6 +2521,7 @@ impl ReferenceModel {
             non_offloaded_dense_duration += elapsed;
 
             let started_at = Instant::now();
+            let attn_started_at = Instant::now();
             let attn = attention_single_query(
                 &q,
                 &k,
@@ -2504,15 +2531,41 @@ impl ReferenceModel {
                 self.config.num_key_value_heads,
                 self.config.head_dim,
             );
-            let attn_output = self.matvec_f16_resolved(&layer_tensors.o_proj_weight, &attn)?;
+            let attn_elapsed = attn_started_at.elapsed();
+            attention_stage_metrics.query_duration += attn_elapsed;
+            let use_attention_full = use_attention_qkv && Self::packed_use_attention_full();
+            let oproj_started_at = Instant::now();
+            let attn_output = if use_attention_full {
+                session.run_projection(
+                    &layer_tensors.o_proj_weight,
+                    self.config.hidden_size,
+                    self.config.hidden_size,
+                    &attn,
+                )?
+            } else {
+                self.matvec_f16_resolved(&layer_tensors.o_proj_weight, &attn)?
+            };
+            let oproj_elapsed = oproj_started_at.elapsed();
+            attention_stage_metrics.oproj_duration += oproj_elapsed;
+            let residual_started_at = Instant::now();
             hidden = residual
                 .iter()
                 .zip(attn_output.iter())
                 .map(|(left, right)| left + right)
                 .collect();
+            let residual_elapsed = residual_started_at.elapsed();
+            attention_stage_metrics.residual_duration += residual_elapsed;
             let elapsed = started_at.elapsed();
             metrics.attention_duration += elapsed;
-            non_offloaded_dense_duration += elapsed;
+            if use_attention_qkv {
+                if use_attention_full {
+                    non_offloaded_dense_duration += attn_elapsed + residual_elapsed;
+                } else {
+                    non_offloaded_dense_duration += elapsed;
+                }
+            } else {
+                non_offloaded_dense_duration += elapsed;
+            }
 
             let residual = hidden;
             let started_at = Instant::now();
@@ -2611,6 +2664,7 @@ impl ReferenceModel {
                 Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
                 total_started.elapsed(),
                 &metrics,
+                &attention_stage_metrics,
                 &mlp_stage_metrics,
                 non_offloaded_dense_duration,
                 &session,
@@ -2682,6 +2736,7 @@ impl ReferenceModel {
         let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens);
         let mut session = PackedGpuSession::new(self);
         let mut non_offloaded_dense_duration = Duration::ZERO;
+        let mut attention_stage_metrics = PackedAttentionStageMetrics::default();
         let mut mlp_stage_metrics = PackedMlpStageMetrics::default();
         let mut last_next_token = None;
 
@@ -2691,6 +2746,7 @@ impl ReferenceModel {
                 position,
                 &mut cache,
                 &mut metrics,
+                &mut attention_stage_metrics,
                 &mut mlp_stage_metrics,
                 &mut non_offloaded_dense_duration,
                 &mut session,
@@ -2718,6 +2774,7 @@ impl ReferenceModel {
                 prompt_ids.len() + generation_index,
                 &mut cache,
                 &mut metrics,
+                &mut attention_stage_metrics,
                 &mut mlp_stage_metrics,
                 &mut non_offloaded_dense_duration,
                 &mut session,
@@ -2740,6 +2797,7 @@ impl ReferenceModel {
             Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
             total_started.elapsed(),
             &metrics,
+            &attention_stage_metrics,
             &mlp_stage_metrics,
             non_offloaded_dense_duration,
             &session,
@@ -2778,6 +2836,7 @@ impl ReferenceModel {
         let mut cache = self.allocate_layer_cache_vec(prompt_ids.len());
         let mut session = PackedGpuSession::new(self);
         let mut non_offloaded_dense_duration = Duration::ZERO;
+        let mut attention_stage_metrics = PackedAttentionStageMetrics::default();
         let mut mlp_stage_metrics = PackedMlpStageMetrics::default();
         let mut last_logits = Vec::new();
         for (position, &token_id) in prompt_ids.iter().enumerate() {
@@ -2786,6 +2845,7 @@ impl ReferenceModel {
                 position,
                 &mut cache,
                 &mut metrics,
+                &mut attention_stage_metrics,
                 &mut mlp_stage_metrics,
                 &mut non_offloaded_dense_duration,
                 &mut session,
@@ -3239,6 +3299,7 @@ impl ReferenceModel {
         position: usize,
         cache: &mut [LayerCache],
         metrics: &mut DecodeMetrics,
+        attention_stage_metrics: &mut PackedAttentionStageMetrics,
         mlp_stage_metrics: &mut PackedMlpStageMetrics,
         non_offloaded_dense_duration: &mut Duration,
         session: &mut PackedGpuSession<'_>,
@@ -3328,6 +3389,7 @@ impl ReferenceModel {
             *non_offloaded_dense_duration += elapsed;
 
             let started_at = Instant::now();
+            let attn_started_at = Instant::now();
             layer_cache.keys.extend_from_slice(&k);
             layer_cache.values.extend_from_slice(&v);
             let attn = attention_single_query(
@@ -3339,15 +3401,41 @@ impl ReferenceModel {
                 self.config.num_key_value_heads,
                 self.config.head_dim,
             );
-            let attn_output = self.matvec_f16_resolved(&layer_tensors.o_proj_weight, &attn)?;
+            let attn_elapsed = attn_started_at.elapsed();
+            attention_stage_metrics.query_duration += attn_elapsed;
+            let use_attention_full = use_attention_qkv && Self::packed_use_attention_full();
+            let oproj_started_at = Instant::now();
+            let attn_output = if use_attention_full {
+                session.run_projection(
+                    &layer_tensors.o_proj_weight,
+                    self.config.hidden_size,
+                    self.config.hidden_size,
+                    &attn,
+                )?
+            } else {
+                self.matvec_f16_resolved(&layer_tensors.o_proj_weight, &attn)?
+            };
+            let oproj_elapsed = oproj_started_at.elapsed();
+            attention_stage_metrics.oproj_duration += oproj_elapsed;
+            let residual_started_at = Instant::now();
             hidden = residual
                 .iter()
                 .zip(attn_output.iter())
                 .map(|(left, right)| left + right)
                 .collect();
+            let residual_elapsed = residual_started_at.elapsed();
+            attention_stage_metrics.residual_duration += residual_elapsed;
             let elapsed = started_at.elapsed();
             metrics.attention_duration += elapsed;
-            *non_offloaded_dense_duration += elapsed;
+            if use_attention_qkv {
+                if use_attention_full {
+                    *non_offloaded_dense_duration += attn_elapsed + residual_elapsed;
+                } else {
+                    *non_offloaded_dense_duration += elapsed;
+                }
+            } else {
+                *non_offloaded_dense_duration += elapsed;
+            }
 
             let residual = hidden;
             let started_at = Instant::now();

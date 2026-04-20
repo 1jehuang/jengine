@@ -416,11 +416,12 @@ From the latest real one-token run:
 13. With the rebuilt release chunked capture path, the latest combined upper bound is now in the mid-`4.5 s` range, and the stage breakdown shows `mlp_ms=2872.509` as the largest remaining stage-level bucket
 14. The one-process chunked runner shows a warm in-process combined upper bound of `2819.341 ms` with `pack_cache_hits=57` and `gpu_cache_hits=57`, which is about `0.355 tok/s` for one-token decode and confirms that cache reuse now matters a lot
 15. A new packed cache prewarm API now makes the direct packed benchmark much more practical, raising the cold iteration to `0.409 tok/s` and the warm second pass to `0.537 tok/s` with `JENGINE_PREWARM_PACKED=1 JENGINE_PACKED_MLP_FULL=1`
-16. A prewarmed direct attribution sample still shows `non_offloaded_dense_ms=1936.774`, and in that warm full-MLP regime the `attention_ms=1522.674` bucket is now the single biggest direct benchmark stage
-17. The new MLP sub-breakdown shows `mlp_down_ms=1913.680`, which means `down_proj` handling is the dominant subcomponent inside the cold chunked MLP tail even though naive full offload regresses in cold capture
-18. A direct real-tensor microbenchmark still shows `down_proj` packed GPU kernel time at only `0.869 ms` versus `123.933 ms` dense CPU and `133.083 ms` packed CPU, which means the problem is structural integration overhead rather than raw GPU math throughput
-19. Warm in-process full-MLP offload (`JENGINE_PACKED_MLP_FULL=1`) reaches about `0.908 tok/s` in the chunked runner and about `0.537 tok/s` on the direct warm second-pass benchmark with prewarm, so the next goal is to turn that warm-path behavior into a direct end-to-end result closer to `1 tok/s`
-20. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the direct attention path while still preserving the MLP-tail gains
+16. A prewarmed direct attribution sample still shows `non_offloaded_dense_ms=1791.581`, and in that warm full-MLP regime the `attention_ms=1406.942` bucket is now the single biggest direct benchmark stage
+17. The attention sub-breakdown shows `attention_oproj_ms=1406.322` while `attention_query_ms=0.359`, which means the next direct-path attention-side work should focus on `o_proj` integration rather than the attention core itself
+18. The new MLP sub-breakdown shows `mlp_down_ms=1913.680`, which means `down_proj` handling is the dominant subcomponent inside the cold chunked MLP tail even though naive full offload regresses in cold capture
+19. Direct real-tensor microbenchmarks now show both `down_proj` and `o_proj` raw packed GPU kernels are tiny (`0.869 ms` and `1.469 ms` respectively), which means the remaining problem is structural integration overhead rather than raw GPU math throughput
+20. Warm in-process full-MLP offload (`JENGINE_PACKED_MLP_FULL=1`) reaches about `0.908 tok/s` in the chunked runner and about `0.537 tok/s` on the direct warm second-pass benchmark with prewarm, so the next goal is to turn that warm-path behavior into a direct end-to-end result closer to `1 tok/s`
+21. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into `down_proj` and `o_proj` integration while still preserving the warm-cache behavior
 
 ## Best next step
 

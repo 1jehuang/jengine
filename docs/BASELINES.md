@@ -610,27 +610,56 @@ JENGINE_NO_HEARTBEAT=1 JENGINE_PREWARM_PACKED=1 JENGINE_PACKED_MLP_FULL=1 ./targ
 
 Observed sample:
 
-- total: `2299.752 ms`
-- embed: `88.381 ms`
-- norm: `324.656 ms`
+- total: `2111.556 ms`
+- embed: `71.893 ms`
+- norm: `311.841 ms`
 - qkv: `76.868 ms`
-- attention: `1522.674 ms`
-- mlp: `213.085 ms`
-  - `mlp_down`: `75.525 ms`
-- logits: `71.591 ms`
+- attention: `1406.942 ms`
+  - `attention_query`: `0.359 ms`
+  - `attention_oproj`: `1406.322 ms`
+  - `attention_residual`: `0.137 ms`
+- mlp: `187.861 ms`
+  - `mlp_down`: `65.885 ms`
+- logits: `69.199 ms`
 - compile: `0.000 ms`
 - weight upload: `0.000 ms`
-- gpu: `279.446 ms`
-- download: `76.452 ms`
-- non-offloaded dense: `1936.774 ms`
-- orchestration: `6.962 ms`
+- gpu: `241.762 ms`
+- download: `72.290 ms`
+- non-offloaded dense: `1791.581 ms`
+- orchestration: `5.805 ms`
 - dispatches: `170`
 
 Current interpretation:
 
 - once compile, weight upload, and most orchestration are removed, the direct path is still dominated by non-offloaded dense work
 - in that warm full-MLP regime, the **attention stage** is now the largest direct benchmark bucket
-- that means the next direct end-to-end improvement likely needs a better attention-side structural redesign, while keeping the MLP-side warm-path gains intact
+- the attention sub-breakdown shows that almost all of that attention-side cost is the `o_proj` part, not the attention core itself
+- that means the next direct end-to-end improvement likely needs a better `o_proj` integration path while keeping the MLP-side warm-path gains intact
+
+### Real `o_proj` tensor microbenchmark
+
+Command shapes:
+
+```bash
+cargo run --quiet --bin compare_packed_matvec -- \
+  /home/jeremy/models/bonsai-1.7b/model.safetensors \
+  model.layers.0.self_attn.o_proj.weight 2048 2048
+
+cargo run --quiet --bin vulkan_packed_matvec -- \
+  /home/jeremy/models/bonsai-1.7b/model.safetensors \
+  model.layers.0.self_attn.o_proj.weight 2048 2048
+```
+
+Observed sample:
+
+- dense CPU: `48.788 ms`
+- packed CPU: `43.570 ms`
+- packed GPU kernel: `1.469 ms`
+
+Current interpretation:
+
+- the raw packed path for `o_proj` is already viable on the real tensor
+- so the current `attention_oproj` dominance in the warm direct benchmark is an integration problem, not a raw math problem
 
 ### Chunked MLP-only packed upper bound
 
