@@ -1,5 +1,6 @@
 # Packed runtime architecture
 
+> For the redesign plan aimed at a persistent GPU-first decode engine and the `200 tok/s` north-star goal, see `docs/PERSISTENT_GPU_FIRST_PACKED_DECODE.md`.
 ## Goal
 
 Run Bonsai primarily from packed ternary artifacts, with dense source tensors used only where they are still the best practical choice.
