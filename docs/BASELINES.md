@@ -572,6 +572,33 @@ Current interpretation:
 - the warm second pass is above `0.5 tok/s`, which is a meaningful step toward the current `1 tok/s` target
 - the gap between the warm chunked upper bound and the direct benchmark still points at broader end-to-end decode overhead outside the isolated chunk plan
 
+### Direct prewarmed `bench_packed_toks` sample
+
+Command shape:
+
+```bash
+JENGINE_NO_HEARTBEAT=1 JENGINE_PREWARM_PACKED=1 JENGINE_PACKED_MLP_FULL=1 ./target/release/bench_packed_toks \
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model hello 1 2 combined
+```
+
+Observed sample:
+
+- iteration 1:
+  - total: `2447.662 ms`
+  - throughput: `0.409 tok/s`
+- iteration 2, warm:
+  - total: `1862.786 ms`
+  - throughput: `0.537 tok/s`
+- average:
+  - total: `2155.224 ms`
+  - throughput: `0.473 tok/s`
+
+Current interpretation:
+
+- explicit cache prewarm already helps the direct benchmark materially, especially on the first measured iteration
+- but even with prewarm, the direct path is still behind the best warm chunked upper-bound numbers
+- that confirms there is still broader decode-path overhead left to remove beyond simple cache fill
+
 ### Chunked MLP-only packed upper bound
 
 Using the same helper on the `mlp` variant now produces:

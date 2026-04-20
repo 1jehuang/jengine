@@ -275,6 +275,24 @@ So the kernel math itself is **not** the limiting issue for `down_proj`. The hug
 
 That is why naive full-MLP offload regressed even though `down_proj` is still the dominant MLP subcomponent: the broader path is not yet structured well enough to cash in the kernel-side upside.
 
+### Packed cache prewarm makes the direct packed benchmark much more practical
+
+A new `prewarm_packed_decode_caches(...)` API is now exposed on `ReferenceModel`, and the packed CLI / benchmark paths honor `JENGINE_PREWARM_PACKED=1`.
+
+With both `JENGINE_PREWARM_PACKED=1` and `JENGINE_PACKED_MLP_FULL=1`, the direct packed benchmark now yields:
+
+- iteration 1:
+  - total: `2447.662 ms`
+  - throughput: `0.409 tok/s`
+- iteration 2, warm:
+  - total: `1862.786 ms`
+  - throughput: `0.537 tok/s`
+- average:
+  - total: `2155.224 ms`
+  - throughput: `0.473 tok/s`
+
+So prewarming is already buying a real improvement in the direct packed benchmark path, even though it still does not yet match the warmer chunked upper-bound numbers.
+
 ### Direct `bench_packed_toks` now shows a usable warm result with full-MLP offload
 
 Running the actual packed decode benchmark in one process for two iterations with `JENGINE_PACKED_MLP_FULL=1` now yields:
@@ -375,11 +393,12 @@ From the latest real one-token run:
 12. Packed-artifact `generate_greedy` now routes into the packed decode path automatically, so the packed-first runtime is no longer just benchmark-only infrastructure
 13. With the rebuilt release chunked capture path, the latest combined upper bound is now in the mid-`4.5 s` range, and the stage breakdown shows `mlp_ms=2872.509` as the largest remaining stage-level bucket
 14. The one-process chunked runner shows a warm in-process combined upper bound of `2819.341 ms` with `pack_cache_hits=57` and `gpu_cache_hits=57`, which is about `0.355 tok/s` for one-token decode and confirms that cache reuse now matters a lot
-15. The direct `bench_packed_toks` path now reaches `0.508 tok/s` on the warm second pass with `JENGINE_PACKED_MLP_FULL=1`, which is a stronger direct benchmark signal even though it is still below the `1 tok/s` target
-16. The new MLP sub-breakdown shows `mlp_down_ms=1913.680`, which means `down_proj` handling is the dominant subcomponent inside the MLP tail even though naive full offload regresses in cold capture
-17. A direct real-tensor microbenchmark still shows `down_proj` packed GPU kernel time at only `0.869 ms` versus `123.933 ms` dense CPU and `133.083 ms` packed CPU, which means the problem is structural integration overhead rather than raw GPU math throughput
-18. Warm in-process full-MLP offload (`JENGINE_PACKED_MLP_FULL=1`) reaches about `0.908 tok/s` in the chunked runner and about `0.508 tok/s` on the direct warm second-pass benchmark, so the next MLP-side goal is to make that warm-path advantage practical without paying the current cold-start penalties
-19. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the MLP tail with a more structural redesign around `down_proj` and its warm-cache behavior while still reducing remaining dense-side work and synchronization overhead
+15. A new packed cache prewarm API now makes the direct packed benchmark much more practical, raising the cold iteration to `0.409 tok/s` and the warm second pass to `0.537 tok/s` with `JENGINE_PREWARM_PACKED=1 JENGINE_PACKED_MLP_FULL=1`
+16. The direct `bench_packed_toks` path now reaches `0.508 tok/s` on the warm second pass with only `JENGINE_PACKED_MLP_FULL=1`, which is a stronger direct benchmark signal even though it is still below the `1 tok/s` target
+17. The new MLP sub-breakdown shows `mlp_down_ms=1913.680`, which means `down_proj` handling is the dominant subcomponent inside the MLP tail even though naive full offload regresses in cold capture
+18. A direct real-tensor microbenchmark still shows `down_proj` packed GPU kernel time at only `0.869 ms` versus `123.933 ms` dense CPU and `133.083 ms` packed CPU, which means the problem is structural integration overhead rather than raw GPU math throughput
+19. Warm in-process full-MLP offload (`JENGINE_PACKED_MLP_FULL=1`) reaches about `0.908 tok/s` in the chunked runner and about `0.537 tok/s` on the direct warm second-pass benchmark with prewarm, so the next MLP-side goal is to make that warm-path advantage practical without paying the current cold-start penalties
+20. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the MLP tail with a more structural redesign around `down_proj` and its warm-cache behavior while still reducing remaining dense-side work and synchronization overhead
 
 ## Best next step
 

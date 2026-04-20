@@ -988,6 +988,69 @@ impl ReferenceModel {
         }
     }
 
+    pub fn prewarm_packed_decode_caches(
+        &self,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+    ) -> Result<(), ReferenceError> {
+        if self.packed_model.is_none() {
+            return Ok(());
+        }
+        let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
+        for layer_tensors in &self.layer_tensors {
+            if use_attention_qkv {
+                let triplet_key = format!(
+                    "concat::{}||{}||{}",
+                    layer_tensors.q_proj_weight,
+                    layer_tensors.k_proj_weight,
+                    layer_tensors.v_proj_weight
+                );
+                let (packed, _, _) = self.get_or_create_projection_triplet_cache(
+                    &triplet_key,
+                    &layer_tensors.q_proj_weight,
+                    self.config.hidden_size,
+                    &layer_tensors.k_proj_weight,
+                    kv_rows,
+                    &layer_tensors.v_proj_weight,
+                    kv_rows,
+                    self.config.hidden_size,
+                )?;
+                let _ = self.get_or_create_projection_gpu(&triplet_key, &packed)?;
+            }
+            if use_mlp_gu {
+                let pair_key = format!(
+                    "concat::{}||{}",
+                    layer_tensors.gate_proj_weight, layer_tensors.up_proj_weight
+                );
+                let (packed, _, _) = self.get_or_create_projection_pair_cache(
+                    &pair_key,
+                    &layer_tensors.gate_proj_weight,
+                    self.config.intermediate_size,
+                    &layer_tensors.up_proj_weight,
+                    self.config.intermediate_size,
+                    self.config.hidden_size,
+                )?;
+                let _ = self.get_or_create_projection_gpu(&pair_key, &packed)?;
+                if Self::packed_use_mlp_full() {
+                    let (packed, _, _) = self.get_or_create_projection_cache(
+                        &layer_tensors.down_proj_weight,
+                        self.config.hidden_size,
+                        self.config.intermediate_size,
+                    )?;
+                    let _ = self
+                        .get_or_create_projection_gpu(&layer_tensors.down_proj_weight, &packed)?;
+                }
+            }
+        }
+        let (logits_packed, _, _) = self.get_or_create_projection_cache(
+            "model.embed_tokens.weight",
+            self.config.vocab_size,
+            self.config.hidden_size,
+        )?;
+        let _ = self.get_or_create_projection_gpu("model.embed_tokens.weight", &logits_packed)?;
+        Ok(())
+    }
+
     fn packed_cache_bytes(&self) -> usize {
         let mut total = self
             .packed_model

@@ -104,6 +104,13 @@ fn main() {
         ReferenceModel::load_from_root_with_packed_artifact(&root, &artifact_dir)
             .expect("packed model should load")
     });
+    if std::env::var_os("JENGINE_PREWARM_PACKED").is_some() {
+        run_stage("prewarm_packed", || {
+            packed_model
+                .prewarm_packed_decode_caches(use_attention_qkv, use_mlp_gu)
+                .expect("packed decode prewarm should succeed")
+        });
+    }
 
     let layers = packed_model.config.num_hidden_layers;
     for iteration in 0..iterations {

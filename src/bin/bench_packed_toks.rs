@@ -71,6 +71,13 @@ fn main() {
         "combined" => (true, true),
         other => panic!("unsupported variant: {other}"),
     };
+    if std::env::var_os("JENGINE_PREWARM_PACKED").is_some() {
+        run_stage("prewarm_packed", || {
+            packed
+                .prewarm_packed_decode_caches(use_attention_qkv, use_mlp_gu)
+                .expect("packed decode prewarm should succeed")
+        });
+    }
 
     let mut total_ms = 0.0f64;
     let mut tok_s_values = Vec::with_capacity(iterations);

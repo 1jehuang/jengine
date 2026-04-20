@@ -27,6 +27,11 @@ fn main() {
 
     let model = ReferenceModel::load_from_root_with_packed_artifact(&root, &artifact_dir)
         .expect("packed reference model should load");
+    if std::env::var_os("JENGINE_PREWARM_PACKED").is_some() {
+        model
+            .prewarm_packed_decode_caches(use_attention_qkv, use_mlp_gu)
+            .expect("packed decode prewarm should succeed");
+    }
     let result = model
         .generate_packed_greedy(&prompt, max_new_tokens, use_attention_qkv, use_mlp_gu)
         .expect("packed reference generation should succeed");
