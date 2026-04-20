@@ -353,6 +353,44 @@ impl HybridProjectionDecodeMetrics {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackedDecodeMetrics {
+    pub enabled_projections: String,
+    pub total_duration: Duration,
+    pub pack_duration: Duration,
+    pub compile_duration: Duration,
+    pub upload_duration: Duration,
+    pub gpu_duration: Duration,
+    pub download_duration: Duration,
+    pub pack_cache_hits: usize,
+    pub gpu_cache_hits: usize,
+    pub dispatch_count: usize,
+    pub upload_bytes: usize,
+    pub download_bytes: usize,
+    pub output_text: String,
+}
+
+impl PackedDecodeMetrics {
+    pub fn summarize(&self) -> String {
+        format!(
+            "enabled={} total_ms={:.3} pack_ms={:.3} compile_ms={:.3} upload_ms={:.3} gpu_ms={:.3} download_ms={:.3} pack_cache_hits={} gpu_cache_hits={} dispatch_count={} upload_bytes={} download_bytes={} output={}",
+            self.enabled_projections,
+            self.total_duration.as_secs_f64() * 1_000.0,
+            self.pack_duration.as_secs_f64() * 1_000.0,
+            self.compile_duration.as_secs_f64() * 1_000.0,
+            self.upload_duration.as_secs_f64() * 1_000.0,
+            self.gpu_duration.as_secs_f64() * 1_000.0,
+            self.download_duration.as_secs_f64() * 1_000.0,
+            self.pack_cache_hits,
+            self.gpu_cache_hits,
+            self.dispatch_count,
+            self.upload_bytes,
+            self.download_bytes,
+            self.output_text,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PackedGpuSessionMetrics {
     pack_duration: Duration,
@@ -1498,6 +1536,97 @@ impl ReferenceModel {
         })
     }
 
+    pub fn benchmark_packed_decode(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+    ) -> Result<PackedDecodeMetrics, ReferenceError> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
+        let prompt_ids = self.encode_prompt_ids(tokenizer, prompt)?;
+        let total_started = Instant::now();
+        let mut metrics = DecodeMetrics {
+            prompt_tokens: prompt_ids.len(),
+            generated_tokens: 0,
+            total_duration: Duration::ZERO,
+            embedding_duration: Duration::ZERO,
+            norm_duration: Duration::ZERO,
+            qkv_duration: Duration::ZERO,
+            attention_duration: Duration::ZERO,
+            mlp_duration: Duration::ZERO,
+            logits_duration: Duration::ZERO,
+        };
+        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens);
+        let mut session = PackedGpuSession::new(self);
+        let mut last_logits = Vec::new();
+
+        for (position, &token_id) in prompt_ids.iter().enumerate() {
+            last_logits = self.forward_step_packed_decode(
+                token_id,
+                position,
+                &mut cache,
+                &mut metrics,
+                &mut session,
+                use_attention_qkv,
+                use_mlp_gu,
+            )?;
+        }
+
+        let mut output_ids = prompt_ids.to_vec();
+        for generation_index in 0..max_new_tokens {
+            let next_token = argmax(&last_logits).ok_or_else(|| {
+                ReferenceError::Decode("argmax failed on empty logits".to_string())
+            })?;
+            output_ids.push(next_token);
+            metrics.generated_tokens += 1;
+            last_logits = self.forward_step_packed_decode(
+                next_token,
+                prompt_ids.len() + generation_index,
+                &mut cache,
+                &mut metrics,
+                &mut session,
+                use_attention_qkv,
+                use_mlp_gu,
+            )?;
+        }
+
+        let output_text =
+            tokenizer.decode(&output_ids.iter().map(|id| *id as u32).collect::<Vec<_>>())?;
+        let mut enabled = String::new();
+        if use_attention_qkv {
+            enabled.push_str("qkv");
+        }
+        if use_mlp_gu {
+            if !enabled.is_empty() {
+                enabled.push('+');
+            }
+            enabled.push_str("gu");
+        }
+        if enabled.is_empty() {
+            enabled.push_str("dense");
+        }
+
+        Ok(PackedDecodeMetrics {
+            enabled_projections: enabled,
+            total_duration: total_started.elapsed(),
+            pack_duration: session.metrics.pack_duration,
+            compile_duration: session.metrics.compile_duration,
+            upload_duration: session.metrics.upload_duration,
+            gpu_duration: session.metrics.gpu_duration,
+            download_duration: session.metrics.download_duration,
+            pack_cache_hits: session.metrics.pack_cache_hits,
+            gpu_cache_hits: session.metrics.gpu_cache_hits,
+            dispatch_count: session.metrics.dispatch_count,
+            upload_bytes: session.metrics.upload_bytes,
+            download_bytes: session.metrics.download_bytes,
+            output_text,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_hybrid_qproj_decode(
         &self,
@@ -1883,6 +2012,184 @@ impl ReferenceModel {
             .matvec_f16("model.embed_tokens.weight", &hidden)?;
         metrics.logits_duration += started_at.elapsed();
         Ok((logits, compile, upload, gpu, download))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_step_packed_decode(
+        &self,
+        token_id: usize,
+        position: usize,
+        cache: &mut [LayerCache],
+        metrics: &mut DecodeMetrics,
+        session: &mut PackedGpuSession<'_>,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+    ) -> Result<Vec<f32>, ReferenceError> {
+        let started_at = Instant::now();
+        let mut hidden = self.embedding_lookup_resolved("model.embed_tokens.weight", token_id)?;
+        metrics.embedding_duration += started_at.elapsed();
+
+        let (cos, sin) = rope_cos_sin(&self.rope, &[position]);
+
+        for (layer_idx, layer_cache) in cache
+            .iter_mut()
+            .enumerate()
+            .take(self.config.num_hidden_layers)
+        {
+            let prefix = format!("model.layers.{layer_idx}");
+            let residual = hidden.clone();
+
+            let started_at = Instant::now();
+            let input_norm_weight =
+                self.load_vector_f32_resolved(&format!("{prefix}.input_layernorm.weight"))?;
+            let mut hidden_states =
+                weighted_rms_norm(&hidden, &input_norm_weight, self.config.rms_norm_eps as f32);
+            metrics.norm_duration += started_at.elapsed();
+
+            let started_at = Instant::now();
+            let mut q = if use_attention_qkv {
+                session.run_projection(
+                    &format!("{prefix}.self_attn.q_proj.weight"),
+                    self.config.hidden_size,
+                    self.config.hidden_size,
+                    &hidden_states,
+                )?
+            } else {
+                self.matvec_f16_resolved(
+                    &format!("{prefix}.self_attn.q_proj.weight"),
+                    &hidden_states,
+                )?
+            };
+            let mut k = if use_attention_qkv {
+                session.run_projection(
+                    &format!("{prefix}.self_attn.k_proj.weight"),
+                    self.config.num_key_value_heads * self.config.head_dim,
+                    self.config.hidden_size,
+                    &hidden_states,
+                )?
+            } else {
+                self.matvec_f16_resolved(
+                    &format!("{prefix}.self_attn.k_proj.weight"),
+                    &hidden_states,
+                )?
+            };
+            let v = if use_attention_qkv {
+                session.run_projection(
+                    &format!("{prefix}.self_attn.v_proj.weight"),
+                    self.config.num_key_value_heads * self.config.head_dim,
+                    self.config.hidden_size,
+                    &hidden_states,
+                )?
+            } else {
+                self.matvec_f16_resolved(
+                    &format!("{prefix}.self_attn.v_proj.weight"),
+                    &hidden_states,
+                )?
+            };
+            metrics.qkv_duration += started_at.elapsed();
+
+            let started_at = Instant::now();
+            let q_norm_weight =
+                self.load_vector_f32_resolved(&format!("{prefix}.self_attn.q_norm.weight"))?;
+            let k_norm_weight =
+                self.load_vector_f32_resolved(&format!("{prefix}.self_attn.k_norm.weight"))?;
+            apply_head_rms_norm_weighted(
+                &mut q,
+                self.config.num_attention_heads,
+                self.config.head_dim,
+                &q_norm_weight,
+                self.config.rms_norm_eps as f32,
+            );
+            apply_head_rms_norm_weighted(
+                &mut k,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+                &k_norm_weight,
+                self.config.rms_norm_eps as f32,
+            );
+            apply_rotary_single(
+                &mut q,
+                &mut k,
+                &cos,
+                &sin,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+            );
+            metrics.norm_duration += started_at.elapsed();
+
+            let started_at = Instant::now();
+            layer_cache.keys.extend_from_slice(&k);
+            layer_cache.values.extend_from_slice(&v);
+            let attn = attention_single_query(
+                &q,
+                &layer_cache.keys,
+                &layer_cache.values,
+                position + 1,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+            );
+            let attn_output =
+                self.matvec_f16_resolved(&format!("{prefix}.self_attn.o_proj.weight"), &attn)?;
+            hidden = residual
+                .iter()
+                .zip(attn_output.iter())
+                .map(|(left, right)| left + right)
+                .collect();
+            metrics.attention_duration += started_at.elapsed();
+
+            let residual = hidden.clone();
+            let started_at = Instant::now();
+            let post_norm_weight = self
+                .load_vector_f32_resolved(&format!("{prefix}.post_attention_layernorm.weight"))?;
+            hidden_states =
+                weighted_rms_norm(&hidden, &post_norm_weight, self.config.rms_norm_eps as f32);
+            metrics.norm_duration += started_at.elapsed();
+
+            let started_at = Instant::now();
+            let gate = if use_mlp_gu {
+                session.run_projection(
+                    &format!("{prefix}.mlp.gate_proj.weight"),
+                    self.config.intermediate_size,
+                    self.config.hidden_size,
+                    &hidden_states,
+                )?
+            } else {
+                self.matvec_f16_resolved(&format!("{prefix}.mlp.gate_proj.weight"), &hidden_states)?
+            };
+            let up = if use_mlp_gu {
+                session.run_projection(
+                    &format!("{prefix}.mlp.up_proj.weight"),
+                    self.config.intermediate_size,
+                    self.config.hidden_size,
+                    &hidden_states,
+                )?
+            } else {
+                self.matvec_f16_resolved(&format!("{prefix}.mlp.up_proj.weight"), &hidden_states)?
+            };
+            let mlp = swiglu(&gate, &up);
+            let down = self.matvec_f16_resolved(&format!("{prefix}.mlp.down_proj.weight"), &mlp)?;
+            hidden = residual
+                .iter()
+                .zip(down.iter())
+                .map(|(left, right)| left + right)
+                .collect();
+            metrics.mlp_duration += started_at.elapsed();
+        }
+
+        let started_at = Instant::now();
+        let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
+        let hidden =
+            weighted_rms_norm(&hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
+        metrics.norm_duration += started_at.elapsed();
+
+        let started_at = Instant::now();
+        let logits = self
+            .weights
+            .matvec_f16("model.embed_tokens.weight", &hidden)?;
+        metrics.logits_duration += started_at.elapsed();
+        Ok(logits)
     }
 
     #[allow(clippy::too_many_arguments)]
