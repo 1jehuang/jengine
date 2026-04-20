@@ -3,9 +3,11 @@ use half::f16;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use safetensors::tensor::Dtype;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -107,6 +109,7 @@ struct TensorIndexEntry {
 pub struct WeightStore {
     storage: WeightStorage,
     tensors: BTreeMap<String, TensorIndexEntry>,
+    vector_cache: RefCell<BTreeMap<String, Rc<Vec<f32>>>>,
 }
 
 impl WeightStore {
@@ -181,6 +184,7 @@ impl WeightStore {
         Ok(Self {
             storage: WeightStorage::Mapped(mmap),
             tensors,
+            vector_cache: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -190,6 +194,7 @@ impl WeightStore {
         Self {
             storage: WeightStorage::Owned(bytes),
             tensors,
+            vector_cache: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -217,8 +222,15 @@ impl WeightStore {
     }
 
     pub fn load_vector_f32(&self, name: &str) -> Result<Vec<f32>, WeightError> {
+        if let Some(cached) = self.vector_cache.borrow().get(name) {
+            return Ok((**cached).clone());
+        }
         let tensor = self.tensor_entry(name)?;
-        decode_f16_tensor(self.tensor_bytes(tensor), tensor.dtype, &tensor.shape)
+        let values = decode_f16_tensor(self.tensor_bytes(tensor), tensor.dtype, &tensor.shape)?;
+        self.vector_cache
+            .borrow_mut()
+            .insert(name.to_string(), Rc::new(values.clone()));
+        Ok(values)
     }
 
     pub fn embedding_lookup(&self, name: &str, token_id: usize) -> Result<Vec<f32>, WeightError> {

@@ -43,6 +43,48 @@ Jengine can now:
 
 ## Latest measured highlights
 
+### Broad decode prewarm largely removed the direct first-token gap
+
+With:
+
+- `JENGINE_PREWARM_PACKED=1`
+- `JENGINE_PACKED_ATTENTION_FULL=1`
+- `JENGINE_PACKED_MLP_FULL=1`
+
+and after extending packed decode prewarm to also populate the dense norm-vector caches that the packed path still touches every token, the direct packed benchmark now measures:
+
+- iteration 1: `409.400 ms`, `2.443 tok/s`
+- iteration 2: `436.938 ms`, `2.289 tok/s`
+- average: `423.169 ms`, `2.366 tok/s`
+
+That is important because the earlier prewarmed direct path was still heavily split between a weak first measured iteration and a much stronger warm second pass. The broader decode prewarm now makes the direct path much more stable from the first measured token onward.
+
+A matching direct attribution sample on the same prewarmed configuration measured:
+
+- total: `434.758 ms`
+- embed: `76.270 ms`
+- norm: `1.381 ms`
+- qkv: `54.373 ms`
+- attention: `37.317 ms`
+  - `attention_query`: `0.481 ms`
+  - `attention_oproj`: `36.630 ms`
+  - `attention_residual`: `0.062 ms`
+- mlp: `187.119 ms`
+  - `mlp_swiglu`: `1.456 ms`
+  - `mlp_down`: `57.329 ms`
+  - `mlp_residual`: `0.085 ms`
+- logits: `78.000 ms`
+- compile: `0.000 ms`
+- weight upload: `0.000 ms`
+- activation upload: `0.231 ms`
+- gpu: `219.249 ms`
+- download: `130.100 ms`
+- non-offloaded dense: `79.735 ms`
+- orchestration: `5.443 ms`
+- dispatches: `226`
+
+So the packed runtime is no longer mostly losing to compile and weight upload churn in the direct prewarmed path. The remaining cost is now dominated by the live decode work itself.
+
 ### Decode-wide packed attribution now exists
 From the latest real combined packed decode attribution run:
 

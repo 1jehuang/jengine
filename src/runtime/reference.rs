@@ -1005,15 +1005,23 @@ pub struct ReferenceModel {
 
 impl ReferenceModel {
     fn packed_enabled_label(use_attention_qkv: bool, use_mlp_gu: bool) -> String {
+        let use_attention_full = use_attention_qkv && Self::packed_use_attention_full();
+        let use_mlp_full = use_mlp_gu && Self::packed_use_mlp_full();
         let mut enabled = String::new();
         if use_attention_qkv {
             enabled.push_str("qkv");
+            if use_attention_full {
+                enabled.push_str("+o");
+            }
         }
         if use_mlp_gu {
             if !enabled.is_empty() {
                 enabled.push('+');
             }
             enabled.push_str("gu");
+            if use_mlp_full {
+                enabled.push_str("+d");
+            }
         }
         if enabled.is_empty() {
             enabled.push_str("dense");
@@ -1226,6 +1234,11 @@ impl ReferenceModel {
         }
         let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
         for layer_tensors in &self.layer_tensors {
+            let _ = self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
+            let _ =
+                self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
+            let _ = self.load_vector_f32_resolved(&layer_tensors.q_norm_weight)?;
+            let _ = self.load_vector_f32_resolved(&layer_tensors.k_norm_weight)?;
             if use_attention_qkv {
                 let triplet_key = format!(
                     "concat::{}||{}||{}",
@@ -1279,6 +1292,7 @@ impl ReferenceModel {
                 }
             }
         }
+        let _ = self.load_vector_f32_resolved("model.norm.weight")?;
         let (logits_packed, _, _) = self.get_or_create_projection_cache(
             "model.embed_tokens.weight",
             self.config.vocab_size,
