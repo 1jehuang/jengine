@@ -15,6 +15,7 @@ These values are the latest verified measurements gathered on this machine from 
 - Vulkan dense q_proj matvec: about **2.519 ms** GPU execution
 - Vulkan packed q_proj matvec: about **1.711 ms** GPU execution
 - Hybrid q_proj decode: works correctly, but still slower end to end because pack and pipeline setup are not cached yet
+- Cached hybrid q_proj decode: warm-cache run reduces total time further and removes pack/compile cost entirely
 
 ## Real Bonsai 1.7B CPU runs
 
@@ -137,6 +138,37 @@ Observed sample:
 - max abs diff: `0.000000`
 - mean abs diff: `0.000000`
 
+## Hybrid decode baselines
+
+### Real q_proj hybrid decode comparison
+
+Command shape:
+
+```bash
+TMPDIR=$PWD/.tmp ./target/release/bench_hybrid_qproj \
+  /home/jeremy/models/bonsai-1.7b hello 1 0 .artifacts/hybrid_cached.txt
+```
+
+Observed sample:
+
+- dense total: `9822.266 ms`
+- hybrid uncached total: `5920.685 ms`
+  - pack: `56.546 ms`
+  - gpu compile: `447.967 ms`
+  - gpu upload: `0.048 ms`
+  - gpu compute: `2.524 ms`
+  - gpu download: `0.147 ms`
+- hybrid cached first total: `6076.817 ms`
+  - pack cache hit: `false`
+  - gpu cache hit: `false`
+  - gpu compile: `228.059 ms`
+- hybrid cached warm total: `5475.410 ms`
+  - pack cache hit: `true`
+  - gpu cache hit: `true`
+  - gpu upload: `22.279 ms`
+  - gpu compute: `15.424 ms`
+  - gpu download: `0.238 ms`
+
 ## Key current conclusion
 
 The model, repacker, and runtime integration are correct enough to measure real behavior.
@@ -144,3 +176,5 @@ The model, repacker, and runtime integration are correct enough to measure real 
 Current highest CPU hotspot remains the MLP path, followed by QKV projections and logits. The current packed CPU kernel is correctness-first and not yet performance-competitive with dense FP16.
 
 For apples-to-apples future comparisons, prefer the release workflow in `docs/RELEASE_BENCHMARK_WORKFLOW.md` and capture reports with `scripts/capture_release_baselines.sh`.
+
+Recent important improvement: memory-mapped weight loading reduced real-model startup overhead enough for the cached hybrid q_proj benchmark path to become observable in this harness.

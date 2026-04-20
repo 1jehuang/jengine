@@ -1,5 +1,6 @@
 use crate::runtime::assets::BonsaiAssetPaths;
 use half::f16;
+use memmap2::Mmap;
 use rayon::prelude::*;
 use safetensors::tensor::{Dtype, SafeTensors};
 use std::fs;
@@ -88,8 +89,14 @@ impl WeightProbe {
     }
 }
 
+enum WeightStorage {
+    #[cfg(test)]
+    Owned(Vec<u8>),
+    Mapped(Mmap),
+}
+
 pub struct WeightStore {
-    bytes: Vec<u8>,
+    storage: WeightStorage,
 }
 
 impl WeightStore {
@@ -158,13 +165,31 @@ impl WeightStore {
     }
 
     pub fn load_from_file(path: impl AsRef<Path>) -> Result<Self, WeightError> {
-        let bytes = fs::read(path)?;
-        Ok(Self { bytes })
+        let file = fs::File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok(Self {
+            storage: WeightStorage::Mapped(mmap),
+        })
+    }
+
+    #[cfg(test)]
+    fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self {
+            storage: WeightStorage::Owned(bytes),
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match &self.storage {
+            #[cfg(test)]
+            WeightStorage::Owned(bytes) => bytes,
+            WeightStorage::Mapped(mmap) => mmap,
+        }
     }
 
     pub fn probe(&self) -> Result<WeightProbe, WeightError> {
         let started_at = Instant::now();
-        let tensors = SafeTensors::deserialize(&self.bytes)?;
+        let tensors = SafeTensors::deserialize(self.as_bytes())?;
         let mut names = tensors
             .names()
             .iter()
@@ -183,7 +208,7 @@ impl WeightStore {
     }
 
     pub fn load_vector_f32(&self, name: &str) -> Result<Vec<f32>, WeightError> {
-        let tensors = SafeTensors::deserialize(&self.bytes)?;
+        let tensors = SafeTensors::deserialize(self.as_bytes())?;
         let tensor = tensors
             .tensor(name)
             .map_err(|_| WeightError::MissingTensor(name.to_string()))?;
@@ -191,7 +216,7 @@ impl WeightStore {
     }
 
     pub fn embedding_lookup(&self, name: &str, token_id: usize) -> Result<Vec<f32>, WeightError> {
-        let tensors = SafeTensors::deserialize(&self.bytes)?;
+        let tensors = SafeTensors::deserialize(self.as_bytes())?;
         let tensor = tensors
             .tensor(name)
             .map_err(|_| WeightError::MissingTensor(name.to_string()))?;
@@ -224,7 +249,7 @@ impl WeightStore {
     }
 
     pub fn matvec_f16(&self, name: &str, input: &[f32]) -> Result<Vec<f32>, WeightError> {
-        let tensors = SafeTensors::deserialize(&self.bytes)?;
+        let tensors = SafeTensors::deserialize(self.as_bytes())?;
         let tensor = tensors
             .tensor(name)
             .map_err(|_| WeightError::MissingTensor(name.to_string()))?;
@@ -365,5 +390,14 @@ mod tests {
         assert!((output[1] - 4.0).abs() < 1e-5);
         assert!((output[2] - 18.0).abs() < 1e-5);
         assert_eq!(norm, vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn supports_owned_bytes_storage_for_small_fixtures() {
+        let fixture = write_fixture();
+        let bytes = fs::read(fixture.path()).expect("fixture bytes should load");
+        let store = WeightStore::from_bytes(bytes);
+        let probe = store.probe().expect("probe should succeed");
+        assert_eq!(probe.tensor_count, 3);
     }
 }
