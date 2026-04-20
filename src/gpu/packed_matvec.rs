@@ -747,6 +747,32 @@ impl CachedGpuPackedMatvecRunner {
         })
     }
 
+    pub fn run_resident_from_packed_buffer(
+        &mut self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: vk::Buffer,
+        source_packed_len: usize,
+        source_buffer_size: u64,
+    ) -> Result<GpuPackedMatvecReport, GpuPackedMatvecError> {
+        let upload_duration = self.copy_packed_input_from_buffer(
+            source_context,
+            source_buffer,
+            source_packed_len,
+            source_buffer_size,
+        )?;
+        let gpu_duration = self.submit_and_wait()?;
+        Ok(GpuPackedMatvecReport {
+            rows: self.rows,
+            cols: self.cols,
+            compile_duration: Duration::ZERO,
+            upload_duration,
+            gpu_duration,
+            download_duration: Duration::ZERO,
+            max_abs_diff: 0.0,
+            mean_abs_diff: 0.0,
+        })
+    }
+
     pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> {
         &self._shared_context
     }
@@ -840,6 +866,67 @@ impl CachedGpuPackedMatvecRunner {
             ));
         }
         let byte_len = self.cols * std::mem::size_of::<f32>();
+        if byte_len as u64 > source_buffer_size || byte_len as u64 > self.vector_buffer.size {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "copy {} bytes exceeds source {} or destination {} buffer size",
+                byte_len, source_buffer_size, self.vector_buffer.size
+            )));
+        }
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let copy_command = unsafe { self.device.allocate_command_buffers(&alloc)?[0] };
+        unsafe {
+            self.device
+                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
+            let region = [vk::BufferCopy::default().size(byte_len as u64)];
+            self.device.cmd_copy_buffer(
+                copy_command,
+                source_buffer,
+                self.vector_buffer.buffer,
+                &region,
+            );
+            self.device.end_command_buffer(copy_command)?;
+            self.device.reset_fences(&[self.fence])?;
+        }
+        let submit_info =
+            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
+        let started = Instant::now();
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.device
+                .free_command_buffers(self.command_pool, &[copy_command]);
+        }
+        Ok(started.elapsed())
+    }
+
+    fn copy_packed_input_from_buffer(
+        &self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: vk::Buffer,
+        source_packed_len: usize,
+        source_buffer_size: u64,
+    ) -> Result<Duration, GpuPackedMatvecError> {
+        if self.input_mode != PackedRunnerInputMode::PackedHalfPairs {
+            return Err(GpuPackedMatvecError::Shape(
+                "packed resident chaining requires a packed-half-pairs input runner".to_string(),
+            ));
+        }
+        if source_packed_len != self.packed_cols {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "source packed len {} does not match destination packed cols {}",
+                source_packed_len, self.packed_cols
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuPackedMatvecError::Shape(
+                "resident chaining requires runners to share the same Vulkan context".to_string(),
+            ));
+        }
+        let byte_len = self.packed_cols * std::mem::size_of::<u32>();
         if byte_len as u64 > source_buffer_size || byte_len as u64 > self.vector_buffer.size {
             return Err(GpuPackedMatvecError::Shape(format!(
                 "copy {} bytes exceeds source {} or destination {} buffer size",
