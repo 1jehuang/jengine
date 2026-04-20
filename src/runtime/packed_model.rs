@@ -1,7 +1,7 @@
 use crate::model::config::BonsaiModelConfig;
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::packed::{PackedIoError, PackedTensorFile};
-use crate::runtime::repack::pack_ternary_g128;
+use crate::runtime::repack::{pack_ternary_g128, unpack_ternary_g128};
 use crate::runtime::weights::{WeightError, WeightStore};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -66,6 +66,48 @@ impl PackedModelSummary {
         format!(
             "entry_count={} packed_total_bytes={} source_file_bytes={} reduction_x={:.3}",
             self.entry_count, self.packed_total_bytes, self.source_file_bytes, reduction
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackedModelValidationReport {
+    pub checked_entries: usize,
+    pub max_abs_diff: f32,
+    pub mean_abs_diff: f32,
+}
+
+impl PackedModelValidationReport {
+    pub fn summarize(&self) -> String {
+        format!(
+            "checked_entries={} max_abs_diff={:.6} mean_abs_diff={:.6}",
+            self.checked_entries, self.max_abs_diff, self.mean_abs_diff
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackedModelBenchReport {
+    pub manifest_load_duration: std::time::Duration,
+    pub packed_total_bytes: u64,
+    pub source_file_bytes: u64,
+    pub entry_count: usize,
+}
+
+impl PackedModelBenchReport {
+    pub fn summarize(&self) -> String {
+        let reduction = if self.packed_total_bytes == 0 {
+            0.0
+        } else {
+            self.source_file_bytes as f64 / self.packed_total_bytes as f64
+        };
+        format!(
+            "manifest_load_ms={:.3} entry_count={} packed_total_bytes={} source_file_bytes={} reduction_x={:.3}",
+            self.manifest_load_duration.as_secs_f64() * 1_000.0,
+            self.entry_count,
+            self.packed_total_bytes,
+            self.source_file_bytes,
+            reduction,
         )
     }
 }
@@ -254,6 +296,73 @@ pub fn load_packed_model_manifest(
     Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
 }
 
+pub fn validate_packed_model_artifact(
+    model_root: impl AsRef<Path>,
+    artifact_dir: impl AsRef<Path>,
+) -> Result<PackedModelValidationReport, PackedModelError> {
+    let assets = BonsaiAssetPaths::from_root(model_root.as_ref())?;
+    let store = WeightStore::load_from_assets(&assets)?;
+    let manifest = load_packed_model_manifest(artifact_dir.as_ref().join("manifest.json"))?;
+
+    let mut checked_entries = 0usize;
+    let mut max_abs_diff = 0.0f32;
+    let mut sum_abs_diff = 0.0f32;
+    let mut compared_values = 0usize;
+
+    for entry in &manifest.entries {
+        let packed = PackedTensorFile::read_from_path(artifact_dir.as_ref().join(&entry.rel_path))?;
+        let unpacked = unpack_ternary_g128(&packed.tensor)
+            .map_err(|error| PackedModelError::Encode(format!("{}: {error}", entry.name)))?;
+        let source = store.load_vector_f32(&entry.name)?;
+        if unpacked.len() != source.len() {
+            return Err(PackedModelError::Encode(format!(
+                "{}: unpacked length {} does not match source {}",
+                entry.name,
+                unpacked.len(),
+                source.len()
+            )));
+        }
+        checked_entries += 1;
+        for (left, right) in unpacked.iter().zip(source.iter()) {
+            let diff = (left - right).abs();
+            max_abs_diff = max_abs_diff.max(diff);
+            sum_abs_diff += diff;
+            compared_values += 1;
+        }
+    }
+
+    let mean_abs_diff = if compared_values == 0 {
+        0.0
+    } else {
+        sum_abs_diff / compared_values as f32
+    };
+    Ok(PackedModelValidationReport {
+        checked_entries,
+        max_abs_diff,
+        mean_abs_diff,
+    })
+}
+
+pub fn benchmark_packed_model_artifact(
+    artifact_dir: impl AsRef<Path>,
+) -> Result<PackedModelBenchReport, PackedModelError> {
+    let manifest_path = artifact_dir.as_ref().join("manifest.json");
+    let started_at = std::time::Instant::now();
+    let manifest = load_packed_model_manifest(&manifest_path)?;
+    let manifest_load_duration = started_at.elapsed();
+    let packed_total_bytes = manifest
+        .entries
+        .iter()
+        .map(|entry| entry.total_file_bytes)
+        .sum();
+    Ok(PackedModelBenchReport {
+        manifest_load_duration,
+        packed_total_bytes,
+        source_file_bytes: manifest.source_file_bytes,
+        entry_count: manifest.entries.len(),
+    })
+}
+
 pub fn validate_packed_model_manifest(
     manifest: &PackedModelManifest,
     config: &BonsaiModelConfig,
@@ -287,8 +396,9 @@ fn sanitize_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_artifact_layout, build_packable_tensor_specs, load_packed_model_manifest,
-        validate_packed_model_manifest, write_packed_model_artifact,
+        benchmark_packed_model_artifact, build_artifact_layout, build_packable_tensor_specs,
+        load_packed_model_manifest, validate_packed_model_artifact, validate_packed_model_manifest,
+        write_packed_model_artifact,
     };
     use crate::model::config::BonsaiModelConfig;
     use std::fs;
@@ -392,7 +502,12 @@ mod tests {
         )
         .unwrap();
         validate_packed_model_manifest(&loaded, &config).unwrap();
+        let validation = validate_packed_model_artifact(root.path(), out.path()).unwrap();
+        let bench = benchmark_packed_model_artifact(out.path()).unwrap();
         assert_eq!(manifest.entries.len(), 8);
         assert_eq!(summary.entry_count, 8);
+        assert_eq!(validation.checked_entries, 8);
+        assert_eq!(validation.max_abs_diff, 0.0);
+        assert_eq!(bench.entry_count, 8);
     }
 }
