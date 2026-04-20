@@ -4366,14 +4366,30 @@ mod tests {
             result
                 .dispatch_trace
                 .iter()
-                .any(|trace| trace.stage == "attention_qkv")
+                .any(|trace| trace.path == "gpu_packed" && trace.stage == "attention_qkv")
         );
         assert!(
             result
                 .dispatch_trace
                 .iter()
-                .any(|trace| trace.stage == "logits_argmax")
+                .any(|trace| trace.path == "gpu_packed" && trace.stage == "logits_argmax")
         );
+        assert!(
+            result
+                .dispatch_trace
+                .iter()
+                .any(|trace| trace.path == "dense_cpu" && trace.stage == "attention_core")
+        );
+        assert!(
+            result
+                .dispatch_trace
+                .iter()
+                .any(|trace| trace.path == "dense_cpu" && trace.stage == "mlp_swiglu")
+        );
+        let summary = result.metrics.summarize();
+        assert!(summary.contains("attention_query_ms="));
+        assert!(summary.contains("attention_oproj_ms="));
+        assert!(summary.contains("mlp_down_ms="));
         assert!(result.metrics.gpu_duration > Duration::ZERO);
     }
 
