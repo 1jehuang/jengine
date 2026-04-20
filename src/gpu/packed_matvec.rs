@@ -5,7 +5,7 @@ use std::ffi::CString;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GpuPackedMatvecReport {
@@ -45,6 +45,7 @@ pub enum GpuPackedMatvecError {
     CString(std::ffi::NulError),
     MissingDevice,
     MissingQueue,
+    Shape(String),
 }
 
 impl std::fmt::Display for GpuPackedMatvecError {
@@ -58,6 +59,7 @@ impl std::fmt::Display for GpuPackedMatvecError {
             Self::CString(error) => write!(f, "CString error: {error}"),
             Self::MissingDevice => write!(f, "no suitable Vulkan device found"),
             Self::MissingQueue => write!(f, "no suitable compute queue family found"),
+            Self::Shape(message) => write!(f, "shape error: {message}"),
         }
     }
 }
@@ -119,269 +121,385 @@ pub fn run_packed_ternary_matvec_with_output(
     input: &[f32],
     reference: Option<&[f32]>,
 ) -> Result<(Vec<f32>, GpuPackedMatvecReport), GpuPackedMatvecError> {
-    let compile_started = Instant::now();
-    let shader_path = compile_shader(Path::new("shaders/packed_ternary_matvec.comp"))?;
-    let compile_duration = compile_started.elapsed();
+    let (mut runner, compile_duration) =
+        CachedGpuPackedMatvecRunner::new(code_words, scales, group_size, rows, cols)?;
+    let (output, mut report) = runner.run_with_output(input, reference)?;
+    report.compile_duration = compile_duration;
+    Ok((output, report))
+}
 
-    let packed_cols = cols.div_ceil(2);
-    let vector_words = pack_f16_pairs(input);
-    let output_bytes = rows * std::mem::size_of::<f32>();
+pub struct CachedGpuPackedMatvecRunner {
+    shader_path: PathBuf,
+    _instance: Instance,
+    device: Device,
+    queue: vk::Queue,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    packed_cols: usize,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    shader_module: vk::ShaderModule,
+    pipeline: vk::Pipeline,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
+    code_buffer: BufferAllocation,
+    scale_buffer: BufferAllocation,
+    vector_buffer: BufferAllocation,
+    output_buffer: BufferAllocation,
+}
 
-    let entry = unsafe { Entry::load()? };
-    let app_name = CString::new("jengine-packed-matvec")?;
-    let engine_name = CString::new("jengine")?;
-    let app_info = vk::ApplicationInfo::default()
-        .application_name(&app_name)
-        .application_version(vk::make_api_version(0, 0, 1, 0))
-        .engine_name(&engine_name)
-        .engine_version(vk::make_api_version(0, 0, 1, 0))
-        .api_version(vk::API_VERSION_1_3);
-    let instance_ci = vk::InstanceCreateInfo::default().application_info(&app_info);
-    let instance = unsafe { entry.create_instance(&instance_ci, None)? };
+impl CachedGpuPackedMatvecRunner {
+    pub fn new(
+        code_words: &[u32],
+        scales: &[f32],
+        group_size: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Self, Duration), GpuPackedMatvecError> {
+        let compile_started = Instant::now();
+        let shader_path = compile_shader(Path::new("shaders/packed_ternary_matvec.comp"))?;
 
-    let (physical_device, queue_family_index) = pick_compute_device(&instance)?;
-    let priorities = [1.0f32];
-    let queue_ci = [vk::DeviceQueueCreateInfo::default()
-        .queue_family_index(queue_family_index)
-        .queue_priorities(&priorities)];
-    let device_ci = vk::DeviceCreateInfo::default().queue_create_infos(&queue_ci);
-    let device = unsafe { instance.create_device(physical_device, &device_ci, None)? };
-    let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+        let entry = unsafe { Entry::load()? };
+        let app_name = CString::new("jengine-packed-matvec")?;
+        let engine_name = CString::new("jengine")?;
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(&app_name)
+            .application_version(vk::make_api_version(0, 0, 1, 0))
+            .engine_name(&engine_name)
+            .engine_version(vk::make_api_version(0, 0, 1, 0))
+            .api_version(vk::API_VERSION_1_3);
+        let instance_ci = vk::InstanceCreateInfo::default().application_info(&app_info);
+        let instance = unsafe { entry.create_instance(&instance_ci, None)? };
 
-    let code_buffer = create_host_visible_buffer(
-        &instance,
-        &device,
-        physical_device,
-        (code_words.len() * 4) as u64,
-        vk::BufferUsageFlags::STORAGE_BUFFER,
-    )?;
-    let scale_buffer = create_host_visible_buffer(
-        &instance,
-        &device,
-        physical_device,
-        (scales.len() * 4) as u64,
-        vk::BufferUsageFlags::STORAGE_BUFFER,
-    )?;
-    let vector_buffer = create_host_visible_buffer(
-        &instance,
-        &device,
-        physical_device,
-        (vector_words.len() * 4) as u64,
-        vk::BufferUsageFlags::STORAGE_BUFFER,
-    )?;
-    let output_buffer = create_host_visible_buffer(
-        &instance,
-        &device,
-        physical_device,
-        output_bytes as u64,
-        vk::BufferUsageFlags::STORAGE_BUFFER,
-    )?;
+        let (physical_device, queue_family_index) = pick_compute_device(&instance)?;
+        let priorities = [1.0f32];
+        let queue_ci = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .queue_priorities(&priorities)];
+        let device_ci = vk::DeviceCreateInfo::default().queue_create_infos(&queue_ci);
+        let device = unsafe { instance.create_device(physical_device, &device_ci, None)? };
+        let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
-    let upload_started = Instant::now();
-    write_u32_buffer(&device, code_buffer.memory, code_words)?;
-    write_f32_buffer(&device, scale_buffer.memory, scales)?;
-    write_u32_buffer(&device, vector_buffer.memory, &vector_words)?;
-    zero_buffer(&device, output_buffer.memory, output_bytes)?;
-    let upload_duration = upload_started.elapsed();
+        let packed_cols = cols.div_ceil(2);
+        let output_bytes = rows * std::mem::size_of::<f32>();
+        let code_buffer = create_host_visible_buffer(
+            &instance,
+            &device,
+            physical_device,
+            (code_words.len() * 4) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        let scale_buffer = create_host_visible_buffer(
+            &instance,
+            &device,
+            physical_device,
+            (scales.len() * 4) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        let vector_buffer = create_host_visible_buffer(
+            &instance,
+            &device,
+            physical_device,
+            (packed_cols * 4) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        let output_buffer = create_host_visible_buffer(
+            &instance,
+            &device,
+            physical_device,
+            output_bytes as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        write_u32_buffer(&device, code_buffer.memory, code_words)?;
+        write_f32_buffer(&device, scale_buffer.memory, scales)?;
+        zero_buffer(&device, vector_buffer.memory, packed_cols * 4)?;
+        zero_buffer(&device, output_buffer.memory, output_bytes)?;
 
-    let descriptor_layout_bindings = [
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_count(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(1)
-            .descriptor_count(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(2)
-            .descriptor_count(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE),
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(3)
-            .descriptor_count(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE),
-    ];
-    let descriptor_layout_ci =
-        vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_layout_bindings);
-    let descriptor_set_layout =
-        unsafe { device.create_descriptor_set_layout(&descriptor_layout_ci, None)? };
+        let descriptor_layout_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let descriptor_layout_ci =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_layout_bindings);
+        let descriptor_set_layout =
+            unsafe { device.create_descriptor_set_layout(&descriptor_layout_ci, None)? };
 
-    let push_range = [vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::COMPUTE)
-        .offset(0)
-        .size(16)];
-    let set_layouts = [descriptor_set_layout];
-    let pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
-        .set_layouts(&set_layouts)
-        .push_constant_ranges(&push_range);
-    let pipeline_layout = unsafe { device.create_pipeline_layout(&pipeline_layout_ci, None)? };
+        let push_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::COMPUTE)
+            .offset(0)
+            .size(16)];
+        let set_layouts = [descriptor_set_layout];
+        let pipeline_layout_ci = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_range);
+        let pipeline_layout = unsafe { device.create_pipeline_layout(&pipeline_layout_ci, None)? };
 
-    let shader_module = create_shader_module(&device, &shader_path)?;
-    let entry_name = CString::new("main")?;
-    let stage_ci = vk::PipelineShaderStageCreateInfo::default()
-        .stage(vk::ShaderStageFlags::COMPUTE)
-        .module(shader_module)
-        .name(&entry_name);
-    let compute_ci = [vk::ComputePipelineCreateInfo::default()
-        .stage(stage_ci)
-        .layout(pipeline_layout)];
-    let pipeline = unsafe {
-        device
-            .create_compute_pipelines(vk::PipelineCache::null(), &compute_ci, None)
-            .map_err(|(_, err)| GpuPackedMatvecError::Vk(err))?[0]
-    };
+        let shader_module = create_shader_module(&device, &shader_path)?;
+        let entry_name = CString::new("main")?;
+        let stage_ci = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader_module)
+            .name(&entry_name);
+        let compute_ci = [vk::ComputePipelineCreateInfo::default()
+            .stage(stage_ci)
+            .layout(pipeline_layout)];
+        let pipeline = unsafe {
+            device
+                .create_compute_pipelines(vk::PipelineCache::null(), &compute_ci, None)
+                .map_err(|(_, err)| GpuPackedMatvecError::Vk(err))?[0]
+        };
 
-    let pool_sizes = [vk::DescriptorPoolSize::default()
-        .ty(vk::DescriptorType::STORAGE_BUFFER)
-        .descriptor_count(4)];
-    let descriptor_pool_ci = vk::DescriptorPoolCreateInfo::default()
-        .pool_sizes(&pool_sizes)
-        .max_sets(1);
-    let descriptor_pool = unsafe { device.create_descriptor_pool(&descriptor_pool_ci, None)? };
-    let set_layouts = [descriptor_set_layout];
-    let alloc_info = vk::DescriptorSetAllocateInfo::default()
-        .descriptor_pool(descriptor_pool)
-        .set_layouts(&set_layouts);
-    let descriptor_set = unsafe { device.allocate_descriptor_sets(&alloc_info)?[0] };
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(4)];
+        let descriptor_pool_ci = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&pool_sizes)
+            .max_sets(1);
+        let descriptor_pool = unsafe { device.create_descriptor_pool(&descriptor_pool_ci, None)? };
+        let set_layouts = [descriptor_set_layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(&set_layouts);
+        let descriptor_set = unsafe { device.allocate_descriptor_sets(&alloc_info)?[0] };
 
-    let code_info = [vk::DescriptorBufferInfo::default()
-        .buffer(code_buffer.buffer)
-        .offset(0)
-        .range(vk::WHOLE_SIZE)];
-    let scale_info = [vk::DescriptorBufferInfo::default()
-        .buffer(scale_buffer.buffer)
-        .offset(0)
-        .range(vk::WHOLE_SIZE)];
-    let vector_info = [vk::DescriptorBufferInfo::default()
-        .buffer(vector_buffer.buffer)
-        .offset(0)
-        .range(vk::WHOLE_SIZE)];
-    let output_info = [vk::DescriptorBufferInfo::default()
-        .buffer(output_buffer.buffer)
-        .offset(0)
-        .range(vk::WHOLE_SIZE)];
-    let writes = [
-        vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&code_info),
-        vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(1)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&scale_info),
-        vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(2)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&vector_info),
-        vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(3)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&output_info),
-    ];
-    unsafe { device.update_descriptor_sets(&writes, &[]) };
+        let code_info = [vk::DescriptorBufferInfo::default()
+            .buffer(code_buffer.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let scale_info = [vk::DescriptorBufferInfo::default()
+            .buffer(scale_buffer.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let vector_info = [vk::DescriptorBufferInfo::default()
+            .buffer(vector_buffer.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let output_info = [vk::DescriptorBufferInfo::default()
+            .buffer(output_buffer.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&code_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&scale_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&vector_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&output_info),
+        ];
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
 
-    let command_pool_ci =
-        vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_index);
-    let command_pool = unsafe { device.create_command_pool(&command_pool_ci, None)? };
-    let command_alloc = vk::CommandBufferAllocateInfo::default()
-        .command_pool(command_pool)
-        .level(vk::CommandBufferLevel::PRIMARY)
-        .command_buffer_count(1);
-    let command_buffer = unsafe { device.allocate_command_buffers(&command_alloc)?[0] };
+        let command_pool_ci = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let command_pool = unsafe { device.create_command_pool(&command_pool_ci, None)? };
+        let command_alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let command_buffer = unsafe { device.allocate_command_buffers(&command_alloc)?[0] };
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
 
-    unsafe { device.begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())? };
-    unsafe {
-        device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
-        device.cmd_bind_descriptor_sets(
-            command_buffer,
-            vk::PipelineBindPoint::COMPUTE,
-            pipeline_layout,
-            0,
-            &[descriptor_set],
-            &[],
-        );
-    }
-    let push_constants = [
-        rows as u32,
-        cols as u32,
-        group_size as u32,
-        packed_cols as u32,
-    ];
-    let push_bytes = unsafe {
-        std::slice::from_raw_parts(
-            push_constants.as_ptr() as *const u8,
-            push_constants.len() * 4,
-        )
-    };
-    unsafe {
-        device.cmd_push_constants(
-            command_buffer,
-            pipeline_layout,
-            vk::ShaderStageFlags::COMPUTE,
-            0,
-            push_bytes,
-        );
-        device.cmd_dispatch(command_buffer, rows.div_ceil(64) as u32, 1, 1);
-        device.end_command_buffer(command_buffer)?;
-    }
-
-    let submit_info =
-        [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer))];
-    let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
-    let gpu_started = Instant::now();
-    unsafe {
-        device.queue_submit(queue, &submit_info, fence)?;
-        device.wait_for_fences(&[fence], true, u64::MAX)?;
-    }
-    let gpu_duration = gpu_started.elapsed();
-
-    let download_started = Instant::now();
-    let gpu_output = read_f32_buffer(&device, output_buffer.memory, rows)?;
-    let download_duration = download_started.elapsed();
-    let (max_abs_diff, mean_abs_diff) = match reference {
-        Some(reference) => compare_outputs(reference, &gpu_output),
-        None => (0.0, 0.0),
-    };
-
-    unsafe {
-        device.destroy_fence(fence, None);
-        device.destroy_command_pool(command_pool, None);
-        device.destroy_descriptor_pool(descriptor_pool, None);
-        device.destroy_pipeline(pipeline, None);
-        device.destroy_shader_module(shader_module, None);
-        device.destroy_pipeline_layout(pipeline_layout, None);
-        device.destroy_descriptor_set_layout(descriptor_set_layout, None);
-        destroy_buffer(&device, code_buffer);
-        destroy_buffer(&device, scale_buffer);
-        destroy_buffer(&device, vector_buffer);
-        destroy_buffer(&device, output_buffer);
-        device.destroy_device(None);
-        instance.destroy_instance(None);
-    }
-    let _ = std::fs::remove_file(shader_path);
-
-    Ok((
-        gpu_output,
-        GpuPackedMatvecReport {
+        let runner = Self {
+            shader_path,
+            _instance: instance,
+            device,
+            queue,
             rows,
             cols,
-            compile_duration,
-            upload_duration,
-            gpu_duration,
-            download_duration,
-            max_abs_diff,
-            mean_abs_diff,
-        },
-    ))
+            group_size,
+            packed_cols,
+            descriptor_set_layout,
+            pipeline_layout,
+            shader_module,
+            pipeline,
+            descriptor_pool,
+            descriptor_set,
+            command_pool,
+            command_buffer,
+            fence,
+            code_buffer,
+            scale_buffer,
+            vector_buffer,
+            output_buffer,
+        };
+        runner.record_command_buffer()?;
+        Ok((runner, compile_started.elapsed()))
+    }
+
+    pub fn run_with_output(
+        &mut self,
+        input: &[f32],
+        reference: Option<&[f32]>,
+    ) -> Result<(Vec<f32>, GpuPackedMatvecReport), GpuPackedMatvecError> {
+        if input.len() != self.cols {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "input length {} does not match cols {}",
+                input.len(),
+                self.cols
+            )));
+        }
+        let vector_words = pack_f16_pairs(input);
+        if vector_words.len() != self.packed_cols {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "packed input length {} does not match packed cols {}",
+                vector_words.len(),
+                self.packed_cols
+            )));
+        }
+
+        let upload_started = Instant::now();
+        write_u32_buffer(&self.device, self.vector_buffer.memory, &vector_words)?;
+        zero_buffer(
+            &self.device,
+            self.output_buffer.memory,
+            self.rows * std::mem::size_of::<f32>(),
+        )?;
+        let upload_duration = upload_started.elapsed();
+
+        let submit_info = [
+            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer))
+        ];
+        unsafe {
+            self.device.reset_fences(&[self.fence])?;
+        }
+        let gpu_started = Instant::now();
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        let gpu_duration = gpu_started.elapsed();
+
+        let download_started = Instant::now();
+        let gpu_output = read_f32_buffer(&self.device, self.output_buffer.memory, self.rows)?;
+        let download_duration = download_started.elapsed();
+        let (max_abs_diff, mean_abs_diff) = match reference {
+            Some(reference) => compare_outputs(reference, &gpu_output),
+            None => (0.0, 0.0),
+        };
+
+        Ok((
+            gpu_output,
+            GpuPackedMatvecReport {
+                rows: self.rows,
+                cols: self.cols,
+                compile_duration: Duration::ZERO,
+                upload_duration,
+                gpu_duration,
+                download_duration,
+                max_abs_diff,
+                mean_abs_diff,
+            },
+        ))
+    }
+
+    fn record_command_buffer(&self) -> Result<(), GpuPackedMatvecError> {
+        unsafe {
+            self.device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
+            self.device.begin_command_buffer(
+                self.command_buffer,
+                &vk::CommandBufferBeginInfo::default(),
+            )?;
+            self.device.cmd_bind_pipeline(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[self.descriptor_set],
+                &[],
+            );
+        }
+        let push_constants = [
+            self.rows as u32,
+            self.cols as u32,
+            self.group_size as u32,
+            self.packed_cols as u32,
+        ];
+        let push_bytes = unsafe {
+            std::slice::from_raw_parts(
+                push_constants.as_ptr() as *const u8,
+                push_constants.len() * 4,
+            )
+        };
+        unsafe {
+            self.device.cmd_push_constants(
+                self.command_buffer,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                push_bytes,
+            );
+            self.device
+                .cmd_dispatch(self.command_buffer, self.rows.div_ceil(64) as u32, 1, 1);
+            self.device.end_command_buffer(self.command_buffer)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CachedGpuPackedMatvecRunner {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            self.device.destroy_fence(self.fence, None);
+            self.device.destroy_command_pool(self.command_pool, None);
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device.destroy_shader_module(self.shader_module, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            destroy_buffer(&self.device, self.code_buffer);
+            destroy_buffer(&self.device, self.scale_buffer);
+            destroy_buffer(&self.device, self.vector_buffer);
+            destroy_buffer(&self.device, self.output_buffer);
+        }
+        let _ = std::fs::remove_file(&self.shader_path);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -391,7 +509,15 @@ struct BufferAllocation {
 }
 
 fn compile_shader(path: &Path) -> Result<PathBuf, GpuPackedMatvecError> {
-    let out = std::env::temp_dir().join("jengine-packed-matvec.spv");
+    let unique = format!(
+        "jengine-packed-matvec-{}-{}.spv",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let out = std::env::temp_dir().join(unique);
     let output = Command::new("glslc")
         .arg(path)
         .arg("-o")

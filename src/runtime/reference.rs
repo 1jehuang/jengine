@@ -1,12 +1,17 @@
 use crate::cpu::block::{YarnRope, build_yarn_rope, rope_cos_sin};
 use crate::cpu::primitives::{argmax, swiglu};
-use crate::gpu::packed_matvec::run_packed_ternary_matvec_with_output;
+use crate::gpu::packed_matvec::{
+    CachedGpuPackedMatvecRunner, run_packed_ternary_matvec_with_output,
+};
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
 use crate::runtime::weights::{WeightError, WeightStore};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -75,7 +80,9 @@ pub struct ProjectionComparison {
 pub struct HybridDecodeMetrics {
     pub total_duration: Duration,
     pub q_proj_pack_duration: Duration,
+    pub q_proj_pack_cache_hit: bool,
     pub q_proj_gpu_compile_duration: Duration,
+    pub q_proj_gpu_cache_hit: bool,
     pub q_proj_gpu_upload_duration: Duration,
     pub q_proj_gpu_duration: Duration,
     pub q_proj_gpu_download_duration: Duration,
@@ -85,10 +92,12 @@ pub struct HybridDecodeMetrics {
 impl HybridDecodeMetrics {
     pub fn summarize(&self) -> String {
         format!(
-            "total_ms={:.3} qproj_pack_ms={:.3} qproj_gpu_compile_ms={:.3} qproj_gpu_upload_ms={:.3} qproj_gpu_ms={:.3} qproj_gpu_download_ms={:.3} output={}",
+            "total_ms={:.3} qproj_pack_ms={:.3} qproj_pack_cache_hit={} qproj_gpu_compile_ms={:.3} qproj_gpu_cache_hit={} qproj_gpu_upload_ms={:.3} qproj_gpu_ms={:.3} qproj_gpu_download_ms={:.3} output={}",
             self.total_duration.as_secs_f64() * 1_000.0,
             self.q_proj_pack_duration.as_secs_f64() * 1_000.0,
+            self.q_proj_pack_cache_hit,
             self.q_proj_gpu_compile_duration.as_secs_f64() * 1_000.0,
+            self.q_proj_gpu_cache_hit,
             self.q_proj_gpu_upload_duration.as_secs_f64() * 1_000.0,
             self.q_proj_gpu_duration.as_secs_f64() * 1_000.0,
             self.q_proj_gpu_download_duration.as_secs_f64() * 1_000.0,
@@ -218,6 +227,8 @@ pub struct ReferenceModel {
     pub tokenizer: Option<TokenizerRuntime>,
     pub weights: WeightStore,
     rope: YarnRope,
+    cached_hybrid_qproj: RefCell<HashMap<usize, Rc<HybridQProjCache>>>,
+    cached_hybrid_qproj_gpu: RefCell<HashMap<usize, Rc<RefCell<CachedGpuPackedMatvecRunner>>>>,
 }
 
 impl ReferenceModel {
@@ -238,6 +249,8 @@ impl ReferenceModel {
             tokenizer: None,
             weights,
             rope,
+            cached_hybrid_qproj: RefCell::new(HashMap::new()),
+            cached_hybrid_qproj_gpu: RefCell::new(HashMap::new()),
         })
     }
 
@@ -449,6 +462,54 @@ impl ReferenceModel {
             .tokenizer
             .as_ref()
             .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
+        let prompt_ids = self.encode_prompt_ids(tokenizer, prompt)?;
+        let (hybrid, q_proj_pack_duration) = self.build_hybrid_qproj_cache(layer_idx)?;
+        self.run_hybrid_qproj_decode(
+            tokenizer,
+            &prompt_ids,
+            max_new_tokens,
+            &hybrid,
+            q_proj_pack_duration,
+            false,
+            Duration::ZERO,
+            false,
+            None,
+        )
+    }
+
+    pub fn benchmark_cached_hybrid_qproj_decode(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        layer_idx: usize,
+    ) -> Result<HybridDecodeMetrics, ReferenceError> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
+        let prompt_ids = self.encode_prompt_ids(tokenizer, prompt)?;
+        let (hybrid, q_proj_pack_duration, q_proj_pack_cache_hit) =
+            self.get_or_create_hybrid_qproj_cache(layer_idx)?;
+        let (gpu_runner, q_proj_gpu_compile_duration, q_proj_gpu_cache_hit) =
+            self.get_or_create_hybrid_qproj_gpu(layer_idx, &hybrid)?;
+        self.run_hybrid_qproj_decode(
+            tokenizer,
+            &prompt_ids,
+            max_new_tokens,
+            &hybrid,
+            q_proj_pack_duration,
+            q_proj_pack_cache_hit,
+            q_proj_gpu_compile_duration,
+            q_proj_gpu_cache_hit,
+            Some(gpu_runner),
+        )
+    }
+
+    fn encode_prompt_ids(
+        &self,
+        tokenizer: &TokenizerRuntime,
+        prompt: &str,
+    ) -> Result<Vec<usize>, ReferenceError> {
         let prompt_ids = tokenizer
             .encode(prompt)?
             .into_iter()
@@ -459,7 +520,13 @@ impl ReferenceModel {
                 "prompt encoded to zero tokens".to_string(),
             ));
         }
+        Ok(prompt_ids)
+    }
 
+    fn build_hybrid_qproj_cache(
+        &self,
+        layer_idx: usize,
+    ) -> Result<(HybridQProjCache, Duration), ReferenceError> {
         let tensor_name = format!("model.layers.{layer_idx}.self_attn.q_proj.weight");
         let values = self.weights.load_vector_f32(&tensor_name)?;
         let pack_started = Instant::now();
@@ -481,15 +548,77 @@ impl ReferenceModel {
                 word
             })
             .collect::<Vec<_>>();
-        let hybrid = HybridQProjCache {
-            layer_idx,
-            rows: self.config.hidden_size,
-            cols: self.config.hidden_size,
-            group_size: packed.group_size,
-            code_words,
-            scales: packed.scales,
-        };
+        Ok((
+            HybridQProjCache {
+                layer_idx,
+                rows: self.config.hidden_size,
+                cols: self.config.hidden_size,
+                group_size: packed.group_size,
+                code_words,
+                scales: packed.scales,
+            },
+            q_proj_pack_duration,
+        ))
+    }
 
+    fn get_or_create_hybrid_qproj_cache(
+        &self,
+        layer_idx: usize,
+    ) -> Result<(Rc<HybridQProjCache>, Duration, bool), ReferenceError> {
+        if let Some(cached) = self.cached_hybrid_qproj.borrow().get(&layer_idx).cloned() {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let (hybrid, duration) = self.build_hybrid_qproj_cache(layer_idx)?;
+        let hybrid = Rc::new(hybrid);
+        self.cached_hybrid_qproj
+            .borrow_mut()
+            .insert(layer_idx, hybrid.clone());
+        Ok((hybrid, duration, false))
+    }
+
+    fn get_or_create_hybrid_qproj_gpu(
+        &self,
+        layer_idx: usize,
+        hybrid: &HybridQProjCache,
+    ) -> Result<(Rc<RefCell<CachedGpuPackedMatvecRunner>>, Duration, bool), ReferenceError> {
+        if let Some(cached) = self
+            .cached_hybrid_qproj_gpu
+            .borrow()
+            .get(&layer_idx)
+            .cloned()
+        {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let (runner, duration) = CachedGpuPackedMatvecRunner::new(
+            &hybrid.code_words,
+            &hybrid.scales,
+            hybrid.group_size,
+            hybrid.rows,
+            hybrid.cols,
+        )
+        .map_err(|error| {
+            ReferenceError::Decode(format!("gpu packed q_proj init failed: {error}"))
+        })?;
+        let runner = Rc::new(RefCell::new(runner));
+        self.cached_hybrid_qproj_gpu
+            .borrow_mut()
+            .insert(layer_idx, runner.clone());
+        Ok((runner, duration, false))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_hybrid_qproj_decode(
+        &self,
+        tokenizer: &TokenizerRuntime,
+        prompt_ids: &[usize],
+        max_new_tokens: usize,
+        hybrid: &HybridQProjCache,
+        q_proj_pack_duration: Duration,
+        q_proj_pack_cache_hit: bool,
+        q_proj_gpu_compile_duration: Duration,
+        q_proj_gpu_cache_hit: bool,
+        gpu_runner: Option<Rc<RefCell<CachedGpuPackedMatvecRunner>>>,
+    ) -> Result<HybridDecodeMetrics, ReferenceError> {
         let total_started = Instant::now();
         let mut metrics = DecodeMetrics {
             prompt_tokens: prompt_ids.len(),
@@ -508,7 +637,7 @@ impl ReferenceModel {
                 values: Vec::new(),
             })
             .collect::<Vec<_>>();
-        let mut compile = Duration::ZERO;
+        let mut compile = q_proj_gpu_compile_duration;
         let mut upload = Duration::ZERO;
         let mut gpu = Duration::ZERO;
         let mut download = Duration::ZERO;
@@ -520,7 +649,8 @@ impl ReferenceModel {
                 position,
                 &mut cache,
                 &mut metrics,
-                &hybrid,
+                hybrid,
+                gpu_runner.as_ref(),
             )?;
             last_logits = logits;
             compile += c;
@@ -528,7 +658,7 @@ impl ReferenceModel {
             gpu += g;
             download += d;
         }
-        let mut output_ids = prompt_ids.clone();
+        let mut output_ids = prompt_ids.to_vec();
         for generation_index in 0..max_new_tokens {
             let next_token = argmax(&last_logits).ok_or_else(|| {
                 ReferenceError::Decode("argmax failed on empty logits".to_string())
@@ -540,7 +670,8 @@ impl ReferenceModel {
                 prompt_ids.len() + generation_index,
                 &mut cache,
                 &mut metrics,
-                &hybrid,
+                hybrid,
+                gpu_runner.as_ref(),
             )?;
             last_logits = logits;
             compile += c;
@@ -554,7 +685,9 @@ impl ReferenceModel {
         Ok(HybridDecodeMetrics {
             total_duration: total_started.elapsed(),
             q_proj_pack_duration,
+            q_proj_pack_cache_hit,
             q_proj_gpu_compile_duration: compile,
+            q_proj_gpu_cache_hit,
             q_proj_gpu_upload_duration: upload,
             q_proj_gpu_duration: gpu,
             q_proj_gpu_download_duration: download,
@@ -708,6 +841,7 @@ impl ReferenceModel {
         cache: &mut [LayerCache],
         metrics: &mut DecodeMetrics,
         hybrid: &HybridQProjCache,
+        gpu_runner: Option<&Rc<RefCell<CachedGpuPackedMatvecRunner>>>,
     ) -> Result<(Vec<f32>, Duration, Duration, Duration, Duration), ReferenceError> {
         let started_at = Instant::now();
         let mut hidden = self
@@ -739,18 +873,28 @@ impl ReferenceModel {
 
             let started_at = Instant::now();
             let mut q = if layer_idx == hybrid.layer_idx {
-                let (out, report) = run_packed_ternary_matvec_with_output(
-                    &hybrid.code_words,
-                    &hybrid.scales,
-                    hybrid.group_size,
-                    hybrid.rows,
-                    hybrid.cols,
-                    &hidden_states,
-                    None,
-                )
-                .map_err(|error| {
-                    ReferenceError::Decode(format!("gpu packed q_proj failed: {error}"))
-                })?;
+                let (out, report) = match gpu_runner {
+                    Some(runner) => runner
+                        .borrow_mut()
+                        .run_with_output(&hidden_states, None)
+                        .map_err(|error| {
+                            ReferenceError::Decode(format!(
+                                "cached gpu packed q_proj failed: {error}"
+                            ))
+                        })?,
+                    None => run_packed_ternary_matvec_with_output(
+                        &hybrid.code_words,
+                        &hybrid.scales,
+                        hybrid.group_size,
+                        hybrid.rows,
+                        hybrid.cols,
+                        &hidden_states,
+                        None,
+                    )
+                    .map_err(|error| {
+                        ReferenceError::Decode(format!("gpu packed q_proj failed: {error}"))
+                    })?,
+                };
                 compile += report.compile_duration;
                 upload += report.upload_duration;
                 gpu += report.gpu_duration;
@@ -1152,6 +1296,26 @@ mod tests {
             .expect("hybrid decode should succeed");
         assert!(result.total_duration > Duration::ZERO);
         assert!(result.summarize().contains("qproj_gpu_ms="));
+        assert!(!result.q_proj_pack_cache_hit);
+        assert!(!result.q_proj_gpu_cache_hit);
+    }
+
+    #[test]
+    fn reuses_cached_hybrid_qproj_resources_on_synthetic_model() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let model = ReferenceModel::load_from_root(dir.path()).expect("model should load");
+        let first = model
+            .benchmark_cached_hybrid_qproj_decode("tok2", 1, 0)
+            .expect("cached hybrid decode should succeed");
+        let second = model
+            .benchmark_cached_hybrid_qproj_decode("tok2", 1, 0)
+            .expect("cached warm hybrid decode should succeed");
+        assert!(!first.q_proj_pack_cache_hit);
+        assert!(!first.q_proj_gpu_cache_hit);
+        assert!(second.q_proj_pack_cache_hit);
+        assert!(second.q_proj_gpu_cache_hit);
+        assert!(second.summarize().contains("qproj_pack_cache_hit=true"));
     }
 
     #[test]
