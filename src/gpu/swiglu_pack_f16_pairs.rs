@@ -188,6 +188,96 @@ impl CachedGpuSwigluPackF16PairsRunner {
         let mismatched = reference.map(|r| r.iter().zip(output.iter()).filter(|(a,b)| a != b).count()).unwrap_or(0);
         Ok((output, GpuSwigluPackF16PairsReport { len: self.len, compile_duration: Duration::ZERO, upload_duration, gpu_duration, download_duration, max_mismatched_words: mismatched }))
     }
+
+    pub fn run_with_output_from_buffer(
+        &mut self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: vk::Buffer,
+        source_len: usize,
+        source_buffer_size: u64,
+    ) -> Result<GpuSwigluPackF16PairsReport, GpuSwigluPackF16PairsError> {
+        let upload_duration = self.copy_input_from_buffer(
+            source_context,
+            source_buffer,
+            source_len,
+            source_buffer_size,
+        )?;
+        let gpu_duration = self.submit_and_wait()?;
+        Ok(GpuSwigluPackF16PairsReport {
+            len: self.len,
+            compile_duration: Duration::ZERO,
+            upload_duration,
+            gpu_duration,
+            download_duration: Duration::ZERO,
+            max_mismatched_words: 0,
+        })
+    }
+
+    pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> { &self._shared_context }
+    pub fn output_buffer_handle(&self) -> vk::Buffer { self.output_buffer.buffer }
+    pub fn output_buffer_size(&self) -> u64 { self.output_buffer.size }
+    pub fn packed_len(&self) -> usize { self.packed_len }
+    pub fn len(&self) -> usize { self.len }
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+
+    fn submit_and_wait(&self) -> Result<Duration, GpuSwigluPackF16PairsError> {
+        let submit_info = [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer))];
+        unsafe { self.device.reset_fences(&[self.fence])?; }
+        let gpu_started = Instant::now();
+        unsafe {
+            self.device.queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        Ok(gpu_started.elapsed())
+    }
+
+    fn copy_input_from_buffer(
+        &self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: vk::Buffer,
+        source_len: usize,
+        source_buffer_size: u64,
+    ) -> Result<Duration, GpuSwigluPackF16PairsError> {
+        if source_len != self.len * 2 {
+            return Err(GpuSwigluPackF16PairsError::Shape(format!(
+                "source len {} does not match destination len {}",
+                source_len,
+                self.len * 2
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuSwigluPackF16PairsError::Shape(
+                "resident chaining requires runners to share the same Vulkan context".to_string(),
+            ));
+        }
+        let byte_len = self.len * 2 * std::mem::size_of::<f32>();
+        if byte_len as u64 > source_buffer_size || byte_len as u64 > self.input_buffer.size {
+            return Err(GpuSwigluPackF16PairsError::Shape(format!(
+                "copy {} bytes exceeds source {} or destination {} buffer size",
+                byte_len, source_buffer_size, self.input_buffer.size
+            )));
+        }
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let copy_command = unsafe { self.device.allocate_command_buffers(&alloc)?[0] };
+        unsafe {
+            self.device.begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
+            let region = [vk::BufferCopy::default().size(byte_len as u64)];
+            self.device.cmd_copy_buffer(copy_command, source_buffer, self.input_buffer.buffer, &region);
+            self.device.end_command_buffer(copy_command)?;
+            self.device.reset_fences(&[self.fence])?;
+        }
+        let submit_info = [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
+        let started = Instant::now();
+        unsafe {
+            self.device.queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.device.free_command_buffers(self.command_pool, &[copy_command]);
+        }
+        Ok(started.elapsed())
+    }
 }
 
 impl Drop for CachedGpuSwigluPackF16PairsRunner {
