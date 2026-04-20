@@ -247,6 +247,36 @@ Current interpretation:
 - `gate_proj + up_proj` currently looks like the promising first MLP offload slice
 - adding `down_proj` in the current form is much slower and needs separate investigation before broader rollout
 
+## Broader hybrid decode baselines
+
+### Real cached `qkv + gu` decode comparison
+
+Command shape:
+
+```bash
+TMPDIR=$PWD/.tmp cargo run --release --bin bench_hybrid_qkv_gu -- \
+  /home/jeremy/models/bonsai-1.7b hello 1 0 .artifacts/hybrid_qkv_gu.txt
+```
+
+Observed sample:
+
+- dense total: `4410.178 ms`
+- hybrid `qkv + gu` total: `4613.321 ms`
+- pack: `548.142 ms`
+- compile: `1110.788 ms`
+- upload: `11.568 ms`
+- gpu: `32.298 ms`
+- download: `1.129 ms`
+
+Current interpretation:
+
+- this broader `qkv + gu` mix is **not yet faster than dense**
+- the current bottleneck is no longer just whether individual projection slices work
+- the current bottleneck is now the aggregate cost of:
+  - pack/setup work
+  - cached runner initialization footprint across more projections
+  - transfer / execution overhead once more projections participate
+
 ## Key current conclusion
 
 The model, repacker, and runtime integration are correct enough to measure real behavior.
@@ -256,3 +286,5 @@ Current highest CPU hotspot remains the MLP path, followed by QKV projections an
 For apples-to-apples future comparisons, prefer the release workflow in `docs/RELEASE_BENCHMARK_WORKFLOW.md` and capture reports with `scripts/capture_release_baselines.sh`.
 
 Recent important improvement: memory-mapped weight loading reduced real-model startup overhead enough for the cached hybrid q_proj benchmark path to become observable in this harness.
+
+Recent important caution: the first broader `qkv + gu` hybrid decode benchmark is slightly slower than dense, so the next optimization pass should focus on reducing aggregate multi-projection overhead before adding more decode-path complexity.
