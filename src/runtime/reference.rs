@@ -230,6 +230,12 @@ pub struct DecodeResult {
     pub metrics: DecodeMetrics,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum PackedDecodeStepResult {
+    Logits(Vec<f32>),
+    NextToken(usize),
+}
+
 #[derive(Debug, Clone)]
 struct LayerCache {
     keys: Vec<f32>,
@@ -506,10 +512,74 @@ impl<'a> PackedGpuSession<'a> {
         cols: usize,
         input: &[f32],
     ) -> Result<Vec<f32>, ReferenceError> {
+        let (packed, weight_upload_duration, gpu_cache_hit) =
+            self.prepare_projection_runner(tensor_name, rows, cols)?;
+
+        let (output, report) = self
+            .model
+            .cached_projection_gpu
+            .borrow()
+            .get(tensor_name)
+            .cloned()
+            .expect("prepared runner should exist")
+            .borrow_mut()
+            .run_with_output(input, None)
+            .map_err(|error| {
+                ReferenceError::Decode(format!("gpu projection failed for {tensor_name}: {error}"))
+            })?;
+        self.account_projection_report(
+            &packed,
+            cols,
+            weight_upload_duration,
+            gpu_cache_hit,
+            &report,
+            rows * std::mem::size_of::<f32>(),
+        );
+        Ok(output)
+    }
+
+    fn run_projection_argmax(
+        &mut self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Result<usize, ReferenceError> {
+        let (packed, weight_upload_duration, gpu_cache_hit) =
+            self.prepare_projection_runner(tensor_name, rows, cols)?;
+        let (argmax_index, report) = self
+            .model
+            .cached_projection_gpu
+            .borrow()
+            .get(tensor_name)
+            .cloned()
+            .expect("prepared runner should exist")
+            .borrow_mut()
+            .run_with_argmax(input)
+            .map_err(|error| {
+                ReferenceError::Decode(format!("gpu projection failed for {tensor_name}: {error}"))
+            })?;
+        self.account_projection_report(
+            &packed,
+            cols,
+            weight_upload_duration,
+            gpu_cache_hit,
+            &report,
+            0,
+        );
+        Ok(argmax_index)
+    }
+
+    fn prepare_projection_runner(
+        &mut self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Rc<PackedProjectionCache>, Duration, bool), ReferenceError> {
         let (packed, pack_duration, pack_cache_hit) =
             self.model
                 .get_or_create_projection_cache(tensor_name, rows, cols)?;
-        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+        let (_runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
             .model
             .get_or_create_projection_gpu(tensor_name, &packed)?;
         self.metrics.pack_duration += pack_duration;
@@ -517,16 +587,18 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.weight_upload_duration += weight_upload_duration;
         self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+        Ok((packed, weight_upload_duration, gpu_cache_hit))
+    }
 
-        let (output, report) =
-            runner
-                .borrow_mut()
-                .run_with_output(input, None)
-                .map_err(|error| {
-                    ReferenceError::Decode(format!(
-                        "gpu projection failed for {tensor_name}: {error}"
-                    ))
-                })?;
+    fn account_projection_report(
+        &mut self,
+        packed: &PackedProjectionCache,
+        cols: usize,
+        weight_upload_duration: Duration,
+        gpu_cache_hit: bool,
+        report: &crate::gpu::packed_matvec::GpuPackedMatvecReport,
+        download_bytes: usize,
+    ) {
         self.metrics.activation_upload_duration += report.upload_duration;
         self.metrics.upload_duration += weight_upload_duration + report.upload_duration;
         self.metrics.gpu_duration += report.gpu_duration;
@@ -541,8 +613,7 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.activation_upload_bytes += activation_upload_bytes;
         self.metrics.upload_bytes +=
             usize::from(!gpu_cache_hit) * weight_bytes + activation_upload_bytes;
-        self.metrics.download_bytes += rows * std::mem::size_of::<f32>();
-        Ok(output)
+        self.metrics.download_bytes += download_bytes;
     }
 
     fn run_projection_pair(
@@ -2165,6 +2236,7 @@ impl ReferenceModel {
                 &mut session,
                 use_attention_qkv,
                 use_mlp_gu,
+                true,
             )?;
         }
 
@@ -2422,10 +2494,10 @@ impl ReferenceModel {
         let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens);
         let mut session = PackedGpuSession::new(self);
         let mut non_offloaded_dense_duration = Duration::ZERO;
-        let mut last_logits = Vec::new();
+        let mut last_next_token = None;
 
         for (position, &token_id) in prompt_ids.iter().enumerate() {
-            last_logits = self.forward_step_packed_decode(
+            let step = self.forward_step_packed_decode(
                 token_id,
                 position,
                 &mut cache,
@@ -2434,17 +2506,24 @@ impl ReferenceModel {
                 &mut session,
                 use_attention_qkv,
                 use_mlp_gu,
+                true,
             )?;
+            last_next_token = Some(match step {
+                PackedDecodeStepResult::NextToken(token_id) => token_id,
+                PackedDecodeStepResult::Logits(_) => {
+                    unreachable!("argmax-only packed decode should not return logits")
+                }
+            });
         }
 
         let mut output_ids = prompt_ids.to_vec();
         for generation_index in 0..max_new_tokens {
-            let next_token = argmax(&last_logits).ok_or_else(|| {
+            let next_token = last_next_token.ok_or_else(|| {
                 ReferenceError::Decode("argmax failed on empty logits".to_string())
             })?;
             output_ids.push(next_token);
             metrics.generated_tokens += 1;
-            last_logits = self.forward_step_packed_decode(
+            let step = self.forward_step_packed_decode(
                 next_token,
                 prompt_ids.len() + generation_index,
                 &mut cache,
@@ -2453,7 +2532,14 @@ impl ReferenceModel {
                 &mut session,
                 use_attention_qkv,
                 use_mlp_gu,
+                true,
             )?;
+            last_next_token = Some(match step {
+                PackedDecodeStepResult::NextToken(token_id) => token_id,
+                PackedDecodeStepResult::Logits(_) => {
+                    unreachable!("argmax-only packed decode should not return logits")
+                }
+            });
         }
 
         let output_text =
@@ -2495,7 +2581,7 @@ impl ReferenceModel {
         let mut non_offloaded_dense_duration = Duration::ZERO;
         let mut last_logits = Vec::new();
         for (position, &token_id) in prompt_ids.iter().enumerate() {
-            last_logits = self.forward_step_packed_decode(
+            last_logits = match self.forward_step_packed_decode(
                 token_id,
                 position,
                 &mut cache,
@@ -2504,7 +2590,13 @@ impl ReferenceModel {
                 &mut session,
                 use_attention_qkv,
                 use_mlp_gu,
-            )?;
+                false,
+            )? {
+                PackedDecodeStepResult::Logits(logits) => logits,
+                PackedDecodeStepResult::NextToken(_) => {
+                    unreachable!("full-logits prefill path should not return argmax-only output")
+                }
+            };
         }
         Ok(last_logits)
     }
@@ -2950,7 +3042,8 @@ impl ReferenceModel {
         session: &mut PackedGpuSession<'_>,
         use_attention_qkv: bool,
         use_mlp_gu: bool,
-    ) -> Result<Vec<f32>, ReferenceError> {
+        argmax_only: bool,
+    ) -> Result<PackedDecodeStepResult, ReferenceError> {
         let started_at = Instant::now();
         let mut hidden = self.embedding_lookup_resolved("model.embed_tokens.weight", token_id)?;
         let elapsed = started_at.elapsed();
@@ -3112,13 +3205,24 @@ impl ReferenceModel {
         *non_offloaded_dense_duration += elapsed;
 
         let started_at = Instant::now();
-        let logits = self
-            .weights
-            .matvec_f16("model.embed_tokens.weight", &hidden)?;
+        let result = if argmax_only {
+            let next_token = session.run_projection_argmax(
+                "model.embed_tokens.weight",
+                self.config.vocab_size,
+                self.config.hidden_size,
+                &hidden,
+            )?;
+            PackedDecodeStepResult::NextToken(next_token)
+        } else {
+            let logits = self.matvec_f16_resolved("model.embed_tokens.weight", &hidden)?;
+            PackedDecodeStepResult::Logits(logits)
+        };
         let elapsed = started_at.elapsed();
         metrics.logits_duration += elapsed;
-        *non_offloaded_dense_duration += elapsed;
-        Ok(logits)
+        if !argmax_only {
+            *non_offloaded_dense_duration += elapsed;
+        }
+        Ok(result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3811,7 +3915,7 @@ mod tests {
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed model should load");
         let prompt_ids = [2usize];
-        let expected_dispatches = packed.config.num_hidden_layers * 2;
+        let expected_dispatches = packed.config.num_hidden_layers * 2 + 1;
 
         let first = packed
             .benchmark_packed_step_from_token_ids(&prompt_ids, true, true)
