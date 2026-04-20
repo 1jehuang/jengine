@@ -54,24 +54,32 @@ fn main() {
     let variant = std::env::args().nth(5).unwrap_or_else(|| "all".to_string());
     let out_path = std::env::args().nth(6);
 
-    let dense_model = run_stage("load_dense_model", || {
-        ReferenceModel::load_from_root(&root).expect("dense model should load")
-    });
+    let run_dense = variant == "all" || variant == "dense";
+    let dense_model = if run_dense {
+        Some(run_stage("load_dense_model", || {
+            ReferenceModel::load_from_root(&root).expect("dense model should load")
+        }))
+    } else {
+        None
+    };
     let packed_model = run_stage("load_packed_model", || {
         ReferenceModel::load_from_root_with_packed_artifact(&root, &artifact_dir)
             .expect("packed model should load")
     });
 
-    let dense = run_stage("dense_decode", || {
-        dense_model
-            .generate_greedy(&prompt, max_new_tokens)
-            .expect("dense decode should succeed")
-    });
-    let mut lines = vec![format!(
-        "dense={} output={}",
-        dense.metrics.summarize(),
-        dense.output_text,
-    )];
+    let mut lines = Vec::new();
+    if let Some(dense_model) = &dense_model {
+        let dense = run_stage("dense_decode", || {
+            dense_model
+                .generate_greedy(&prompt, max_new_tokens)
+                .expect("dense decode should succeed")
+        });
+        lines.push(format!(
+            "dense={} output={}",
+            dense.metrics.summarize(),
+            dense.output_text,
+        ));
+    }
     if variant == "attention" || variant == "all" {
         let attention_only = run_stage("packed_attention_decode", || {
             packed_model

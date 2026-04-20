@@ -330,23 +330,49 @@ fn compile_shader(path: &Path) -> Result<PathBuf, GpuMatvecError> {
         .unwrap_or_else(|| PathBuf::from(".tmp"));
     std::fs::create_dir_all(&temp_dir)?;
     let out = temp_dir.join("jengine-fp16-matvec.spv");
+    if shader_cache_is_fresh(path, &out)? {
+        return Ok(out);
+    }
+    let tmp = temp_dir.join(format!(
+        "jengine-fp16-matvec-{}-{}.tmp.spv",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
     let output = Command::new("glslc")
         .arg(path)
         .arg("-o")
-        .arg(&out)
+        .arg(&tmp)
         .output()?;
     if !output.status.success() {
         return Err(GpuMatvecError::Process(
             String::from_utf8_lossy(&output.stderr).to_string(),
         ));
     }
-    let val = Command::new("spirv-val").arg(&out).output()?;
+    let val = Command::new("spirv-val").arg(&tmp).output()?;
     if !val.status.success() {
         return Err(GpuMatvecError::Process(
             String::from_utf8_lossy(&val.stderr).to_string(),
         ));
     }
+    std::fs::rename(&tmp, &out)?;
     Ok(out)
+}
+
+fn shader_cache_is_fresh(source: &Path, compiled: &Path) -> Result<bool, GpuMatvecError> {
+    let Ok(compiled_meta) = std::fs::metadata(compiled) else {
+        return Ok(false);
+    };
+    let source_meta = std::fs::metadata(source)?;
+    let Ok(compiled_modified) = compiled_meta.modified() else {
+        return Ok(false);
+    };
+    let Ok(source_modified) = source_meta.modified() else {
+        return Ok(false);
+    };
+    Ok(compiled_modified >= source_modified && compiled_meta.len() > 0)
 }
 
 fn pick_compute_device(instance: &Instance) -> Result<(vk::PhysicalDevice, u32), GpuMatvecError> {

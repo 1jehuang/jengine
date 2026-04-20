@@ -549,26 +549,44 @@ fn compile_shader(path: &Path) -> Result<PathBuf, GpuPackedMatvecError> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".tmp"));
     std::fs::create_dir_all(&temp_dir)?;
-    let unique = format!(
-        "jengine-packed-matvec-{}-{}.spv",
+    let out = temp_dir.join("jengine-packed-matvec.spv");
+    if shader_cache_is_fresh(path, &out)? {
+        return Ok(out);
+    }
+    let tmp = temp_dir.join(format!(
+        "jengine-packed-matvec-{}-{}.tmp.spv",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos()
-    );
-    let out = temp_dir.join(unique);
+    ));
     let output = Command::new("glslc")
         .arg(path)
         .arg("-o")
-        .arg(&out)
+        .arg(&tmp)
         .output()?;
     if !output.status.success() {
         return Err(GpuPackedMatvecError::Process(
             String::from_utf8_lossy(&output.stderr).to_string(),
         ));
     }
+    std::fs::rename(&tmp, &out)?;
     Ok(out)
+}
+
+fn shader_cache_is_fresh(source: &Path, compiled: &Path) -> Result<bool, GpuPackedMatvecError> {
+    let Ok(compiled_meta) = std::fs::metadata(compiled) else {
+        return Ok(false);
+    };
+    let source_meta = std::fs::metadata(source)?;
+    let Ok(compiled_modified) = compiled_meta.modified() else {
+        return Ok(false);
+    };
+    let Ok(source_modified) = source_meta.modified() else {
+        return Ok(false);
+    };
+    Ok(compiled_modified >= source_modified && compiled_meta.len() > 0)
 }
 
 fn pick_compute_device(
