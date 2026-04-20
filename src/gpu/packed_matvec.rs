@@ -5,6 +5,7 @@ use std::ffi::{CStr, CString};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,7 +129,70 @@ pub fn run_packed_ternary_matvec_with_output(
     Ok((output, report))
 }
 
+pub struct SharedGpuPackedContext {
+    _entry: Entry,
+    instance: Instance,
+    device: Device,
+    queue: vk::Queue,
+    physical_device: vk::PhysicalDevice,
+    queue_family_index: u32,
+}
+
+impl SharedGpuPackedContext {
+    pub fn new() -> Result<Arc<Self>, GpuPackedMatvecError> {
+        let entry = unsafe { Entry::load()? };
+        let app_name = CString::new("jengine-packed-matvec")?;
+        let engine_name = CString::new("jengine")?;
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(&app_name)
+            .application_version(vk::make_api_version(0, 0, 1, 0))
+            .engine_name(&engine_name)
+            .engine_version(vk::make_api_version(0, 0, 1, 0))
+            .api_version(vk::API_VERSION_1_3);
+        let instance_ci = vk::InstanceCreateInfo::default().application_info(&app_info);
+        let instance = unsafe { entry.create_instance(&instance_ci, None)? };
+
+        let (physical_device, queue_family_index) = pick_compute_device(&instance)?;
+        let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
+        let priorities = [1.0f32];
+        let queue_ci = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .queue_priorities(&priorities)];
+        let device_ci = vk::DeviceCreateInfo::default().queue_create_infos(&queue_ci);
+        let device = unsafe { instance.create_device(physical_device, &device_ci, None)? };
+        let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+        let _ = packed_shader_variant(&device_properties);
+        Ok(Arc::new(Self {
+            _entry: entry,
+            instance,
+            device,
+            queue,
+            physical_device,
+            queue_family_index,
+        }))
+    }
+
+    fn shader_choice(&self) -> (&'static str, u32) {
+        let device_properties = unsafe {
+            self.instance
+                .get_physical_device_properties(self.physical_device)
+        };
+        packed_shader_variant(&device_properties)
+    }
+}
+
+impl Drop for SharedGpuPackedContext {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            self.device.destroy_device(None);
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
 pub struct CachedGpuPackedMatvecRunner {
+    _shared_context: Arc<SharedGpuPackedContext>,
     _instance: Instance,
     device: Device,
     queue: vk::Queue,
@@ -199,31 +263,27 @@ impl CachedGpuPackedMatvecRunner {
         rows: usize,
         cols: usize,
     ) -> Result<(Self, Duration), GpuPackedMatvecError> {
+        let context = SharedGpuPackedContext::new()?;
+        Self::new_with_context(context, code_words, scales, group_size, rows, cols)
+    }
+
+    pub fn new_with_context(
+        context: Arc<SharedGpuPackedContext>,
+        code_words: &[u32],
+        scales: &[f32],
+        group_size: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Self, Duration), GpuPackedMatvecError> {
         let compile_started = Instant::now();
 
-        let entry = unsafe { Entry::load()? };
-        let app_name = CString::new("jengine-packed-matvec")?;
-        let engine_name = CString::new("jengine")?;
-        let app_info = vk::ApplicationInfo::default()
-            .application_name(&app_name)
-            .application_version(vk::make_api_version(0, 0, 1, 0))
-            .engine_name(&engine_name)
-            .engine_version(vk::make_api_version(0, 0, 1, 0))
-            .api_version(vk::API_VERSION_1_3);
-        let instance_ci = vk::InstanceCreateInfo::default().application_info(&app_info);
-        let instance = unsafe { entry.create_instance(&instance_ci, None)? };
-
-        let (physical_device, queue_family_index) = pick_compute_device(&instance)?;
-        let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
-        let (shader_source, workgroup_size) = packed_shader_variant(&device_properties);
+        let instance = context.instance.clone();
+        let device = context.device.clone();
+        let queue = context.queue;
+        let physical_device = context.physical_device;
+        let queue_family_index = context.queue_family_index;
+        let (shader_source, workgroup_size) = context.shader_choice();
         let shader_path = compile_shader(Path::new(shader_source))?;
-        let priorities = [1.0f32];
-        let queue_ci = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family_index)
-            .queue_priorities(&priorities)];
-        let device_ci = vk::DeviceCreateInfo::default().queue_create_infos(&queue_ci);
-        let device = unsafe { instance.create_device(physical_device, &device_ci, None)? };
-        let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
         let packed_cols = cols.div_ceil(2);
         let output_bytes = rows * std::mem::size_of::<f32>();
@@ -377,6 +437,7 @@ impl CachedGpuPackedMatvecRunner {
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
 
         let runner = Self {
+            _shared_context: context,
             _instance: instance,
             device,
             queue,
@@ -410,9 +471,35 @@ impl CachedGpuPackedMatvecRunner {
         rows: usize,
         cols: usize,
     ) -> Result<(Self, Duration), GpuPackedMatvecError> {
+        let context = SharedGpuPackedContext::new()?;
+        Self::new_uninitialized_with_context(
+            context,
+            code_word_len,
+            scale_len,
+            group_size,
+            rows,
+            cols,
+        )
+    }
+
+    pub fn new_uninitialized_with_context(
+        context: Arc<SharedGpuPackedContext>,
+        code_word_len: usize,
+        scale_len: usize,
+        group_size: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Self, Duration), GpuPackedMatvecError> {
         let zero_code_words = vec![0u32; code_word_len];
         let zero_scales = vec![0.0f32; scale_len];
-        Self::new(&zero_code_words, &zero_scales, group_size, rows, cols)
+        Self::new_with_context(
+            context,
+            &zero_code_words,
+            &zero_scales,
+            group_size,
+            rows,
+            cols,
+        )
     }
 
     pub fn update_weights(

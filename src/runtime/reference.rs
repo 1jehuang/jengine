@@ -1,7 +1,7 @@
 use crate::cpu::block::{YarnRope, build_yarn_rope, rope_cos_sin};
 use crate::cpu::primitives::{argmax, swiglu};
 use crate::gpu::packed_matvec::{
-    CachedGpuPackedMatvecRunner, run_packed_ternary_matvec_with_output,
+    CachedGpuPackedMatvecRunner, SharedGpuPackedContext, run_packed_ternary_matvec_with_output,
 };
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
@@ -13,6 +13,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -1199,6 +1200,7 @@ pub struct ReferenceModel {
     cached_hybrid_qproj_gpu: RefCell<HashMap<usize, Rc<RefCell<CachedGpuPackedMatvecRunner>>>>,
     cached_projection_packed: RefCell<HashMap<String, Rc<PackedProjectionCache>>>,
     cached_projection_gpu: RefCell<HashMap<String, CachedProjectionGpuRunner>>,
+    packed_gpu_context: RefCell<Option<Arc<SharedGpuPackedContext>>>,
 }
 
 impl ReferenceModel {
@@ -1333,6 +1335,7 @@ impl ReferenceModel {
             cached_hybrid_qproj_gpu: RefCell::new(HashMap::new()),
             cached_projection_packed: RefCell::new(HashMap::new()),
             cached_projection_gpu: RefCell::new(HashMap::new()),
+            packed_gpu_context: RefCell::new(None),
         })
     }
 
@@ -1962,7 +1965,9 @@ impl ReferenceModel {
         {
             return Ok((cached, Duration::ZERO, true));
         }
-        let (runner, duration) = CachedGpuPackedMatvecRunner::new(
+        let context = self.get_or_create_packed_gpu_context()?;
+        let (runner, duration) = CachedGpuPackedMatvecRunner::new_with_context(
+            context,
             &hybrid.code_words,
             &hybrid.scales,
             hybrid.group_size,
@@ -2167,7 +2172,9 @@ impl ReferenceModel {
         {
             return Ok((cached, Duration::ZERO, Duration::ZERO, true));
         }
-        let (mut runner, duration) = CachedGpuPackedMatvecRunner::new_uninitialized(
+        let context = self.get_or_create_packed_gpu_context()?;
+        let (mut runner, duration) = CachedGpuPackedMatvecRunner::new_uninitialized_with_context(
+            context,
             packed.code_words.len(),
             packed.scales.len(),
             packed.group_size,
@@ -2189,6 +2196,18 @@ impl ReferenceModel {
             .borrow_mut()
             .insert(tensor_name.to_string(), runner.clone());
         Ok((runner, duration, weight_upload_duration, false))
+    }
+
+    fn get_or_create_packed_gpu_context(
+        &self,
+    ) -> Result<Arc<SharedGpuPackedContext>, ReferenceError> {
+        if let Some(context) = self.packed_gpu_context.borrow().as_ref().cloned() {
+            return Ok(context);
+        }
+        let context = SharedGpuPackedContext::new()
+            .map_err(|error| ReferenceError::Decode(format!("gpu context init failed: {error}")))?;
+        *self.packed_gpu_context.borrow_mut() = Some(context.clone());
+        Ok(context)
     }
 
     pub fn benchmark_attention_projection_mix(
