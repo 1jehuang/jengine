@@ -399,6 +399,45 @@ impl CachedGpuPackedMatvecRunner {
         Ok((runner, compile_started.elapsed()))
     }
 
+    pub fn new_uninitialized(
+        code_word_len: usize,
+        scale_len: usize,
+        group_size: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Self, Duration), GpuPackedMatvecError> {
+        let zero_code_words = vec![0u32; code_word_len];
+        let zero_scales = vec![0.0f32; scale_len];
+        Self::new(&zero_code_words, &zero_scales, group_size, rows, cols)
+    }
+
+    pub fn update_weights(
+        &mut self,
+        code_words: &[u32],
+        scales: &[f32],
+    ) -> Result<Duration, GpuPackedMatvecError> {
+        let expected_code_words = (self.code_buffer_bytes() / 4) as usize;
+        let expected_scales = (self.scale_buffer_bytes() / 4) as usize;
+        if code_words.len() != expected_code_words {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "code_words length {} does not match expected {}",
+                code_words.len(),
+                expected_code_words
+            )));
+        }
+        if scales.len() != expected_scales {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "scales length {} does not match expected {}",
+                scales.len(),
+                expected_scales
+            )));
+        }
+        let started = Instant::now();
+        write_u32_buffer(&self.device, self.code_buffer.memory, code_words)?;
+        write_f32_buffer(&self.device, self.scale_buffer.memory, scales)?;
+        Ok(started.elapsed())
+    }
+
     pub fn run_with_output(
         &mut self,
         input: &[f32],
