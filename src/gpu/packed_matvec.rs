@@ -146,12 +146,12 @@ pub fn run_packed_ternary_matvec_raw_f32_with_output(
 }
 
 pub struct SharedGpuPackedContext {
-    _entry: Entry,
-    instance: Instance,
-    device: Device,
-    queue: vk::Queue,
-    physical_device: vk::PhysicalDevice,
-    queue_family_index: u32,
+    pub(crate) _entry: Entry,
+    pub(crate) instance: Instance,
+    pub(crate) device: Device,
+    pub(crate) queue: vk::Queue,
+    pub(crate) physical_device: vk::PhysicalDevice,
+    pub(crate) queue_family_index: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
