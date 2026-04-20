@@ -1,8 +1,7 @@
-use crate::cpu::primitives::matvec;
 use crate::model::config::BonsaiModelConfig;
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::packed::{PackedIoError, PackedTensorFile};
-use crate::runtime::repack::{pack_ternary_g128, unpack_ternary_g128};
+use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128, unpack_ternary_g128};
 use crate::runtime::weights::{WeightError, WeightStore};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -202,26 +201,25 @@ impl PackedModelStore {
         name: &str,
         input: &[f32],
     ) -> Result<Option<Vec<f32>>, PackedModelError> {
-        let Some(entry) = self.entries_by_name.get(name) else {
+        let Some(packed) = self.load_packed_tensor_file(name)? else {
             return Ok(None);
         };
-        if entry.shape.len() != 2 {
+        let tensor = packed.tensor;
+        if tensor.shape.len() != 2 {
             return Err(PackedModelError::Encode(format!(
                 "{name}: matvec requires rank-2 tensor"
             )));
         }
-        let rows = entry.shape[0];
-        let cols = entry.shape[1];
+        let cols = tensor.shape[1];
         if input.len() != cols {
             return Err(PackedModelError::Encode(format!(
                 "{name}: input length {} does not match cols {cols}",
                 input.len()
             )));
         }
-        let values = self.load_vector_f32(name)?.ok_or_else(|| {
-            PackedModelError::Encode(format!("{name}: tensor disappeared during packed load"))
-        })?;
-        Ok(Some(matvec(&values, rows, cols, input)))
+        Ok(Some(matvec_packed_ternary(&tensor, input).map_err(
+            |error| PackedModelError::Encode(format!("{name}: {error}")),
+        )?))
     }
 
     pub fn packed_total_bytes(&self) -> usize {
@@ -748,6 +746,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(embed.len(), 4);
+        let before_matvec_cache_bytes = store.unpacked_cache_bytes();
         let matvec = store
             .matvec_f32(
                 "model.layers.0.self_attn.q_proj.weight",
@@ -756,5 +755,6 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(matvec.len(), 4);
+        assert_eq!(store.unpacked_cache_bytes(), before_matvec_cache_bytes);
     }
 }
