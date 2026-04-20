@@ -209,4 +209,5 @@ Every milestone is expected to keep these green:
 - `docs/PERFORMANCE_TARGETS.md` - current performance targets
 - `docs/STATUS.md` - current project status and next bottlenecks
 - `docs/TOKENIZER_FALLBACK.md` - tokenizer fallback behavior and expected model files
+- `docs/AUTOMATION_WORKFLOWS.md` - quick CI, regression, and local profiling scripts
 - `docs/VULKAN_PLAN.md` - Vulkan backend plan based on measured hotspots
