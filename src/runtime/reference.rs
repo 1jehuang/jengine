@@ -546,6 +546,69 @@ impl ReferenceModel {
         Ok(self.weights.matvec_f16(name, input)?)
     }
 
+    fn packed_codes_to_words(bytes: &[u8]) -> Vec<u32> {
+        bytes
+            .chunks(4)
+            .map(|chunk| {
+                let mut word = 0u32;
+                for (i, byte) in chunk.iter().enumerate() {
+                    word |= (*byte as u32) << (i * 8);
+                }
+                word
+            })
+            .collect()
+    }
+
+    fn load_packed_projection_cache_from_artifact(
+        &self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Option<PackedProjectionCache>, ReferenceError> {
+        let Some(packed_model) = &self.packed_model else {
+            return Ok(None);
+        };
+        let Some(packed) = packed_model.load_packed_tensor_file(tensor_name)? else {
+            return Ok(None);
+        };
+        if packed.tensor.shape != vec![rows, cols] {
+            return Err(ReferenceError::Decode(format!(
+                "packed artifact shape mismatch for {tensor_name}: {:?} vs [{rows}, {cols}]",
+                packed.tensor.shape
+            )));
+        }
+        Ok(Some(PackedProjectionCache {
+            rows,
+            cols,
+            group_size: packed.tensor.group_size,
+            code_words: Self::packed_codes_to_words(&packed.tensor.packed_codes),
+            scales: packed.tensor.scales,
+        }))
+    }
+
+    fn load_hybrid_qproj_cache_from_artifact(
+        &self,
+        layer_idx: usize,
+    ) -> Result<Option<HybridQProjCache>, ReferenceError> {
+        let tensor_name = format!("model.layers.{layer_idx}.self_attn.q_proj.weight");
+        let Some(packed) = self.load_packed_projection_cache_from_artifact(
+            &tensor_name,
+            self.config.hidden_size,
+            self.config.hidden_size,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(HybridQProjCache {
+            layer_idx,
+            rows: packed.rows,
+            cols: packed.cols,
+            group_size: packed.group_size,
+            code_words: packed.code_words,
+            scales: packed.scales,
+        }))
+    }
+
     fn activation_working_bytes(&self) -> usize {
         let hidden = self.config.hidden_size * std::mem::size_of::<f32>();
         let kv =
@@ -795,6 +858,9 @@ impl ReferenceModel {
         &self,
         layer_idx: usize,
     ) -> Result<(HybridQProjCache, Duration), ReferenceError> {
+        if let Some(hybrid) = self.load_hybrid_qproj_cache_from_artifact(layer_idx)? {
+            return Ok((hybrid, Duration::ZERO));
+        }
         let tensor_name = format!("model.layers.{layer_idx}.self_attn.q_proj.weight");
         let values = self.weights.load_vector_f32(&tensor_name)?;
         let pack_started = Instant::now();
@@ -805,17 +871,7 @@ impl ReferenceModel {
         )
         .map_err(|error| ReferenceError::Decode(format!("pack failed: {error}")))?;
         let q_proj_pack_duration = pack_started.elapsed();
-        let code_words = packed
-            .packed_codes
-            .chunks(4)
-            .map(|chunk| {
-                let mut word = 0u32;
-                for (i, byte) in chunk.iter().enumerate() {
-                    word |= (*byte as u32) << (i * 8);
-                }
-                word
-            })
-            .collect::<Vec<_>>();
+        let code_words = Self::packed_codes_to_words(&packed.packed_codes);
         Ok((
             HybridQProjCache {
                 layer_idx,
@@ -880,23 +936,18 @@ impl ReferenceModel {
         rows: usize,
         cols: usize,
     ) -> Result<(PackedProjectionCache, Duration), ReferenceError> {
+        if let Some(packed) =
+            self.load_packed_projection_cache_from_artifact(tensor_name, rows, cols)?
+        {
+            return Ok((packed, Duration::ZERO));
+        }
         let values = self.weights.load_vector_f32(tensor_name)?;
         let pack_started = Instant::now();
         let (packed, _) = pack_ternary_g128(&values, vec![rows, cols], 1e-3).map_err(|error| {
             ReferenceError::Decode(format!("pack failed for {tensor_name}: {error}"))
         })?;
         let pack_duration = pack_started.elapsed();
-        let code_words = packed
-            .packed_codes
-            .chunks(4)
-            .map(|chunk| {
-                let mut word = 0u32;
-                for (i, byte) in chunk.iter().enumerate() {
-                    word |= (*byte as u32) << (i * 8);
-                }
-                word
-            })
-            .collect::<Vec<_>>();
+        let code_words = Self::packed_codes_to_words(&packed.packed_codes);
         Ok((
             PackedProjectionCache {
                 rows,
@@ -2439,6 +2490,24 @@ mod tests {
         assert_eq!(result.output_text, "tok2 tok2");
         let report = model.memory_report(1, 1);
         assert!(report.packed_cache_bytes > 0);
+    }
+
+    #[test]
+    fn uses_persistent_packed_artifact_for_hybrid_qproj_cache_on_synthetic_model() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let metrics = model
+            .benchmark_cached_hybrid_qproj_decode("tok2", 1, 0)
+            .expect("cached hybrid decode should succeed");
+
+        assert_eq!(metrics.q_proj_pack_duration, Duration::ZERO);
+        assert!(!metrics.q_proj_pack_cache_hit);
     }
 
     use std::time::Duration;

@@ -103,6 +103,7 @@ pub struct PackedModelStore {
     pub artifact_dir: PathBuf,
     pub manifest: PackedModelManifest,
     entries_by_name: HashMap<String, PackedModelTensorEntry>,
+    packed_tensor_cache: RefCell<HashMap<String, Rc<PackedTensorFile>>>,
     unpacked_cache: RefCell<HashMap<String, Rc<Vec<f32>>>>,
 }
 
@@ -124,6 +125,7 @@ impl PackedModelStore {
             artifact_dir,
             manifest,
             entries_by_name,
+            packed_tensor_cache: RefCell::new(HashMap::new()),
             unpacked_cache: RefCell::new(HashMap::new()),
         })
     }
@@ -133,19 +135,39 @@ impl PackedModelStore {
     }
 
     pub fn load_vector_f32(&self, name: &str) -> Result<Option<Vec<f32>>, PackedModelError> {
-        let Some(entry) = self.entries_by_name.get(name) else {
-            return Ok(None);
-        };
         if let Some(cached) = self.unpacked_cache.borrow().get(name) {
             return Ok(Some((**cached).clone()));
         }
-        let packed = PackedTensorFile::read_from_path(self.artifact_dir.join(&entry.rel_path))?;
-        let unpacked = unpack_ternary_g128(&packed.tensor)
-            .map_err(|error| PackedModelError::Encode(format!("{}: {error}", entry.name)))?;
+        let Some(packed) = self.load_packed_tensor_file(name)? else {
+            return Ok(None);
+        };
+        let unpacked = unpack_ternary_g128(&packed.tensor).map_err(|error| {
+            PackedModelError::Encode(format!(
+                "{}: {error}",
+                packed.metadata.name.as_deref().unwrap_or(name)
+            ))
+        })?;
         self.unpacked_cache
             .borrow_mut()
             .insert(name.to_string(), Rc::new(unpacked.clone()));
         Ok(Some(unpacked))
+    }
+
+    pub fn load_packed_tensor_file(
+        &self,
+        name: &str,
+    ) -> Result<Option<PackedTensorFile>, PackedModelError> {
+        let Some(entry) = self.entries_by_name.get(name) else {
+            return Ok(None);
+        };
+        if let Some(cached) = self.packed_tensor_cache.borrow().get(name) {
+            return Ok(Some((**cached).clone()));
+        }
+        let packed = PackedTensorFile::read_from_path(self.artifact_dir.join(&entry.rel_path))?;
+        self.packed_tensor_cache
+            .borrow_mut()
+            .insert(name.to_string(), Rc::new(packed.clone()));
+        Ok(Some(packed))
     }
 
     pub fn embedding_lookup(
