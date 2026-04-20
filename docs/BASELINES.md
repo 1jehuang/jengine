@@ -12,6 +12,7 @@ These values are the latest verified measurements gathered on this machine from 
 
 - CPU one-token text prompt run: about **1513.965 ms** total, about **0.66 tok/s**
 - CPU short text benchmark: about **3418.009 ms** for 3 generated tokens, about **0.88 tok/s**
+- CPU packed q_proj matvec optimization: about **1.73x** faster than the prior packed reference path on the real 2048x2048 tensor
 - Vulkan dense q_proj matvec: about **2.519 ms** GPU execution
 - Vulkan packed q_proj matvec: about **1.711 ms** GPU execution
 - Hybrid q_proj decode: works correctly, but still slower end to end because pack and pipeline setup are not cached yet
@@ -126,12 +127,21 @@ cargo run --release --bin compare_packed_matvec -- \
   2048 2048
 ```
 
-Observed sample:
+Observed samples:
 
-- dense: `8.391 ms`
-- packed reference: `34.038 ms`
-- speedup: `0.247x`
-- max abs diff: `0.000000`
+- earlier sample:
+  - dense: `8.391 ms`
+  - packed reference: `34.038 ms`
+  - packed vs dense speedup: `0.247x`
+  - max abs diff: `0.000000`
+- current post-grouped-packed sample:
+  - dense: `3.691 ms`
+  - packed reference: `34.492 ms`
+  - packed optimized: `19.933 ms`
+  - packed optimized vs packed reference speedup: `1.730x`
+  - packed optimized vs dense speedup: `0.185x`
+  - max abs diff vs dense for packed reference: `0.000000`
+  - max abs diff vs dense for packed optimized: `0.000001`
 
 ### Runtime-integrated q_proj dense vs packed
 

@@ -177,7 +177,7 @@ pub fn unpack_ternary_g128(packed: &PackedTernaryTensor) -> Result<Vec<f32>, Rep
     Ok(values)
 }
 
-pub fn matvec_packed_ternary(
+pub fn matvec_packed_ternary_reference(
     packed: &PackedTernaryTensor,
     input: &[f32],
 ) -> Result<Vec<f32>, RepackError> {
@@ -212,6 +212,105 @@ pub fn matvec_packed_ternary(
         *out = sum;
     }
     Ok(output)
+}
+
+pub fn matvec_packed_ternary(
+    packed: &PackedTernaryTensor,
+    input: &[f32],
+) -> Result<Vec<f32>, RepackError> {
+    if packed.shape.len() != 2 {
+        return Err(RepackError::Shape(
+            "packed matvec requires a rank-2 tensor".to_string(),
+        ));
+    }
+    let rows = packed.shape[0];
+    let cols = packed.shape[1];
+    if input.len() != cols {
+        return Err(RepackError::Shape(format!(
+            "input length {} does not match packed tensor columns {}",
+            input.len(),
+            cols
+        )));
+    }
+
+    if packed.group_size == TERNARY_G128_GROUP_SIZE
+        && cols.is_multiple_of(packed.group_size)
+        && packed.original_len == rows * cols
+    {
+        return matvec_packed_ternary_grouped_aligned(packed, input, rows, cols);
+    }
+
+    matvec_packed_ternary_reference(packed, input)
+}
+
+fn matvec_packed_ternary_grouped_aligned(
+    packed: &PackedTernaryTensor,
+    input: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<f32>, RepackError> {
+    let groups_per_row = cols / packed.group_size;
+    let bytes_per_group = packed.group_size / 4;
+    let expected_groups = rows * groups_per_row;
+    if packed.scales.len() != expected_groups {
+        return Err(RepackError::Shape(format!(
+            "packed tensor stores {} scales but aligned matvec expects {}",
+            packed.scales.len(),
+            expected_groups
+        )));
+    }
+    if packed.packed_codes.len() != packed.original_len.div_ceil(4) {
+        return Err(RepackError::Shape(
+            "packed code length does not match original tensor length".to_string(),
+        ));
+    }
+
+    let mut output = vec![0.0f32; rows];
+    for (row, out) in output.iter_mut().enumerate() {
+        let row_group_base = row * groups_per_row;
+        let row_code_base = row * cols / 4;
+        let mut row_sum = 0.0f32;
+        for group in 0..groups_per_row {
+            let scale = packed.scales[row_group_base + group];
+            if scale == 0.0 {
+                continue;
+            }
+            let input_group_start = group * packed.group_size;
+            let input_group_end = input_group_start + packed.group_size;
+            let code_group_start = row_code_base + group * bytes_per_group;
+            let code_group_end = code_group_start + bytes_per_group;
+            let signed_input_sum = accumulate_group_signed_sum(
+                &packed.packed_codes[code_group_start..code_group_end],
+                &input[input_group_start..input_group_end],
+            );
+            row_sum += scale * signed_input_sum;
+        }
+        *out = row_sum;
+    }
+    Ok(output)
+}
+
+fn accumulate_group_signed_sum(codes: &[u8], input: &[f32]) -> f32 {
+    debug_assert_eq!(codes.len() * 4, input.len());
+    let mut sum = 0.0f32;
+    for (byte_index, &byte) in codes.iter().enumerate() {
+        let base = byte_index * 4;
+        sum += code_input_contribution(byte & 0b11, input[base]);
+        sum += code_input_contribution((byte >> 2) & 0b11, input[base + 1]);
+        sum += code_input_contribution((byte >> 4) & 0b11, input[base + 2]);
+        sum += code_input_contribution((byte >> 6) & 0b11, input[base + 3]);
+    }
+    sum
+}
+
+#[inline]
+fn code_input_contribution(code: u8, input: f32) -> f32 {
+    match code {
+        0 => 0.0,
+        1 => input,
+        2 => -input,
+        _ => 0.0,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -268,7 +367,7 @@ fn get_code(bytes: &[u8], element_index: usize) -> u8 {
 mod tests {
     use super::{
         TERNARY_G128_GROUP_SIZE, analyze_ternary_packability, matvec_packed_ternary,
-        pack_ternary_g128, unpack_ternary_g128,
+        matvec_packed_ternary_reference, pack_ternary_g128, unpack_ternary_g128,
     };
 
     #[test]
@@ -314,5 +413,29 @@ mod tests {
         let (packed, _) = pack_ternary_g128(&values, vec![2, 3], 1e-6).unwrap();
         let output = matvec_packed_ternary(&packed, &input).unwrap();
         assert_eq!(output, vec![-2.0, -1.0]);
+    }
+
+    #[test]
+    fn optimized_matvec_matches_reference_on_aligned_groups() {
+        let rows = 2;
+        let cols = TERNARY_G128_GROUP_SIZE;
+        let values = (0..(rows * cols))
+            .map(|index| match index % 3 {
+                0 => 0.0,
+                1 => 1.5,
+                _ => -1.5,
+            })
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index % 7) as f32 * 0.1 - 0.2)
+            .collect::<Vec<_>>();
+        let (packed, _) = pack_ternary_g128(&values, vec![rows, cols], 1e-6).unwrap();
+
+        let reference = matvec_packed_ternary_reference(&packed, &input).unwrap();
+        let optimized = matvec_packed_ternary(&packed, &input).unwrap();
+
+        for (optimized_value, reference_value) in optimized.iter().zip(reference.iter()) {
+            assert!((optimized_value - reference_value).abs() <= 1e-6);
+        }
     }
 }

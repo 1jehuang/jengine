@@ -1,5 +1,7 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use jengine::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
+use jengine::runtime::repack::{
+    matvec_packed_ternary, matvec_packed_ternary_reference, pack_ternary_g128,
+};
 
 fn synthetic_tensor() -> (Vec<f32>, Vec<f32>) {
     let values = (0..(128 * 256))
@@ -18,7 +20,10 @@ fn synthetic_tensor() -> (Vec<f32>, Vec<f32>) {
 fn bench_packed_matvec(c: &mut Criterion) {
     let (values, input) = synthetic_tensor();
     let (packed, _) = pack_ternary_g128(&values, vec![128, 256], 1e-6).unwrap();
-    c.bench_function("packed_matvec/128x256", |b| {
+    c.bench_function("packed_matvec_reference/128x256", |b| {
+        b.iter(|| matvec_packed_ternary_reference(black_box(&packed), black_box(&input)).unwrap())
+    });
+    c.bench_function("packed_matvec_optimized/128x256", |b| {
         b.iter(|| matvec_packed_ternary(black_box(&packed), black_box(&input)).unwrap())
     });
 }

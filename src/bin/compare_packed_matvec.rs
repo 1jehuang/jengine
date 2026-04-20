@@ -1,4 +1,6 @@
-use jengine::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
+use jengine::runtime::repack::{
+    matvec_packed_ternary, matvec_packed_ternary_reference, pack_ternary_g128,
+};
 use jengine::runtime::weights::WeightStore;
 use std::time::Instant;
 
@@ -35,8 +37,19 @@ fn main() {
     let (packed, _) =
         pack_ternary_g128(&values, vec![rows, cols], 1e-3).expect("tensor should pack");
     let started = Instant::now();
+    let packed_reference_out =
+        matvec_packed_ternary_reference(&packed, &input).expect("reference packed matvec");
+    let packed_reference_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+    let started = Instant::now();
     let packed_out = matvec_packed_ternary(&packed, &input).expect("packed matvec should work");
     let packed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+
+    let max_abs_diff_reference = dense
+        .iter()
+        .zip(packed_reference_out.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
 
     let max_abs_diff = dense
         .iter()
@@ -45,10 +58,13 @@ fn main() {
         .fold(0.0f32, f32::max);
 
     println!(
-        "dense_ms={:.3} packed_ms={:.3} speedup_x={:.3} max_abs_diff={:.6}",
+        "dense_ms={:.3} packed_reference_ms={:.3} packed_ms={:.3} packed_vs_reference_speedup_x={:.3} packed_vs_dense_speedup_x={:.3} max_abs_diff_reference={:.6} max_abs_diff={:.6}",
         dense_ms,
+        packed_reference_ms,
         packed_ms,
+        packed_reference_ms / packed_ms,
         dense_ms / packed_ms,
+        max_abs_diff_reference,
         max_abs_diff,
     );
 }
