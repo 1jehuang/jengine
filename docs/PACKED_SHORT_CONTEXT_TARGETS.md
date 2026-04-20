@@ -48,15 +48,15 @@ So the benchmark is no longer merely crawling. The direct warm path is now in ge
 For short-context local packed decode on this hardware, target next:
 
 - **at least `4.0 tok/s`** on the direct warm `combined` packed path
-- and improve the first measured prewarmed iteration further above the current `1.607 tok/s`
+- and improve the first measured prewarmed iteration further above the current `2.840 tok/s`
 
 This is the new near-term target after clearing the older `1.0 tok/s` milestone.
 
 ## Why this target
 
-- the packed direct path now already clears the old `1.0 tok/s` milestone and, with broader decode prewarm, both measured iterations stay above `2.2 tok/s`
+- the packed direct path now already clears the old `1.0 tok/s` milestone and, with broader decode prewarm plus embedding-row caching, both measured iterations stay above `2.8 tok/s`
 - the next useful benchmark question is therefore not whether packed decode can break `1 tok/s`, but whether it can sustain and raise multi-token-per-second behavior on the direct path
-- the main remaining gap is now in pushing the stable prewarmed direct path above the current `~2.4 tok/s` band rather than proving viability at all
+- the main remaining gap is now in pushing the stable prewarmed direct path above the current `~3.2 tok/s` band rather than proving viability at all
 
 ## Practical current-architecture ceiling
 

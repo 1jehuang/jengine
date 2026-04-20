@@ -17,7 +17,7 @@ These values are the latest verified measurements gathered on this machine from 
 - Vulkan packed q_proj matvec: about **1.711 ms** GPU execution
 - Hybrid q_proj decode: works correctly, but still slower end to end because pack and pipeline setup are not cached yet
 - Cached hybrid q_proj decode: warm-cache run reduces total time further and removes pack/compile cost entirely
-- Direct packed combined benchmark with broad decode prewarm plus full attention and full MLP offload: about **409.400 to 436.938 ms** total, about **2.29 to 2.44 tok/s**
+- Direct packed combined benchmark with broad decode prewarm, embedding-row caching, and full attention plus full MLP offload: about **278.126 to 352.139 ms** total, about **2.84 to 3.60 tok/s**
 
 ## Real Bonsai 1.7B CPU runs
 

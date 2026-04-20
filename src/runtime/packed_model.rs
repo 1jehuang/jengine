@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+type EmbeddingRowCache = RefCell<HashMap<(String, usize), Rc<Vec<f32>>>>;
+
 const MANIFEST_VERSION: u32 = 1;
 const PACK_TOLERANCE: f32 = 1e-3;
 
@@ -106,6 +108,7 @@ pub struct PackedModelStore {
     entries_by_name: HashMap<String, PackedModelTensorEntry>,
     packed_tensor_cache: RefCell<HashMap<String, Rc<PackedTensorFile>>>,
     unpacked_cache: RefCell<HashMap<String, Rc<Vec<f32>>>>,
+    embedding_row_cache: EmbeddingRowCache,
 }
 
 impl PackedModelStore {
@@ -128,6 +131,7 @@ impl PackedModelStore {
             entries_by_name,
             packed_tensor_cache: RefCell::new(HashMap::new()),
             unpacked_cache: RefCell::new(HashMap::new()),
+            embedding_row_cache: RefCell::new(HashMap::new()),
         })
     }
 
@@ -232,11 +236,19 @@ impl PackedModelStore {
     }
 
     pub fn unpacked_cache_bytes(&self) -> usize {
-        self.unpacked_cache
+        let unpacked = self
+            .unpacked_cache
             .borrow()
             .values()
             .map(|values| values.len() * std::mem::size_of::<f32>())
-            .sum()
+            .sum::<usize>();
+        let embedding_rows = self
+            .embedding_row_cache
+            .borrow()
+            .values()
+            .map(|values| values.len() * std::mem::size_of::<f32>())
+            .sum::<usize>();
+        unpacked + embedding_rows
     }
 }
 
@@ -747,6 +759,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(embed.len(), 4);
+        let after_first_embed_cache_bytes = store.unpacked_cache_bytes();
+        let embed_again = store
+            .embedding_lookup("model.embed_tokens.weight", 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(embed_again, embed);
+        assert_eq!(store.unpacked_cache_bytes(), after_first_embed_cache_bytes);
         let before_matvec_cache_bytes = store.unpacked_cache_bytes();
         let matvec = store
             .matvec_f32(

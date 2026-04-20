@@ -59,6 +59,14 @@ and after extending packed decode prewarm to also populate the dense norm-vector
 
 That is important because the earlier prewarmed direct path was still heavily split between a weak first measured iteration and a much stronger warm second pass. The broader decode prewarm now makes the direct path much more stable from the first measured token onward.
 
+A follow-up embedding-row cache pass pushed the same direct configuration further:
+
+- iteration 1: `352.139 ms`, `2.840 tok/s`
+- iteration 2: `278.126 ms`, `3.595 tok/s`
+- average: `315.133 ms`, `3.218 tok/s`
+
+So the stable direct path is now solidly above `3 tok/s`, which is a material step closer to the current near-term `4 tok/s` target.
+
 A matching direct attribution sample on the same prewarmed configuration measured:
 
 - total: `434.758 ms`

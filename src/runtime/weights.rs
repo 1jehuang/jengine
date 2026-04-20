@@ -10,6 +10,8 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+type EmbeddingRowCache = RefCell<BTreeMap<(String, usize), Rc<Vec<f32>>>>;
+
 #[derive(Debug)]
 pub enum WeightError {
     Io(std::io::Error),
@@ -110,6 +112,7 @@ pub struct WeightStore {
     storage: WeightStorage,
     tensors: BTreeMap<String, TensorIndexEntry>,
     vector_cache: RefCell<BTreeMap<String, Rc<Vec<f32>>>>,
+    embedding_row_cache: EmbeddingRowCache,
 }
 
 impl WeightStore {
@@ -185,6 +188,7 @@ impl WeightStore {
             storage: WeightStorage::Mapped(mmap),
             tensors,
             vector_cache: RefCell::new(BTreeMap::new()),
+            embedding_row_cache: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -195,6 +199,7 @@ impl WeightStore {
             storage: WeightStorage::Owned(bytes),
             tensors,
             vector_cache: RefCell::new(BTreeMap::new()),
+            embedding_row_cache: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -234,6 +239,10 @@ impl WeightStore {
     }
 
     pub fn embedding_lookup(&self, name: &str, token_id: usize) -> Result<Vec<f32>, WeightError> {
+        let cache_key = (name.to_string(), token_id);
+        if let Some(cached) = self.embedding_row_cache.borrow().get(&cache_key) {
+            return Ok((**cached).clone());
+        }
         let tensor = self.tensor_entry(name)?;
         let shape = &tensor.shape;
         if shape.len() != 2 {
@@ -254,10 +263,14 @@ impl WeightStore {
                 let start = token_id * row_bytes;
                 let end = start + row_bytes;
                 let row = &self.tensor_bytes(tensor)[start..end];
-                Ok(row
+                let values = row
                     .chunks_exact(2)
                     .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                    .collect())
+                    .collect::<Vec<_>>();
+                self.embedding_row_cache
+                    .borrow_mut()
+                    .insert(cache_key, Rc::new(values.clone()));
+                Ok(values)
             }
             dtype => Err(WeightError::UnsupportedDtype(dtype)),
         }
@@ -479,6 +492,9 @@ mod tests {
         let embedding = store
             .embedding_lookup("model.embed_tokens.weight", 1)
             .expect("embedding lookup should succeed");
+        let embedding_again = store
+            .embedding_lookup("model.embed_tokens.weight", 1)
+            .expect("cached embedding lookup should succeed");
         let output = store
             .matvec_f16("model.layers.0.self_attn.q_proj.weight", &embedding)
             .expect("matvec should succeed");
@@ -487,6 +503,7 @@ mod tests {
             .expect("vector load should succeed");
 
         assert_eq!(embedding, vec![3.0, 4.0]);
+        assert_eq!(embedding_again, embedding);
         assert_eq!(output.len(), 3);
         assert!((output[0] - 3.0).abs() < 1e-5);
         assert!((output[1] - 4.0).abs() < 1e-5);
