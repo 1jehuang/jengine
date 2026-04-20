@@ -382,6 +382,12 @@ impl HybridProjectionDecodeMetrics {
 pub struct PackedDecodeMetrics {
     pub enabled_projections: String,
     pub total_duration: Duration,
+    pub embedding_duration: Duration,
+    pub norm_duration: Duration,
+    pub qkv_duration: Duration,
+    pub attention_duration: Duration,
+    pub mlp_duration: Duration,
+    pub logits_duration: Duration,
     pub pack_duration: Duration,
     pub compile_duration: Duration,
     pub weight_upload_duration: Duration,
@@ -430,9 +436,15 @@ impl PackedDecodeMetrics {
 
     pub fn summarize(&self) -> String {
         format!(
-            "enabled={} total_ms={:.3} pack_ms={:.3} compile_ms={:.3} weight_upload_ms={:.3} activation_upload_ms={:.3} upload_ms={:.3} gpu_ms={:.3} download_ms={:.3} non_offloaded_dense_ms={:.3} orchestration_ms={:.3} pack_cache_hits={} gpu_cache_hits={} dispatch_count={} weight_upload_bytes={} activation_upload_bytes={} upload_bytes={} download_bytes={} streamed_bytes={} e2e_gbps={:.3} stream_window_gbps={:.3} output={}",
+            "enabled={} total_ms={:.3} embed_ms={:.3} norm_ms={:.3} qkv_ms={:.3} attention_ms={:.3} mlp_ms={:.3} logits_ms={:.3} pack_ms={:.3} compile_ms={:.3} weight_upload_ms={:.3} activation_upload_ms={:.3} upload_ms={:.3} gpu_ms={:.3} download_ms={:.3} non_offloaded_dense_ms={:.3} orchestration_ms={:.3} pack_cache_hits={} gpu_cache_hits={} dispatch_count={} weight_upload_bytes={} activation_upload_bytes={} upload_bytes={} download_bytes={} streamed_bytes={} e2e_gbps={:.3} stream_window_gbps={:.3} output={}",
             self.enabled_projections,
             self.total_duration.as_secs_f64() * 1_000.0,
+            self.embedding_duration.as_secs_f64() * 1_000.0,
+            self.norm_duration.as_secs_f64() * 1_000.0,
+            self.qkv_duration.as_secs_f64() * 1_000.0,
+            self.attention_duration.as_secs_f64() * 1_000.0,
+            self.mlp_duration.as_secs_f64() * 1_000.0,
+            self.logits_duration.as_secs_f64() * 1_000.0,
             self.pack_duration.as_secs_f64() * 1_000.0,
             self.compile_duration.as_secs_f64() * 1_000.0,
             self.weight_upload_duration.as_secs_f64() * 1_000.0,
@@ -782,6 +794,7 @@ impl ReferenceModel {
     fn finish_packed_decode_metrics(
         enabled_projections: String,
         total_duration: Duration,
+        decode_metrics: &DecodeMetrics,
         non_offloaded_dense_duration: Duration,
         session: &PackedGpuSession<'_>,
         output_text: String,
@@ -798,6 +811,12 @@ impl ReferenceModel {
         PackedDecodeMetrics {
             enabled_projections,
             total_duration,
+            embedding_duration: decode_metrics.embedding_duration,
+            norm_duration: decode_metrics.norm_duration,
+            qkv_duration: decode_metrics.qkv_duration,
+            attention_duration: decode_metrics.attention_duration,
+            mlp_duration: decode_metrics.mlp_duration,
+            logits_duration: decode_metrics.logits_duration,
             pack_duration: session.metrics.pack_duration,
             compile_duration: session.metrics.compile_duration,
             weight_upload_duration: session.metrics.weight_upload_duration,
@@ -2261,6 +2280,7 @@ impl ReferenceModel {
         Ok(Self::finish_packed_decode_metrics(
             Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
             total_started.elapsed(),
+            &metrics,
             non_offloaded_dense_duration,
             &session,
             String::new(),
@@ -2479,6 +2499,7 @@ impl ReferenceModel {
             Self::finish_packed_decode_metrics(
                 Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
                 total_started.elapsed(),
+                &metrics,
                 non_offloaded_dense_duration,
                 &session,
                 String::new(),
@@ -2603,6 +2624,7 @@ impl ReferenceModel {
         let packed_metrics = Self::finish_packed_decode_metrics(
             Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
             total_started.elapsed(),
+            &metrics,
             non_offloaded_dense_duration,
             &session,
             output_text.clone(),

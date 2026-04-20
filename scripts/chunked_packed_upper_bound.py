@@ -10,6 +10,12 @@ import tempfile
 
 FLOAT_KEYS = [
     'total_ms',
+    'embed_ms',
+    'norm_ms',
+    'qkv_ms',
+    'attention_ms',
+    'mlp_ms',
+    'logits_ms',
     'pack_ms',
     'compile_ms',
     'weight_upload_ms',

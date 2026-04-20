@@ -477,39 +477,53 @@ Current interpretation:
 
 ### Carry-up into the chunked combined packed upper bound
 
-Using the same 7-layer chunk chaining workflow as the packed combined upper bound, but with `JENGINE_PACKED_SHADER_VARIANT=xe2_subgroup_row`, first produced:
+Using the same 7-layer chunk chaining workflow as the packed combined upper bound, the latest rebuilt release sample now produces:
 
-- total: `11885.064 ms`
-- compile: `1364.736 ms`
-- upload: `20.824 ms`
-- gpu: `250.854 ms`
-- download: `30.269 ms`
-- non-offloaded dense: `9445.204 ms`
-- orchestration: `773.164 ms`
+- total: `4521.801 ms`
+- embed: `86.530 ms`
+- norm: `3.618 ms`
+- qkv: `569.974 ms`
+- attention: `661.839 ms`
+- mlp: `2732.602 ms`
+- logits: `467.062 ms`
+- compile: `840.249 ms`
+- upload: `21.323 ms`
+- gpu: `70.624 ms`
+- download: `30.657 ms`
+- non-offloaded dense: `2642.862 ms`
+- orchestration: `916.066 ms`
 - dispatches: `57`
-
-Then, after switching packed-model CPU fallback embedding lookup and matvec over to direct packed decode instead of whole-tensor unpack, the same chunked combined workflow produced:
-
-- total: `11458.751 ms`
-- compile: `1358.502 ms`
-- upload: `21.392 ms`
-- gpu: `224.086 ms`
-- download: `29.585 ms`
-- non-offloaded dense: `9064.034 ms`
-- orchestration: `761.142 ms`
-- dispatches: `57`
-
-Compared with the older default-shader chunked combined upper bound:
-
-- total improved from `12212.554 ms` to `11458.751 ms`
-- gpu time improved from `657.716 ms` to `224.086 ms`
 
 Current interpretation:
 
-- the subgroup-row win does survive into the broader packed path
-- and avoiding full unpack on the CPU-side packed fallback also helps materially
-- but even after both of those changes, dense-side work is still the largest bucket in the current chunked combined capture
-- packed-artifact `generate_greedy` now routes into the packed decode path automatically, which means the packed-first runtime is now the default generation path for packed-artifact models rather than only an opt-in benchmark helper
+- the accumulated packed-first runtime changes have materially reduced the chunked combined upper bound
+- the packed GPU kernel time is now comparatively small in the full combined path
+- the new stage breakdown shows that the **MLP stage** is now the largest remaining stage-level bucket in the combined packed path
+- that points the next optimization pass toward the MLP tail and broader packed-first execution, not back toward attention-only offload
+
+### Chunked MLP-only packed upper bound
+
+Using the same helper on the `mlp` variant now produces:
+
+- total: `4927.981 ms`
+- embed: `53.991 ms`
+- norm: `2.411 ms`
+- qkv: `1273.461 ms`
+- attention: `639.963 ms`
+- mlp: `2703.211 ms`
+- logits: `254.761 ms`
+- compile: `386.512 ms`
+- upload: `16.598 ms`
+- gpu: `50.721 ms`
+- download: `28.778 ms`
+- non-offloaded dense: `3853.917 ms`
+- orchestration: `591.444 ms`
+- dispatches: `29`
+
+Current interpretation:
+
+- even in the `mlp`-only variant, the MLP stage remains the single biggest stage bucket
+- that reinforces that the next dense-side redesign work should target the MLP tail and broader packed-first execution
 
 ## Chunked packed capture workarounds
 
