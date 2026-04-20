@@ -461,11 +461,6 @@ impl CachedGpuPackedMatvecRunner {
 
         let upload_started = Instant::now();
         write_u32_buffer(&self.device, self.vector_buffer.memory, &vector_words)?;
-        zero_buffer(
-            &self.device,
-            self.output_buffer.memory,
-            self.rows * std::mem::size_of::<f32>(),
-        )?;
         let upload_duration = upload_started.elapsed();
 
         let submit_info = [
