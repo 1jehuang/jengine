@@ -26,8 +26,9 @@ fn main() {
         .map(|(value, gamma)| value * scale * gamma)
         .collect::<Vec<_>>();
 
-    let (_output, report) = run_weighted_rms_norm_with_output(&input, &weight, 1e-6, Some(&reference))
-        .expect("gpu weighted rms norm should succeed");
+    let (_output, report) =
+        run_weighted_rms_norm_with_output(&input, &weight, 1e-6, Some(&reference))
+            .expect("gpu weighted rms norm should succeed");
 
     println!("{}", report.summarize());
 }

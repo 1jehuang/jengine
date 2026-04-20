@@ -1,5 +1,5 @@
 use ash::util::read_spv;
-use ash::{vk, Device, Instance};
+use ash::{Device, Instance, vk};
 use std::ffi::CString;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -94,11 +94,8 @@ pub fn run_weighted_rms_norm_with_output(
     reference: Option<&[f32]>,
 ) -> Result<(Vec<f32>, GpuWeightedRmsNormReport), GpuWeightedRmsNormError> {
     let context = SharedGpuPackedContext::new().map_err(map_context_error)?;
-    let (mut runner, compile_duration) = CachedGpuWeightedRmsNormRunner::new_with_context(
-        context,
-        input.len(),
-        epsilon,
-    )?;
+    let (mut runner, compile_duration) =
+        CachedGpuWeightedRmsNormRunner::new_with_context(context, input.len(), epsilon)?;
     let (output, mut report) = runner.run_with_output(input, weight, reference)?;
     report.compile_duration = compile_duration;
     Ok((output, report))
@@ -182,7 +179,8 @@ impl CachedGpuWeightedRmsNormRunner {
         ];
         let descriptor_layout_ci =
             vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_layout_bindings);
-        let descriptor_set_layout = unsafe { device.create_descriptor_set_layout(&descriptor_layout_ci, None)? };
+        let descriptor_set_layout =
+            unsafe { device.create_descriptor_set_layout(&descriptor_layout_ci, None)? };
         let push_range = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
@@ -257,10 +255,7 @@ impl CachedGpuWeightedRmsNormRunner {
             .command_buffer_count(1);
         let command_buffer = unsafe { device.allocate_command_buffers(&command_alloc)?[0] };
         unsafe {
-            device.begin_command_buffer(
-                command_buffer,
-                &vk::CommandBufferBeginInfo::default(),
-            )?;
+            device.begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())?;
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(
                 command_buffer,
@@ -317,6 +312,23 @@ impl CachedGpuWeightedRmsNormRunner {
         weight: &[f32],
         reference: Option<&[f32]>,
     ) -> Result<(Vec<f32>, GpuWeightedRmsNormReport), GpuWeightedRmsNormError> {
+        let mut report = self.run_resident(input, weight)?;
+        let (output, download_duration) = self.read_output()?;
+        report.download_duration = download_duration;
+        let (max_abs_diff, mean_abs_diff) = match reference {
+            Some(reference) => compare_outputs(reference, &output),
+            None => (0.0, 0.0),
+        };
+        report.max_abs_diff = max_abs_diff;
+        report.mean_abs_diff = mean_abs_diff;
+        Ok((output, report))
+    }
+
+    pub fn run_resident(
+        &mut self,
+        input: &[f32],
+        weight: &[f32],
+    ) -> Result<GpuWeightedRmsNormReport, GpuWeightedRmsNormError> {
         if input.len() != self.len || weight.len() != self.len {
             return Err(GpuWeightedRmsNormError::Shape(format!(
                 "input len {} and weight len {} must both match runner len {}",
@@ -330,34 +342,47 @@ impl CachedGpuWeightedRmsNormRunner {
         write_f32_buffer(&self.weight_buffer, weight)?;
         let upload_duration = upload_started.elapsed();
         unsafe { self.device.reset_fences(&[self.fence])? };
-        let submit_info = [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(
-            &self.command_buffer,
-        ))];
+        let submit_info = [
+            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer))
+        ];
         let gpu_started = Instant::now();
         unsafe {
-            self.device.queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
             self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
         }
         let gpu_duration = gpu_started.elapsed();
+        Ok(GpuWeightedRmsNormReport {
+            len: self.len,
+            compile_duration: Duration::ZERO,
+            upload_duration,
+            gpu_duration,
+            download_duration: Duration::ZERO,
+            max_abs_diff: 0.0,
+            mean_abs_diff: 0.0,
+        })
+    }
+
+    pub fn read_output(&self) -> Result<(Vec<f32>, Duration), GpuWeightedRmsNormError> {
         let download_started = Instant::now();
         let output = read_f32_buffer(&self.output_buffer, self.len)?;
-        let download_duration = download_started.elapsed();
-        let (max_abs_diff, mean_abs_diff) = match reference {
-            Some(reference) => compare_outputs(reference, &output),
-            None => (0.0, 0.0),
-        };
-        Ok((
-            output,
-            GpuWeightedRmsNormReport {
-                len: self.len,
-                compile_duration: Duration::ZERO,
-                upload_duration,
-                gpu_duration,
-                download_duration,
-                max_abs_diff,
-                mean_abs_diff,
-            },
-        ))
+        Ok((output, download_started.elapsed()))
+    }
+
+    pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> {
+        &self._shared_context
+    }
+
+    pub fn output_buffer_handle(&self) -> vk::Buffer {
+        self.output_buffer.buffer
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 
@@ -366,10 +391,12 @@ impl Drop for CachedGpuWeightedRmsNormRunner {
         unsafe {
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.command_pool, None);
-            self.device.destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
             self.device.destroy_pipeline(self.pipeline, None);
             self.device.destroy_shader_module(self.shader_module, None);
-            self.device.destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             destroy_buffer(&self.device, self.input_buffer);
@@ -472,7 +499,9 @@ fn find_memory_type(
 ) -> Result<u32, GpuWeightedRmsNormError> {
     for i in 0..props.memory_type_count {
         let matches_type = (filter & (1 << i)) != 0;
-        let has_flags = props.memory_types[i as usize].property_flags.contains(flags);
+        let has_flags = props.memory_types[i as usize]
+            .property_flags
+            .contains(flags);
         if matches_type && has_flags {
             return Ok(i);
         }
@@ -490,12 +519,15 @@ fn write_f32_buffer(
     if byte_len > buffer.size {
         return Err(GpuWeightedRmsNormError::Shape(format!(
             "f32 write {} bytes exceeds mapped buffer size {}",
-            byte_len,
-            buffer.size
+            byte_len, buffer.size
         )));
     }
     unsafe {
-        std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, buffer.mapped_ptr, byte_len as usize);
+        std::ptr::copy_nonoverlapping(
+            data.as_ptr() as *const u8,
+            buffer.mapped_ptr,
+            byte_len as usize,
+        );
     }
     Ok(())
 }
@@ -504,8 +536,7 @@ fn zero_buffer(buffer: &BufferAllocation, byte_len: usize) -> Result<(), GpuWeig
     if byte_len as u64 > buffer.size {
         return Err(GpuWeightedRmsNormError::Shape(format!(
             "zero {} bytes exceeds mapped buffer size {}",
-            byte_len,
-            buffer.size
+            byte_len, buffer.size
         )));
     }
     unsafe {
@@ -514,7 +545,10 @@ fn zero_buffer(buffer: &BufferAllocation, byte_len: usize) -> Result<(), GpuWeig
     Ok(())
 }
 
-fn read_f32_buffer(buffer: &BufferAllocation, len: usize) -> Result<Vec<f32>, GpuWeightedRmsNormError> {
+fn read_f32_buffer(
+    buffer: &BufferAllocation,
+    len: usize,
+) -> Result<Vec<f32>, GpuWeightedRmsNormError> {
     let mut out = vec![0.0f32; len];
     unsafe {
         std::ptr::copy_nonoverlapping(buffer.mapped_ptr as *const f32, out.as_mut_ptr(), len);
@@ -541,6 +575,8 @@ fn destroy_buffer(device: &Device, buffer: BufferAllocation) {
     }
 }
 
-fn map_context_error(error: crate::gpu::packed_matvec::GpuPackedMatvecError) -> GpuWeightedRmsNormError {
+fn map_context_error(
+    error: crate::gpu::packed_matvec::GpuPackedMatvecError,
+) -> GpuWeightedRmsNormError {
     GpuWeightedRmsNormError::Shape(format!("shared gpu context init failed: {error}"))
 }

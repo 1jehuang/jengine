@@ -3,6 +3,7 @@ use crate::cpu::primitives::{argmax, swiglu};
 use crate::gpu::packed_matvec::{
     CachedGpuPackedMatvecRunner, SharedGpuPackedContext, run_packed_ternary_matvec_with_output,
 };
+use crate::gpu::weighted_rms_norm::CachedGpuWeightedRmsNormRunner;
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
@@ -289,6 +290,8 @@ struct LayerTensorNames {
 
 type CachedProjectionGpuRunner = Rc<RefCell<CachedGpuPackedMatvecRunner>>;
 type CachedProjectionGpuCacheEntry = (CachedProjectionGpuRunner, Duration, Duration, bool);
+type CachedWeightedRmsNormGpuRunner = Rc<RefCell<CachedGpuWeightedRmsNormRunner>>;
+type CachedWeightedRmsNormGpuCacheEntry = (CachedWeightedRmsNormGpuRunner, Duration, bool);
 type ProjectionTripletOutputs = (Vec<f32>, Vec<f32>, Vec<f32>);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -725,6 +728,13 @@ struct ResidentPackedProjection {
     report: crate::gpu::packed_matvec::GpuPackedMatvecReport,
 }
 
+struct ResidentGpuFinalNorm {
+    runner: CachedWeightedRmsNormGpuRunner,
+    report: crate::gpu::weighted_rms_norm::GpuWeightedRmsNormReport,
+    compile_duration: Duration,
+    gpu_cache_hit: bool,
+}
+
 struct PackedGpuSession<'a> {
     model: &'a ReferenceModel,
     metrics: PackedGpuSessionMetrics,
@@ -760,6 +770,105 @@ impl<'a> PackedGpuSession<'a> {
     ) -> Result<usize, ReferenceError> {
         let resident = self.run_projection_resident(tensor_name, rows, cols, input, "argmax")?;
         self.argmax_projection_output(resident)
+    }
+
+    fn run_projection_argmax_from_final_norm(
+        &mut self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+        final_norm: ResidentGpuFinalNorm,
+    ) -> Result<usize, ReferenceError> {
+        let prepared = self.prepare_projection_runner_raw_f32(tensor_name, rows, cols)?;
+        let mut report = prepared
+            .runner
+            .borrow_mut()
+            .run_resident_from_f32_buffer(
+                final_norm.runner.borrow().shared_context(),
+                final_norm.runner.borrow().output_buffer_handle(),
+                final_norm.runner.borrow().len(),
+                (final_norm.runner.borrow().len() * std::mem::size_of::<f32>()) as u64,
+            )
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection chaining failed for {tensor_name}: {error}"
+                ))
+            })?;
+        let (argmax_index, logits_download_duration) =
+            prepared.runner.borrow().argmax_output().map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection argmax failed for {tensor_name}: {error}"
+                ))
+            })?;
+        report.download_duration = logits_download_duration;
+
+        let norm_weight_upload_bytes = cols * std::mem::size_of::<f32>();
+        let norm_activation_upload_bytes = cols * std::mem::size_of::<f32>();
+        self.metrics.compile_duration += final_norm.compile_duration;
+        self.metrics.weight_upload_duration += final_norm.report.upload_duration;
+        self.metrics.upload_duration += final_norm.report.upload_duration;
+        self.metrics.gpu_duration += final_norm.report.gpu_duration;
+        self.metrics.dispatch_count += 1;
+        self.metrics.weight_upload_bytes += norm_weight_upload_bytes;
+        self.metrics.activation_upload_bytes += norm_activation_upload_bytes;
+        self.metrics.upload_bytes += norm_weight_upload_bytes + norm_activation_upload_bytes;
+        self.metrics.gpu_cache_hits += usize::from(final_norm.gpu_cache_hit);
+        self.dispatch_trace.push(PackedDispatchTrace {
+            index: self.dispatch_trace.len() + 1,
+            operation: "resident".to_string(),
+            path: "gpu_dense".to_string(),
+            stage: "final_norm_gpu".to_string(),
+            tensor_name: "model.norm.weight".to_string(),
+            rows: cols,
+            cols,
+            pack_cache_hit: false,
+            gpu_cache_hit: final_norm.gpu_cache_hit,
+            cpu_ms: (final_norm.compile_duration + final_norm.report.upload_duration).as_secs_f64()
+                * 1_000.0,
+            compile_ms: final_norm.compile_duration.as_secs_f64() * 1_000.0,
+            weight_upload_ms: final_norm.report.upload_duration.as_secs_f64() * 1_000.0,
+            activation_upload_ms: 0.0,
+            gpu_ms: final_norm.report.gpu_duration.as_secs_f64() * 1_000.0,
+            download_ms: 0.0,
+            weight_upload_bytes: norm_weight_upload_bytes,
+            activation_upload_bytes: norm_activation_upload_bytes,
+            download_bytes: 0,
+        });
+
+        let weight_upload_bytes = usize::from(!prepared.gpu_cache_hit)
+            * (prepared.packed.code_words.len() * std::mem::size_of::<u32>()
+                + prepared.packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = cols * std::mem::size_of::<f32>();
+        self.metrics.compile_duration += prepared.compile_duration;
+        self.metrics.weight_upload_duration += prepared.weight_upload_duration;
+        self.metrics.upload_duration += prepared.weight_upload_duration + report.upload_duration;
+        self.metrics.gpu_duration += report.gpu_duration;
+        self.metrics.download_duration += report.download_duration;
+        self.metrics.dispatch_count += 1;
+        self.metrics.gpu_cache_hits += usize::from(prepared.gpu_cache_hit);
+        self.metrics.pack_cache_hits += usize::from(prepared.pack_cache_hit);
+        if !prepared.gpu_cache_hit {
+            self.metrics.weight_upload_bytes += weight_upload_bytes;
+        }
+        self.metrics.activation_upload_bytes += activation_upload_bytes;
+        self.metrics.upload_bytes += weight_upload_bytes + activation_upload_bytes;
+        self.push_dispatch_trace(
+            tensor_name,
+            "argmax",
+            rows,
+            cols,
+            prepared.pack_cache_hit,
+            prepared.gpu_cache_hit,
+            prepared.compile_duration,
+            prepared.weight_upload_duration,
+            report.upload_duration,
+            report.gpu_duration,
+            report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            0,
+        );
+        Ok(argmax_index)
     }
 
     fn run_projection_resident(
@@ -909,6 +1018,49 @@ impl<'a> PackedGpuSession<'a> {
             compile_duration,
             weight_upload_duration,
             pack_cache_hit,
+            gpu_cache_hit,
+        })
+    }
+
+    fn prepare_projection_runner_raw_f32(
+        &mut self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<PreparedProjectionRunner, ReferenceError> {
+        let cache_key = format!("{tensor_name}::raw_f32_input");
+        let (packed, pack_duration, pack_cache_hit) =
+            self.model
+                .get_or_create_projection_cache(tensor_name, rows, cols)?;
+        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu_raw_f32(&cache_key, &packed)?;
+        self.metrics.pack_duration += pack_duration;
+        Ok(PreparedProjectionRunner {
+            packed,
+            runner,
+            compile_duration,
+            weight_upload_duration,
+            pack_cache_hit,
+            gpu_cache_hit,
+        })
+    }
+
+    fn run_final_norm_resident(
+        &mut self,
+        input: &[f32],
+        weight: &[f32],
+    ) -> Result<ResidentGpuFinalNorm, ReferenceError> {
+        let (runner, compile_duration, gpu_cache_hit) =
+            self.model.get_or_create_final_norm_gpu()?;
+        let report = runner
+            .borrow_mut()
+            .run_resident(input, weight)
+            .map_err(|error| ReferenceError::Decode(format!("gpu final norm failed: {error}")))?;
+        Ok(ResidentGpuFinalNorm {
+            runner,
+            report,
+            compile_duration,
             gpu_cache_hit,
         })
     }
@@ -1200,6 +1352,7 @@ pub struct ReferenceModel {
     cached_hybrid_qproj_gpu: RefCell<HashMap<usize, Rc<RefCell<CachedGpuPackedMatvecRunner>>>>,
     cached_projection_packed: RefCell<HashMap<String, Rc<PackedProjectionCache>>>,
     cached_projection_gpu: RefCell<HashMap<String, CachedProjectionGpuRunner>>,
+    cached_final_norm_gpu: RefCell<Option<CachedWeightedRmsNormGpuRunner>>,
     packed_gpu_context: RefCell<Option<Arc<SharedGpuPackedContext>>>,
 }
 
@@ -1235,6 +1388,10 @@ impl ReferenceModel {
 
     fn packed_use_attention_full() -> bool {
         std::env::var_os("JENGINE_PACKED_ATTENTION_FULL").is_some()
+    }
+
+    fn packed_use_gpu_final_norm() -> bool {
+        std::env::var_os("JENGINE_GPU_FINAL_NORM").is_some()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1335,6 +1492,7 @@ impl ReferenceModel {
             cached_hybrid_qproj_gpu: RefCell::new(HashMap::new()),
             cached_projection_packed: RefCell::new(HashMap::new()),
             cached_projection_gpu: RefCell::new(HashMap::new()),
+            cached_final_norm_gpu: RefCell::new(None),
             packed_gpu_context: RefCell::new(None),
         })
     }
@@ -1494,12 +1652,21 @@ impl ReferenceModel {
             }
         }
         let _ = self.load_vector_f32_resolved("model.norm.weight")?;
+        if Self::packed_use_gpu_final_norm() {
+            let _ = self.get_or_create_final_norm_gpu()?;
+        }
         let (logits_packed, _, _) = self.get_or_create_projection_cache(
             "model.embed_tokens.weight",
             self.config.vocab_size,
             self.config.hidden_size,
         )?;
         let _ = self.get_or_create_projection_gpu("model.embed_tokens.weight", &logits_packed)?;
+        if Self::packed_use_gpu_final_norm() {
+            let _ = self.get_or_create_projection_gpu_raw_f32(
+                "model.embed_tokens.weight::raw_f32_input",
+                &logits_packed,
+            )?;
+        }
         Ok(())
     }
 
@@ -2196,6 +2363,64 @@ impl ReferenceModel {
             .borrow_mut()
             .insert(tensor_name.to_string(), runner.clone());
         Ok((runner, duration, weight_upload_duration, false))
+    }
+
+    fn get_or_create_projection_gpu_raw_f32(
+        &self,
+        tensor_name: &str,
+        packed: &PackedProjectionCache,
+    ) -> Result<CachedProjectionGpuCacheEntry, ReferenceError> {
+        if let Some(cached) = self
+            .cached_projection_gpu
+            .borrow()
+            .get(tensor_name)
+            .cloned()
+        {
+            return Ok((cached, Duration::ZERO, Duration::ZERO, true));
+        }
+        let context = self.get_or_create_packed_gpu_context()?;
+        let (mut runner, duration) =
+            CachedGpuPackedMatvecRunner::new_uninitialized_raw_f32_input_with_context(
+                context,
+                packed.code_words.len(),
+                packed.scales.len(),
+                packed.group_size,
+                packed.rows,
+                packed.cols,
+            )
+            .map_err(|error| {
+                ReferenceError::Decode(format!("gpu packed init failed for {tensor_name}: {error}"))
+            })?;
+        let weight_upload_duration = runner
+            .update_weights(&packed.code_words, &packed.scales)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu weight upload failed for {tensor_name}: {error}"
+                ))
+            })?;
+        let runner = Rc::new(RefCell::new(runner));
+        self.cached_projection_gpu
+            .borrow_mut()
+            .insert(tensor_name.to_string(), runner.clone());
+        Ok((runner, duration, weight_upload_duration, false))
+    }
+
+    fn get_or_create_final_norm_gpu(
+        &self,
+    ) -> Result<CachedWeightedRmsNormGpuCacheEntry, ReferenceError> {
+        if let Some(cached) = self.cached_final_norm_gpu.borrow().as_ref().cloned() {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let context = self.get_or_create_packed_gpu_context()?;
+        let (runner, duration) = CachedGpuWeightedRmsNormRunner::new_with_context(
+            context,
+            self.config.hidden_size,
+            self.config.rms_norm_eps as f32,
+        )
+        .map_err(|error| ReferenceError::Decode(format!("gpu final norm init failed: {error}")))?;
+        let runner = Rc::new(RefCell::new(runner));
+        *self.cached_final_norm_gpu.borrow_mut() = Some(runner.clone());
+        Ok((runner, duration, false))
     }
 
     fn get_or_create_packed_gpu_context(
@@ -3942,34 +4167,60 @@ impl ReferenceModel {
             }
         }
 
-        let started_at = Instant::now();
-        let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
-        let hidden =
-            weighted_rms_norm(&hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
-        let elapsed = started_at.elapsed();
-        metrics.norm_duration += elapsed;
-        *non_offloaded_dense_duration += elapsed;
-        session.push_dense_stage_trace("final_norm", "model.norm.weight", elapsed);
-
-        let started_at = Instant::now();
         let result = if argmax_only {
-            let next_token = session.run_projection_argmax(
-                "model.embed_tokens.weight",
-                self.config.vocab_size,
-                self.config.hidden_size,
-                &hidden,
-            )?;
+            let norm_started = Instant::now();
+            let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
+            let next_token = if Self::packed_use_gpu_final_norm() {
+                let final_norm = session.run_final_norm_resident(&hidden, &final_norm_weight)?;
+                metrics.norm_duration += norm_started.elapsed();
+                let logits_started = Instant::now();
+                let next_token = session.run_projection_argmax_from_final_norm(
+                    "model.embed_tokens.weight",
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    final_norm,
+                )?;
+                metrics.logits_duration += logits_started.elapsed();
+                next_token
+            } else {
+                let hidden =
+                    weighted_rms_norm(&hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
+                let norm_elapsed = norm_started.elapsed();
+                metrics.norm_duration += norm_elapsed;
+                *non_offloaded_dense_duration += norm_elapsed;
+                session.push_dense_stage_trace("final_norm", "model.norm.weight", norm_elapsed);
+                let logits_started = Instant::now();
+                let next_token = session.run_projection_argmax(
+                    "model.embed_tokens.weight",
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    &hidden,
+                )?;
+                metrics.logits_duration += logits_started.elapsed();
+                next_token
+            };
             PackedDecodeStepResult::NextToken(next_token)
         } else {
+            let norm_started = Instant::now();
+            let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
+            let hidden =
+                weighted_rms_norm(&hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
+            let norm_elapsed = norm_started.elapsed();
+            metrics.norm_duration += norm_elapsed;
+            *non_offloaded_dense_duration += norm_elapsed;
+            session.push_dense_stage_trace("final_norm", "model.norm.weight", norm_elapsed);
+            let logits_started = Instant::now();
             let logits = self.matvec_f16_resolved("model.embed_tokens.weight", &hidden)?;
+            let logits_elapsed = logits_started.elapsed();
+            metrics.logits_duration += logits_elapsed;
+            *non_offloaded_dense_duration += logits_elapsed;
+            session.push_dense_stage_trace(
+                "logits_dense",
+                "model.embed_tokens.weight",
+                logits_elapsed,
+            );
             PackedDecodeStepResult::Logits(logits)
         };
-        let elapsed = started_at.elapsed();
-        metrics.logits_duration += elapsed;
-        if !argmax_only {
-            *non_offloaded_dense_duration += elapsed;
-            session.push_dense_stage_trace("logits_dense", "model.embed_tokens.weight", elapsed);
-        }
         Ok(result)
     }
 
