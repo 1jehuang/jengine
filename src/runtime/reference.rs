@@ -485,12 +485,14 @@ impl PackedDecodeMetrics {
 pub struct PackedDispatchTrace {
     pub index: usize,
     pub operation: String,
+    pub path: String,
     pub stage: String,
     pub tensor_name: String,
     pub rows: usize,
     pub cols: usize,
     pub pack_cache_hit: bool,
     pub gpu_cache_hit: bool,
+    pub cpu_ms: f64,
     pub compile_ms: f64,
     pub weight_upload_ms: f64,
     pub activation_upload_ms: f64,
@@ -752,12 +754,16 @@ impl<'a> PackedGpuSession<'a> {
         self.dispatch_trace.push(PackedDispatchTrace {
             index: self.dispatch_trace.len() + 1,
             operation: operation.to_string(),
+            path: "gpu_packed".to_string(),
             stage,
             tensor_name: tensor_name.to_string(),
             rows,
             cols,
             pack_cache_hit,
             gpu_cache_hit,
+            cpu_ms: (compile_duration + weight_upload_duration + activation_upload_duration)
+                .as_secs_f64()
+                * 1_000.0,
             compile_ms: compile_duration.as_secs_f64() * 1_000.0,
             weight_upload_ms: weight_upload_duration.as_secs_f64() * 1_000.0,
             activation_upload_ms: activation_upload_duration.as_secs_f64() * 1_000.0,
@@ -766,6 +772,29 @@ impl<'a> PackedGpuSession<'a> {
             weight_upload_bytes,
             activation_upload_bytes,
             download_bytes,
+        });
+    }
+
+    fn push_dense_stage_trace(&mut self, stage: &str, tensor_name: &str, cpu_duration: Duration) {
+        self.dispatch_trace.push(PackedDispatchTrace {
+            index: self.dispatch_trace.len() + 1,
+            operation: "dense_stage".to_string(),
+            path: "dense_cpu".to_string(),
+            stage: stage.to_string(),
+            tensor_name: tensor_name.to_string(),
+            rows: 0,
+            cols: 0,
+            pack_cache_hit: false,
+            gpu_cache_hit: false,
+            cpu_ms: cpu_duration.as_secs_f64() * 1_000.0,
+            compile_ms: 0.0,
+            weight_upload_ms: 0.0,
+            activation_upload_ms: 0.0,
+            gpu_ms: 0.0,
+            download_ms: 0.0,
+            weight_upload_bytes: 0,
+            activation_upload_bytes: 0,
+            download_bytes: 0,
         });
     }
 
@@ -2719,6 +2748,11 @@ impl ReferenceModel {
             );
             let attn_elapsed = attn_started_at.elapsed();
             attention_stage_metrics.query_duration += attn_elapsed;
+            session.push_dense_stage_trace(
+                "attention_core",
+                "attention_single_query",
+                attn_elapsed,
+            );
             let use_attention_full = use_attention_qkv && Self::packed_use_attention_full();
             let oproj_started_at = Instant::now();
             let attn_output = if use_attention_full {
@@ -2741,6 +2775,11 @@ impl ReferenceModel {
                 .collect();
             let residual_elapsed = residual_started_at.elapsed();
             attention_stage_metrics.residual_duration += residual_elapsed;
+            session.push_dense_stage_trace(
+                "attention_residual",
+                "attention_residual_add",
+                residual_elapsed,
+            );
             let elapsed = started_at.elapsed();
             metrics.attention_duration += elapsed;
             if use_attention_qkv {
@@ -2765,6 +2804,11 @@ impl ReferenceModel {
             let elapsed = started_at.elapsed();
             metrics.norm_duration += elapsed;
             non_offloaded_dense_duration += elapsed;
+            session.push_dense_stage_trace(
+                "post_attention_norm",
+                &layer_tensors.post_attention_layernorm_weight,
+                elapsed,
+            );
 
             let started_at = Instant::now();
             let (gate, up, dense_tail_started_at) = if use_mlp_gu {
@@ -2791,6 +2835,7 @@ impl ReferenceModel {
             let mlp = swiglu(&gate, &up);
             let swiglu_elapsed = swiglu_started_at.elapsed();
             mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
+            session.push_dense_stage_trace("mlp_swiglu", "swiglu", swiglu_elapsed);
             let down_started_at = Instant::now();
             let down = if use_mlp_full {
                 session.run_projection(
@@ -2812,6 +2857,7 @@ impl ReferenceModel {
                 .collect();
             let residual_elapsed = residual_started_at.elapsed();
             mlp_stage_metrics.residual_duration += residual_elapsed;
+            session.push_dense_stage_trace("mlp_residual", "mlp_residual_add", residual_elapsed);
             let elapsed = started_at.elapsed();
             metrics.mlp_duration += elapsed;
             if use_mlp_gu {
@@ -3517,6 +3563,11 @@ impl ReferenceModel {
             let elapsed = started_at.elapsed();
             metrics.norm_duration += elapsed;
             *non_offloaded_dense_duration += elapsed;
+            session.push_dense_stage_trace(
+                "input_norm",
+                &layer_tensors.input_layernorm_weight,
+                elapsed,
+            );
             let residual = hidden;
 
             let started_at = Instant::now();
@@ -3574,6 +3625,7 @@ impl ReferenceModel {
             let elapsed = started_at.elapsed();
             metrics.norm_duration += elapsed;
             *non_offloaded_dense_duration += elapsed;
+            session.push_dense_stage_trace("qk_norm_rope", &layer_tensors.q_norm_weight, elapsed);
 
             let started_at = Instant::now();
             let attn_started_at = Instant::now();
@@ -3590,6 +3642,11 @@ impl ReferenceModel {
             );
             let attn_elapsed = attn_started_at.elapsed();
             attention_stage_metrics.query_duration += attn_elapsed;
+            session.push_dense_stage_trace(
+                "attention_core",
+                "attention_single_query",
+                attn_elapsed,
+            );
             let use_attention_full = use_attention_qkv && Self::packed_use_attention_full();
             let oproj_started_at = Instant::now();
             let attn_output = if use_attention_full {
@@ -3612,6 +3669,11 @@ impl ReferenceModel {
                 .collect();
             let residual_elapsed = residual_started_at.elapsed();
             attention_stage_metrics.residual_duration += residual_elapsed;
+            session.push_dense_stage_trace(
+                "attention_residual",
+                "attention_residual_add",
+                residual_elapsed,
+            );
             let elapsed = started_at.elapsed();
             metrics.attention_duration += elapsed;
             if use_attention_qkv {
@@ -3636,6 +3698,11 @@ impl ReferenceModel {
             let elapsed = started_at.elapsed();
             metrics.norm_duration += elapsed;
             *non_offloaded_dense_duration += elapsed;
+            session.push_dense_stage_trace(
+                "post_attention_norm",
+                &layer_tensors.post_attention_layernorm_weight,
+                elapsed,
+            );
 
             let started_at = Instant::now();
             let (gate, up, dense_tail_started_at) = if use_mlp_gu {
@@ -3662,6 +3729,7 @@ impl ReferenceModel {
             let mlp = swiglu(&gate, &up);
             let swiglu_elapsed = swiglu_started_at.elapsed();
             mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
+            session.push_dense_stage_trace("mlp_swiglu", "swiglu", swiglu_elapsed);
             let down_started_at = Instant::now();
             let down = if use_mlp_full {
                 session.run_projection(
@@ -3683,6 +3751,7 @@ impl ReferenceModel {
                 .collect();
             let residual_elapsed = residual_started_at.elapsed();
             mlp_stage_metrics.residual_duration += residual_elapsed;
+            session.push_dense_stage_trace("mlp_residual", "mlp_residual_add", residual_elapsed);
             let elapsed = started_at.elapsed();
             metrics.mlp_duration += elapsed;
             if use_mlp_gu {
@@ -3703,6 +3772,7 @@ impl ReferenceModel {
         let elapsed = started_at.elapsed();
         metrics.norm_duration += elapsed;
         *non_offloaded_dense_duration += elapsed;
+        session.push_dense_stage_trace("final_norm", "model.norm.weight", elapsed);
 
         let started_at = Instant::now();
         let result = if argmax_only {
@@ -3721,6 +3791,7 @@ impl ReferenceModel {
         metrics.logits_duration += elapsed;
         if !argmax_only {
             *non_offloaded_dense_duration += elapsed;
+            session.push_dense_stage_trace("logits_dense", "model.embed_tokens.weight", elapsed);
         }
         Ok(result)
     }
