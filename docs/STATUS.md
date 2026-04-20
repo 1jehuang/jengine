@@ -275,6 +275,35 @@ So the kernel math itself is **not** the limiting issue for `down_proj`. The hug
 
 That is why naive full-MLP offload regressed even though `down_proj` is still the dominant MLP subcomponent: the broader path is not yet structured well enough to cash in the kernel-side upside.
 
+### Warm full-MLP offload is promising even though the cold variant regresses
+
+The env-gated full-MLP experiment (`JENGINE_PACKED_MLP_FULL=1`) looked bad in cold multi-process chunked capture, but the new one-process warm runner shows a very different picture.
+
+For `combined` on the warm second in-process iteration:
+
+- total: `1101.208 ms`
+- compile: `0.000 ms`
+- weight upload: `0.000 ms`
+- gpu: `99.444 ms`
+- download: `31.361 ms`
+- non-offloaded dense: `967.702 ms`
+- qkv: `23.246 ms`
+- attention: `659.908 ms`
+- mlp: `81.371 ms`
+  - `mlp_down`: `28.489 ms`
+- logits: `29.289 ms`
+- dispatches: `85`
+- `pack_cache_hits=85`
+- `gpu_cache_hits=85`
+
+That is about **`0.908 tok/s`** for one-token decode, which is very close to the current `1 tok/s` milestone.
+
+So the right interpretation is now:
+
+- naive full-MLP offload is still bad when every chunk is cold
+- but once cache reuse is preserved in-process, full-MLP offload becomes highly promising
+- the next engineering problem is therefore making that warm-path behavior practical and cheap enough, not abandoning `down_proj` GPU help entirely
+
 ### Packed-first generation is now the default control path for packed-artifact models
 
 The packed-artifact `generate_greedy` / `generate_from_token_ids` path no longer falls back through the dense-style reference loop. It now routes into the packed decode path automatically when a packed model artifact is loaded.
@@ -330,10 +359,10 @@ From the latest real one-token run:
 12. Packed-artifact `generate_greedy` now routes into the packed decode path automatically, so the packed-first runtime is no longer just benchmark-only infrastructure
 13. With the rebuilt release chunked capture path, the latest combined upper bound is now in the mid-`4.5 s` range, and the stage breakdown shows `mlp_ms=2872.509` as the largest remaining stage-level bucket
 14. The one-process chunked runner shows a warm in-process combined upper bound of `2819.341 ms` with `pack_cache_hits=57` and `gpu_cache_hits=57`, which is about `0.355 tok/s` for one-token decode and confirms that cache reuse now matters a lot
-15. The new MLP sub-breakdown shows `mlp_down_ms=1913.680`, which means `down_proj` handling is the dominant subcomponent inside the MLP tail even though naive full offload regresses
+15. The new MLP sub-breakdown shows `mlp_down_ms=1913.680`, which means `down_proj` handling is the dominant subcomponent inside the MLP tail even though naive full offload regresses in cold capture
 16. A direct real-tensor microbenchmark still shows `down_proj` packed GPU kernel time at only `0.869 ms` versus `123.933 ms` dense CPU and `133.083 ms` packed CPU, which means the problem is structural integration overhead rather than raw GPU math throughput
-17. A naive full-MLP packed experiment (`JENGINE_PACKED_MLP_FULL=1`) regressed badly, so the next MLP-side fix is not simply turning `down_proj` into another standalone packed projection
-18. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the MLP tail with a more structural redesign around `down_proj` while still reducing remaining dense-side work and synchronization overhead
+17. Warm in-process full-MLP offload (`JENGINE_PACKED_MLP_FULL=1`) reaches about `0.908 tok/s` for one-token decode, so the next MLP-side goal is to make that warm-path advantage practical without paying the current cold-start penalties
+18. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the MLP tail with a more structural redesign around `down_proj` and its warm-cache behavior while still reducing remaining dense-side work and synchronization overhead
 
 ## Best next step
 

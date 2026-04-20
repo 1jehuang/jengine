@@ -571,15 +571,45 @@ Current interpretation:
 
 ### Naive full-MLP packed experiment
 
-With `JENGINE_PACKED_MLP_FULL=1`, the env-gated experiment that also offloads `down_proj` produced much worse upper bounds:
+With `JENGINE_PACKED_MLP_FULL=1`, the env-gated experiment that also offloads `down_proj` produced much worse upper bounds in cold multi-process chunked capture:
 
 - combined upper bound: `10010.763 ms`
 - mlp-only upper bound: `9835.970 ms`
 
+But in the one-process warm runner, the same full-MLP path becomes much more attractive.
+
+### Warm full-MLP in-process sample
+
+Command shape:
+
+```bash
+JENGINE_NO_HEARTBEAT=1 JENGINE_PACKED_MLP_FULL=1 ./target/release/bench_packed_chunked_upper_bound \
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model 42 combined 7 2
+```
+
+Observed warm second-iteration aggregate:
+
+- total: `1101.208 ms`
+- compile: `0.000 ms`
+- weight upload: `0.000 ms`
+- gpu: `99.444 ms`
+- download: `31.361 ms`
+- non-offloaded dense: `967.702 ms`
+- qkv: `23.246 ms`
+- attention: `659.908 ms`
+- mlp: `81.371 ms`
+  - `mlp_down`: `28.489 ms`
+- logits: `29.289 ms`
+- dispatches: `85`
+- `pack_cache_hits=85`
+- `gpu_cache_hits=85`
+
 Current interpretation:
 
-- simply turning `down_proj` into another standalone packed projection is not the right next fix in the broader packed path
-- but the MLP sub-breakdown shows `down_proj` is still the dominant subcomponent inside the MLP stage, so the real fix likely needs a more structural redesign around that tail rather than naive standalone offload
+- simply turning `down_proj` into another standalone packed projection is not the right next fix when every chunk is cold
+- but once cache reuse is preserved in-process, the full-MLP path becomes highly promising and nearly reaches `1 tok/s`
+- that means the real problem is not the raw `down_proj` GPU kernel, but how cold-start overhead and staging are currently paid around it
+- the next MLP-side redesign should therefore aim to keep more of that warm-path behavior while cutting the cold-start costs
 
 ### Real `down_proj` tensor microbenchmark
 
