@@ -477,21 +477,26 @@ Current interpretation:
 
 ### Carry-up into the chunked combined packed upper bound
 
-Using the same 7-layer chunk chaining workflow as the packed combined upper bound, the latest rebuilt release sample now produces:
+Using the same 7-layer chunk chaining workflow as the packed combined upper bound, the latest rebuilt release samples now land in the mid-`4.5 s` range.
 
-- total: `4521.801 ms`
-- embed: `86.530 ms`
-- norm: `3.618 ms`
-- qkv: `569.974 ms`
-- attention: `661.839 ms`
-- mlp: `2732.602 ms`
-- logits: `467.062 ms`
-- compile: `840.249 ms`
-- upload: `21.323 ms`
-- gpu: `70.624 ms`
-- download: `30.657 ms`
-- non-offloaded dense: `2642.862 ms`
-- orchestration: `916.066 ms`
+A representative recent sample is:
+
+- total: `4557.668 ms`
+- embed: `36.293 ms`
+- norm: `119.368 ms`
+- qkv: `601.657 ms`
+- attention: `654.818 ms`
+- mlp: `2872.509 ms`
+  - `mlp_swiglu`: `0.395 ms`
+  - `mlp_down`: `1913.680 ms`
+  - `mlp_residual`: `0.088 ms`
+- logits: `272.840 ms`
+- compile: `872.561 ms`
+- upload: `19.742 ms`
+- gpu: `70.335 ms`
+- download: `24.491 ms`
+- non-offloaded dense: `2724.712 ms`
+- orchestration: `845.815 ms`
 - dispatches: `57`
 
 Current interpretation:
@@ -499,6 +504,7 @@ Current interpretation:
 - the accumulated packed-first runtime changes have materially reduced the chunked combined upper bound
 - the packed GPU kernel time is now comparatively small in the full combined path
 - the new stage breakdown shows that the **MLP stage** is now the largest remaining stage-level bucket in the combined packed path
+- and inside that stage, `down_proj` dominates the measured MLP sub-breakdown
 - that points the next optimization pass toward the MLP tail and broader packed-first execution, not back toward attention-only offload
 
 ### Chunked MLP-only packed upper bound
@@ -535,7 +541,7 @@ With `JENGINE_PACKED_MLP_FULL=1`, the env-gated experiment that also offloads `d
 Current interpretation:
 
 - simply turning `down_proj` into another standalone packed projection is not the right next fix in the broader packed path
-- the MLP tail still needs work, but it likely needs a more structural redesign than naive full offload
+- but the MLP sub-breakdown shows `down_proj` is still the dominant subcomponent inside the MLP stage, so the real fix likely needs a more structural redesign around that tail rather than naive standalone offload
 
 ## Chunked packed capture workarounds
 

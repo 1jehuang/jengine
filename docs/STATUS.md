@@ -197,24 +197,29 @@ So the kernel-level win is real and it does survive upward, but only as about a 
 
 ### Direct packed CPU fallback plus the rebuilt packed-first path dropped the combined upper bound sharply
 
-With the latest packed-first runtime path, subgroup-row shader, and direct packed CPU fallback for both embedding lookup and matvec, the rebuilt release chunked combined upper bound is now:
+With the latest packed-first runtime path, subgroup-row shader, and direct packed CPU fallback for both embedding lookup and matvec, the rebuilt release chunked combined upper bound is now in the mid-`4.5 s` range.
 
-- total: `4521.801 ms`
-- embed: `86.530 ms`
-- norm: `3.618 ms`
-- qkv: `569.974 ms`
-- attention: `661.839 ms`
-- mlp: `2732.602 ms`
-- logits: `467.062 ms`
-- compile: `840.249 ms`
-- upload: `21.323 ms`
-- gpu: `70.624 ms`
-- download: `30.657 ms`
-- non-offloaded dense: `2642.862 ms`
-- orchestration: `916.066 ms`
+A representative recent sample is:
+
+- total: `4557.668 ms`
+- embed: `36.293 ms`
+- norm: `119.368 ms`
+- qkv: `601.657 ms`
+- attention: `654.818 ms`
+- mlp: `2872.509 ms`
+  - `mlp_swiglu`: `0.395 ms`
+  - `mlp_down`: `1913.680 ms`
+  - `mlp_residual`: `0.088 ms`
+- logits: `272.840 ms`
+- compile: `872.561 ms`
+- upload: `19.742 ms`
+- gpu: `70.335 ms`
+- download: `24.491 ms`
+- non-offloaded dense: `2724.712 ms`
+- orchestration: `845.815 ms`
 - dispatches: `57`
 
-That is a major improvement over the older chunked combined upper bounds. The most important new conclusion is that the **MLP stage is now clearly the largest remaining stage-level bucket** in the combined packed path.
+That is a major improvement over the older chunked combined upper bounds. The most important new conclusion is that the **MLP stage is now clearly the largest remaining stage-level bucket, and within it `down_proj` is by far the dominant subcomponent**.
 
 ### Naive full-MLP offload is not the right next fix
 
@@ -280,9 +285,10 @@ From the latest real one-token run:
 10. A simple subgroup-aligned `32`-thread local-size tweak was effectively a wash, but a larger subgroup-row rewrite improved the real 2048x2048 packed `q_proj` microbenchmark from `1.249 ms` to `0.556 ms` median GPU time, about `2.25x` faster, and this Lunar Lake machine now auto-selects that faster path by default
 11. Carrying that subgroup-row shader into the chunked combined packed path reduced the reconstructed upper bound from `12212.554 ms` to `11885.064 ms`, only about `2.7%` total, which confirms that dense-side work is still the main limiter
 12. Packed-artifact `generate_greedy` now routes into the packed decode path automatically, so the packed-first runtime is no longer just benchmark-only infrastructure
-13. With the rebuilt release chunked capture path, the latest combined upper bound is now `4521.801 ms`, and the stage breakdown shows `mlp_ms=2732.602` as the largest remaining stage-level bucket
-14. A naive full-MLP packed experiment (`JENGINE_PACKED_MLP_FULL=1`) regressed badly, so the next MLP-side fix is not simply turning `down_proj` into another standalone packed projection
-15. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the MLP tail with a more structural redesign while still reducing remaining dense-side work and synchronization overhead
+13. With the rebuilt release chunked capture path, the latest combined upper bound is now in the mid-`4.5 s` range, and the stage breakdown shows `mlp_ms=2872.509` as the largest remaining stage-level bucket
+14. The new MLP sub-breakdown shows `mlp_down_ms=1913.680`, which means `down_proj` handling is the dominant subcomponent inside the MLP tail even though naive full offload regresses
+15. A naive full-MLP packed experiment (`JENGINE_PACKED_MLP_FULL=1`) regressed badly, so the next MLP-side fix is not simply turning `down_proj` into another standalone packed projection
+16. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the MLP tail with a more structural redesign around `down_proj` while still reducing remaining dense-side work and synchronization overhead
 
 ## Best next step
 

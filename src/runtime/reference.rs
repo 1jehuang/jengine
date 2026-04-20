@@ -387,6 +387,9 @@ pub struct PackedDecodeMetrics {
     pub qkv_duration: Duration,
     pub attention_duration: Duration,
     pub mlp_duration: Duration,
+    pub mlp_swiglu_duration: Duration,
+    pub mlp_down_duration: Duration,
+    pub mlp_residual_duration: Duration,
     pub logits_duration: Duration,
     pub pack_duration: Duration,
     pub compile_duration: Duration,
@@ -436,7 +439,7 @@ impl PackedDecodeMetrics {
 
     pub fn summarize(&self) -> String {
         format!(
-            "enabled={} total_ms={:.3} embed_ms={:.3} norm_ms={:.3} qkv_ms={:.3} attention_ms={:.3} mlp_ms={:.3} logits_ms={:.3} pack_ms={:.3} compile_ms={:.3} weight_upload_ms={:.3} activation_upload_ms={:.3} upload_ms={:.3} gpu_ms={:.3} download_ms={:.3} non_offloaded_dense_ms={:.3} orchestration_ms={:.3} pack_cache_hits={} gpu_cache_hits={} dispatch_count={} weight_upload_bytes={} activation_upload_bytes={} upload_bytes={} download_bytes={} streamed_bytes={} e2e_gbps={:.3} stream_window_gbps={:.3} output={}",
+            "enabled={} total_ms={:.3} embed_ms={:.3} norm_ms={:.3} qkv_ms={:.3} attention_ms={:.3} mlp_ms={:.3} mlp_swiglu_ms={:.3} mlp_down_ms={:.3} mlp_residual_ms={:.3} logits_ms={:.3} pack_ms={:.3} compile_ms={:.3} weight_upload_ms={:.3} activation_upload_ms={:.3} upload_ms={:.3} gpu_ms={:.3} download_ms={:.3} non_offloaded_dense_ms={:.3} orchestration_ms={:.3} pack_cache_hits={} gpu_cache_hits={} dispatch_count={} weight_upload_bytes={} activation_upload_bytes={} upload_bytes={} download_bytes={} streamed_bytes={} e2e_gbps={:.3} stream_window_gbps={:.3} output={}",
             self.enabled_projections,
             self.total_duration.as_secs_f64() * 1_000.0,
             self.embedding_duration.as_secs_f64() * 1_000.0,
@@ -444,6 +447,9 @@ impl PackedDecodeMetrics {
             self.qkv_duration.as_secs_f64() * 1_000.0,
             self.attention_duration.as_secs_f64() * 1_000.0,
             self.mlp_duration.as_secs_f64() * 1_000.0,
+            self.mlp_swiglu_duration.as_secs_f64() * 1_000.0,
+            self.mlp_down_duration.as_secs_f64() * 1_000.0,
+            self.mlp_residual_duration.as_secs_f64() * 1_000.0,
             self.logits_duration.as_secs_f64() * 1_000.0,
             self.pack_duration.as_secs_f64() * 1_000.0,
             self.compile_duration.as_secs_f64() * 1_000.0,
@@ -492,6 +498,13 @@ impl PackedDecodeValidationReport {
             self.enabled_projections, self.prompt_tokens, self.max_abs_diff, self.mean_abs_diff,
         )
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PackedMlpStageMetrics {
+    swiglu_duration: Duration,
+    down_duration: Duration,
+    residual_duration: Duration,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -799,6 +812,7 @@ impl ReferenceModel {
         enabled_projections: String,
         total_duration: Duration,
         decode_metrics: &DecodeMetrics,
+        mlp_stage_metrics: &PackedMlpStageMetrics,
         non_offloaded_dense_duration: Duration,
         session: &PackedGpuSession<'_>,
         output_text: String,
@@ -820,6 +834,9 @@ impl ReferenceModel {
             qkv_duration: decode_metrics.qkv_duration,
             attention_duration: decode_metrics.attention_duration,
             mlp_duration: decode_metrics.mlp_duration,
+            mlp_swiglu_duration: mlp_stage_metrics.swiglu_duration,
+            mlp_down_duration: mlp_stage_metrics.down_duration,
+            mlp_residual_duration: mlp_stage_metrics.residual_duration,
             logits_duration: decode_metrics.logits_duration,
             pack_duration: session.metrics.pack_duration,
             compile_duration: session.metrics.compile_duration,
@@ -2267,12 +2284,14 @@ impl ReferenceModel {
         let mut cache = self.allocate_layer_cache_vec(prompt_ids.len());
         let mut session = PackedGpuSession::new(self);
         let mut non_offloaded_dense_duration = Duration::ZERO;
+        let mut mlp_stage_metrics = PackedMlpStageMetrics::default();
         for (position, &token_id) in prompt_ids.iter().enumerate() {
             let _ = self.forward_step_packed_decode(
                 token_id,
                 position,
                 &mut cache,
                 &mut metrics,
+                &mut mlp_stage_metrics,
                 &mut non_offloaded_dense_duration,
                 &mut session,
                 use_attention_qkv,
@@ -2285,6 +2304,7 @@ impl ReferenceModel {
             Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
             total_started.elapsed(),
             &metrics,
+            &mlp_stage_metrics,
             non_offloaded_dense_duration,
             &session,
             String::new(),
@@ -2323,6 +2343,7 @@ impl ReferenceModel {
         };
         let mut session = PackedGpuSession::new(self);
         let mut non_offloaded_dense_duration = Duration::ZERO;
+        let mut mlp_stage_metrics = PackedMlpStageMetrics::default();
         let mut hidden = if let Some(hidden_in) = hidden_in {
             hidden_in.to_vec()
         } else {
@@ -2467,6 +2488,8 @@ impl ReferenceModel {
             let swiglu_started_at = Instant::now();
             let mlp = swiglu(&gate, &up);
             let swiglu_elapsed = swiglu_started_at.elapsed();
+            mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
+            let down_started_at = Instant::now();
             let down = if use_mlp_full {
                 session.run_projection(
                     &layer_tensors.down_proj_weight,
@@ -2477,6 +2500,8 @@ impl ReferenceModel {
             } else {
                 self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?
             };
+            let down_elapsed = down_started_at.elapsed();
+            mlp_stage_metrics.down_duration += down_elapsed;
             let residual_started_at = Instant::now();
             hidden = residual
                 .iter()
@@ -2484,6 +2509,7 @@ impl ReferenceModel {
                 .map(|(left, right)| left + right)
                 .collect();
             let residual_elapsed = residual_started_at.elapsed();
+            mlp_stage_metrics.residual_duration += residual_elapsed;
             let elapsed = started_at.elapsed();
             metrics.mlp_duration += elapsed;
             if use_mlp_gu {
@@ -2522,6 +2548,7 @@ impl ReferenceModel {
                 Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
                 total_started.elapsed(),
                 &metrics,
+                &mlp_stage_metrics,
                 non_offloaded_dense_duration,
                 &session,
                 String::new(),
@@ -2592,6 +2619,7 @@ impl ReferenceModel {
         let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens);
         let mut session = PackedGpuSession::new(self);
         let mut non_offloaded_dense_duration = Duration::ZERO;
+        let mut mlp_stage_metrics = PackedMlpStageMetrics::default();
         let mut last_next_token = None;
 
         for (position, &token_id) in prompt_ids.iter().enumerate() {
@@ -2600,6 +2628,7 @@ impl ReferenceModel {
                 position,
                 &mut cache,
                 &mut metrics,
+                &mut mlp_stage_metrics,
                 &mut non_offloaded_dense_duration,
                 &mut session,
                 use_attention_qkv,
@@ -2626,6 +2655,7 @@ impl ReferenceModel {
                 prompt_ids.len() + generation_index,
                 &mut cache,
                 &mut metrics,
+                &mut mlp_stage_metrics,
                 &mut non_offloaded_dense_duration,
                 &mut session,
                 use_attention_qkv,
@@ -2647,6 +2677,7 @@ impl ReferenceModel {
             Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
             total_started.elapsed(),
             &metrics,
+            &mlp_stage_metrics,
             non_offloaded_dense_duration,
             &session,
             output_text.clone(),
@@ -2684,6 +2715,7 @@ impl ReferenceModel {
         let mut cache = self.allocate_layer_cache_vec(prompt_ids.len());
         let mut session = PackedGpuSession::new(self);
         let mut non_offloaded_dense_duration = Duration::ZERO;
+        let mut mlp_stage_metrics = PackedMlpStageMetrics::default();
         let mut last_logits = Vec::new();
         for (position, &token_id) in prompt_ids.iter().enumerate() {
             last_logits = match self.forward_step_packed_decode(
@@ -2691,6 +2723,7 @@ impl ReferenceModel {
                 position,
                 &mut cache,
                 &mut metrics,
+                &mut mlp_stage_metrics,
                 &mut non_offloaded_dense_duration,
                 &mut session,
                 use_attention_qkv,
@@ -3143,6 +3176,7 @@ impl ReferenceModel {
         position: usize,
         cache: &mut [LayerCache],
         metrics: &mut DecodeMetrics,
+        mlp_stage_metrics: &mut PackedMlpStageMetrics,
         non_offloaded_dense_duration: &mut Duration,
         session: &mut PackedGpuSession<'_>,
         use_attention_qkv: bool,
@@ -3289,6 +3323,8 @@ impl ReferenceModel {
             let swiglu_started_at = Instant::now();
             let mlp = swiglu(&gate, &up);
             let swiglu_elapsed = swiglu_started_at.elapsed();
+            mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
+            let down_started_at = Instant::now();
             let down = if use_mlp_full {
                 session.run_projection(
                     &layer_tensors.down_proj_weight,
@@ -3299,6 +3335,8 @@ impl ReferenceModel {
             } else {
                 self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?
             };
+            let down_elapsed = down_started_at.elapsed();
+            mlp_stage_metrics.down_duration += down_elapsed;
             let residual_started_at = Instant::now();
             hidden = residual
                 .iter()
@@ -3306,6 +3344,7 @@ impl ReferenceModel {
                 .map(|(left, right)| left + right)
                 .collect();
             let residual_elapsed = residual_started_at.elapsed();
+            mlp_stage_metrics.residual_duration += residual_elapsed;
             let elapsed = started_at.elapsed();
             metrics.mlp_duration += elapsed;
             if use_mlp_gu {
