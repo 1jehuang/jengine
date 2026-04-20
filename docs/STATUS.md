@@ -275,6 +275,28 @@ So the kernel math itself is **not** the limiting issue for `down_proj`. The hug
 
 That is why naive full-MLP offload regressed even though `down_proj` is still the dominant MLP subcomponent: the broader path is not yet structured well enough to cash in the kernel-side upside.
 
+### Prewarmed direct packed attribution still shows dense work dominating
+
+A direct prewarmed attribution sample with `JENGINE_PREWARM_PACKED=1 JENGINE_PACKED_MLP_FULL=1` now shows:
+
+- total: `2299.752 ms`
+- embed: `88.381 ms`
+- norm: `324.656 ms`
+- qkv: `76.868 ms`
+- attention: `1522.674 ms`
+- mlp: `213.085 ms`
+  - `mlp_down`: `75.525 ms`
+- logits: `71.591 ms`
+- compile: `0.000 ms`
+- weight upload: `0.000 ms`
+- gpu: `279.446 ms`
+- download: `76.452 ms`
+- non-offloaded dense: `1936.774 ms`
+- orchestration: `6.962 ms`
+- dispatches: `170`
+
+So once compile, weight upload, and most orchestration are gone, the direct path is still dominated by **non-offloaded dense work**, and in that warm full-MLP regime the **attention stage** becomes the single biggest direct benchmark bucket.
+
 ### Packed cache prewarm makes the direct packed benchmark much more practical
 
 A new `prewarm_packed_decode_caches(...)` API is now exposed on `ReferenceModel`, and the packed CLI / benchmark paths honor `JENGINE_PREWARM_PACKED=1`.
@@ -394,11 +416,11 @@ From the latest real one-token run:
 13. With the rebuilt release chunked capture path, the latest combined upper bound is now in the mid-`4.5 s` range, and the stage breakdown shows `mlp_ms=2872.509` as the largest remaining stage-level bucket
 14. The one-process chunked runner shows a warm in-process combined upper bound of `2819.341 ms` with `pack_cache_hits=57` and `gpu_cache_hits=57`, which is about `0.355 tok/s` for one-token decode and confirms that cache reuse now matters a lot
 15. A new packed cache prewarm API now makes the direct packed benchmark much more practical, raising the cold iteration to `0.409 tok/s` and the warm second pass to `0.537 tok/s` with `JENGINE_PREWARM_PACKED=1 JENGINE_PACKED_MLP_FULL=1`
-16. The direct `bench_packed_toks` path now reaches `0.508 tok/s` on the warm second pass with only `JENGINE_PACKED_MLP_FULL=1`, which is a stronger direct benchmark signal even though it is still below the `1 tok/s` target
-17. The new MLP sub-breakdown shows `mlp_down_ms=1913.680`, which means `down_proj` handling is the dominant subcomponent inside the MLP tail even though naive full offload regresses in cold capture
+16. A prewarmed direct attribution sample still shows `non_offloaded_dense_ms=1936.774`, and in that warm full-MLP regime the `attention_ms=1522.674` bucket is now the single biggest direct benchmark stage
+17. The new MLP sub-breakdown shows `mlp_down_ms=1913.680`, which means `down_proj` handling is the dominant subcomponent inside the cold chunked MLP tail even though naive full offload regresses in cold capture
 18. A direct real-tensor microbenchmark still shows `down_proj` packed GPU kernel time at only `0.869 ms` versus `123.933 ms` dense CPU and `133.083 ms` packed CPU, which means the problem is structural integration overhead rather than raw GPU math throughput
-19. Warm in-process full-MLP offload (`JENGINE_PACKED_MLP_FULL=1`) reaches about `0.908 tok/s` in the chunked runner and about `0.537 tok/s` on the direct warm second-pass benchmark with prewarm, so the next MLP-side goal is to make that warm-path advantage practical without paying the current cold-start penalties
-20. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the MLP tail with a more structural redesign around `down_proj` and its warm-cache behavior while still reducing remaining dense-side work and synchronization overhead
+19. Warm in-process full-MLP offload (`JENGINE_PACKED_MLP_FULL=1`) reaches about `0.908 tok/s` in the chunked runner and about `0.537 tok/s` on the direct warm second-pass benchmark with prewarm, so the next goal is to turn that warm-path behavior into a direct end-to-end result closer to `1 tok/s`
+20. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the direct attention path while still preserving the MLP-tail gains
 
 ## Best next step
 

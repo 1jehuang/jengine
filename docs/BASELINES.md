@@ -599,6 +599,39 @@ Current interpretation:
 - but even with prewarm, the direct path is still behind the best warm chunked upper-bound numbers
 - that confirms there is still broader decode-path overhead left to remove beyond simple cache fill
 
+### Direct prewarmed packed attribution sample
+
+Command shape:
+
+```bash
+JENGINE_NO_HEARTBEAT=1 JENGINE_PREWARM_PACKED=1 JENGINE_PACKED_MLP_FULL=1 ./target/release/bench_packed_decode_attribution \
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model hello 1 combined 137 1
+```
+
+Observed sample:
+
+- total: `2299.752 ms`
+- embed: `88.381 ms`
+- norm: `324.656 ms`
+- qkv: `76.868 ms`
+- attention: `1522.674 ms`
+- mlp: `213.085 ms`
+  - `mlp_down`: `75.525 ms`
+- logits: `71.591 ms`
+- compile: `0.000 ms`
+- weight upload: `0.000 ms`
+- gpu: `279.446 ms`
+- download: `76.452 ms`
+- non-offloaded dense: `1936.774 ms`
+- orchestration: `6.962 ms`
+- dispatches: `170`
+
+Current interpretation:
+
+- once compile, weight upload, and most orchestration are removed, the direct path is still dominated by non-offloaded dense work
+- in that warm full-MLP regime, the **attention stage** is now the largest direct benchmark bucket
+- that means the next direct end-to-end improvement likely needs a better attention-side structural redesign, while keeping the MLP-side warm-path gains intact
+
 ### Chunked MLP-only packed upper bound
 
 Using the same helper on the `mlp` variant now produces:
