@@ -1,4 +1,5 @@
 use jengine::gpu::packed_matvec::{
+    CachedGpuPackedMatvecRunner, SharedGpuPackedContext,
     run_packed_ternary_matvec_raw_f32_with_output, run_packed_ternary_matvec_with_output,
 };
 use jengine::runtime::repack::pack_ternary_g128;
@@ -67,9 +68,43 @@ fn main() {
     )
     .expect("packed raw-f32 GPU run should succeed");
 
+    let dense_chained = store
+        .matvec_f16(&tensor_name, &dense)
+        .expect("dense chained matvec should work");
+    let shared_context = SharedGpuPackedContext::new().expect("shared context should initialize");
+    let (mut source_runner, _) = CachedGpuPackedMatvecRunner::new_with_context(
+        shared_context.clone(),
+        &code_words,
+        &packed.scales,
+        packed.group_size,
+        rows,
+        cols,
+    )
+    .expect("source runner should initialize");
+    let (mut chained_runner, _) = CachedGpuPackedMatvecRunner::new_uninitialized_raw_f32_input_with_context(
+        shared_context,
+        code_words.len(),
+        packed.scales.len(),
+        packed.group_size,
+        rows,
+        cols,
+    )
+    .expect("chained runner should initialize");
+    chained_runner
+        .update_weights(&code_words, &packed.scales)
+        .expect("chained runner weights should upload");
+    let (_source_out, source_report) = source_runner
+        .run_with_output(&input, Some(&dense))
+        .expect("source runner should execute");
+    let (_chained_out, chained_report) = chained_runner
+        .run_with_output_from_runner(&source_runner, Some(&dense_chained))
+        .expect("chained runner should execute from resident output");
+
     println!(
-        "half_pair={{ {} }} raw_f32={{ {} }}",
+        "half_pair={{ {} }} raw_f32={{ {} }} source_half_pair={{ {} }} chained_raw_f32={{ {} }}",
         half_report.summarize(),
-        raw_report.summarize()
+        raw_report.summarize(),
+        source_report.summarize(),
+        chained_report.summarize()
     );
 }
