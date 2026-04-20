@@ -443,6 +443,57 @@ impl CachedGpuPackedMatvecRunner {
         input: &[f32],
         reference: Option<&[f32]>,
     ) -> Result<(Vec<f32>, GpuPackedMatvecReport), GpuPackedMatvecError> {
+        let (upload_duration, gpu_duration) = self.run_without_download(input)?;
+        let download_started = Instant::now();
+        let gpu_output = read_f32_buffer(&self.output_buffer, self.rows)?;
+        let download_duration = download_started.elapsed();
+        let (max_abs_diff, mean_abs_diff) = match reference {
+            Some(reference) => compare_outputs(reference, &gpu_output),
+            None => (0.0, 0.0),
+        };
+
+        Ok((
+            gpu_output,
+            GpuPackedMatvecReport {
+                rows: self.rows,
+                cols: self.cols,
+                compile_duration: Duration::ZERO,
+                upload_duration,
+                gpu_duration,
+                download_duration,
+                max_abs_diff,
+                mean_abs_diff,
+            },
+        ))
+    }
+
+    pub fn run_with_argmax(
+        &mut self,
+        input: &[f32],
+    ) -> Result<(usize, GpuPackedMatvecReport), GpuPackedMatvecError> {
+        let (upload_duration, gpu_duration) = self.run_without_download(input)?;
+        let download_started = Instant::now();
+        let argmax_index = argmax_f32_buffer(&self.output_buffer, self.rows)?;
+        let download_duration = download_started.elapsed();
+        Ok((
+            argmax_index,
+            GpuPackedMatvecReport {
+                rows: self.rows,
+                cols: self.cols,
+                compile_duration: Duration::ZERO,
+                upload_duration,
+                gpu_duration,
+                download_duration,
+                max_abs_diff: 0.0,
+                mean_abs_diff: 0.0,
+            },
+        ))
+    }
+
+    fn run_without_download(
+        &mut self,
+        input: &[f32],
+    ) -> Result<(Duration, Duration), GpuPackedMatvecError> {
         if input.len() != self.cols {
             return Err(GpuPackedMatvecError::Shape(format!(
                 "input length {} does not match cols {}",
@@ -476,28 +527,7 @@ impl CachedGpuPackedMatvecRunner {
             self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
         }
         let gpu_duration = gpu_started.elapsed();
-
-        let download_started = Instant::now();
-        let gpu_output = read_f32_buffer(&self.output_buffer, self.rows)?;
-        let download_duration = download_started.elapsed();
-        let (max_abs_diff, mean_abs_diff) = match reference {
-            Some(reference) => compare_outputs(reference, &gpu_output),
-            None => (0.0, 0.0),
-        };
-
-        Ok((
-            gpu_output,
-            GpuPackedMatvecReport {
-                rows: self.rows,
-                cols: self.cols,
-                compile_duration: Duration::ZERO,
-                upload_duration,
-                gpu_duration,
-                download_duration,
-                max_abs_diff,
-                mean_abs_diff,
-            },
-        ))
+        Ok((upload_duration, gpu_duration))
     }
 
     fn record_command_buffer(&self) -> Result<(), GpuPackedMatvecError> {
@@ -767,6 +797,31 @@ fn read_f32_buffer(
         std::ptr::copy_nonoverlapping(buffer.mapped_ptr as *const f32, out.as_mut_ptr(), len);
     }
     Ok(out)
+}
+
+fn argmax_f32_buffer(buffer: &BufferAllocation, len: usize) -> Result<usize, GpuPackedMatvecError> {
+    let byte_len = len * std::mem::size_of::<f32>();
+    if byte_len as u64 > buffer.size {
+        return Err(GpuPackedMatvecError::Shape(format!(
+            "read {} bytes exceeds mapped buffer size {}",
+            byte_len, buffer.size
+        )));
+    }
+    if len == 0 {
+        return Err(GpuPackedMatvecError::Shape(
+            "argmax requires at least one output element".to_string(),
+        ));
+    }
+    let values = unsafe { std::slice::from_raw_parts(buffer.mapped_ptr as *const f32, len) };
+    let mut best_index = 0usize;
+    let mut best_value = values[0];
+    for (index, value) in values.iter().enumerate().skip(1) {
+        if *value > best_value {
+            best_value = *value;
+            best_index = index;
+        }
+    }
+    Ok(best_index)
 }
 
 fn destroy_buffer(device: &Device, buffer: BufferAllocation) {

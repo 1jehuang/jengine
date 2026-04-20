@@ -2019,10 +2019,10 @@ impl ReferenceModel {
         let mut upload = upload_duration;
         let mut gpu = Duration::ZERO;
         let mut download = Duration::ZERO;
-        let mut last_logits = Vec::new();
+        let mut last_next_token = None;
 
         for (position, &token_id) in prompt_ids.iter().enumerate() {
-            let (logits, u, g, d) = self.forward_step_hybrid_qkv_gu(
+            let (next_token, u, g, d) = self.forward_step_hybrid_qkv_gu(
                 token_id,
                 position,
                 &mut cache,
@@ -2037,19 +2037,19 @@ impl ReferenceModel {
                 down_gpu.as_ref(),
                 logits_gpu.as_ref(),
             )?;
-            last_logits = logits;
+            last_next_token = Some(next_token);
             upload += u;
             gpu += g;
             download += d;
         }
         let mut output_ids = prompt_ids.to_vec();
         for generation_index in 0..max_new_tokens {
-            let next_token = argmax(&last_logits).ok_or_else(|| {
+            let next_token = last_next_token.ok_or_else(|| {
                 ReferenceError::Decode("argmax failed on empty logits".to_string())
             })?;
             output_ids.push(next_token);
             metrics.generated_tokens += 1;
-            let (logits, u, g, d) = self.forward_step_hybrid_qkv_gu(
+            let (predicted_next_token, u, g, d) = self.forward_step_hybrid_qkv_gu(
                 next_token,
                 prompt_ids.len() + generation_index,
                 &mut cache,
@@ -2064,7 +2064,7 @@ impl ReferenceModel {
                 down_gpu.as_ref(),
                 logits_gpu.as_ref(),
             )?;
-            last_logits = logits;
+            last_next_token = Some(predicted_next_token);
             upload += u;
             gpu += g;
             download += d;
@@ -3137,7 +3137,7 @@ impl ReferenceModel {
         up_gpu: &Rc<RefCell<CachedGpuPackedMatvecRunner>>,
         down_gpu: Option<&Rc<RefCell<CachedGpuPackedMatvecRunner>>>,
         logits_gpu: Option<&Rc<RefCell<CachedGpuPackedMatvecRunner>>>,
-    ) -> Result<(Vec<f32>, Duration, Duration, Duration), ReferenceError> {
+    ) -> Result<(usize, Duration, Duration, Duration), ReferenceError> {
         let started_at = Instant::now();
         let mut hidden = self
             .weights
@@ -3365,21 +3365,25 @@ impl ReferenceModel {
         metrics.norm_duration += started_at.elapsed();
 
         let started_at = Instant::now();
-        let logits = if let Some(logits_gpu) = logits_gpu {
-            let (out, report) = logits_gpu
+        let next_token = if let Some(logits_gpu) = logits_gpu {
+            let (argmax_index, report) = logits_gpu
                 .borrow_mut()
-                .run_with_output(&hidden, None)
+                .run_with_argmax(&hidden)
                 .map_err(|error| ReferenceError::Decode(format!("gpu logits failed: {error}")))?;
             upload += report.upload_duration;
             gpu += report.gpu_duration;
             download += report.download_duration;
-            out
+            argmax_index
         } else {
-            self.weights
-                .matvec_f16("model.embed_tokens.weight", &hidden)?
+            let logits = self
+                .weights
+                .matvec_f16("model.embed_tokens.weight", &hidden)?;
+            argmax(&logits).ok_or_else(|| {
+                ReferenceError::Decode("argmax failed on empty logits".to_string())
+            })?
         };
         metrics.logits_duration += started_at.elapsed();
-        Ok((logits, upload, gpu, download))
+        Ok((next_token, upload, gpu, download))
     }
 }
 

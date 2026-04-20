@@ -362,24 +362,24 @@ JENGINE_NO_HEARTBEAT=1 ./target/release/bench_hybrid_qkv_gu \
   /home/jeremy/models/bonsai-1.7b hello 1 <layer> <variant>
 ```
 
-Observed three-sample medians:
+Observed three-sample medians after switching the logits path to direct mapped-buffer argmax:
 
 - layer `0`
-  - `qkv+gu`: `1378.146 ms`
-  - `qkv+gu+logits`: `1388.570 ms`
+  - `qkv+gu`: `1397.266 ms`
+  - `qkv+gu+logits`: `1377.805 ms`
 - layer `14`
-  - `qkv+gu`: `1451.116 ms`
-  - `qkv+gu+logits`: `1623.055 ms`
+  - `qkv+gu`: `1447.585 ms`
+  - `qkv+gu+logits`: `1372.383 ms`
 - layer `27`
-  - `qkv+gu`: `1466.605 ms`
-  - `qkv+gu+logits`: `1344.904 ms`
+  - `qkv+gu`: `1459.991 ms`
+  - `qkv+gu+logits`: `1387.104 ms`
 
 Current interpretation:
 
-- logits offload is mixed rather than universally better
-- it regresses the middle sampled layer and is roughly neutral-to-slightly-worse on the early sampled layer
-- but it produces a real win on the late sampled layer, unlike the `o_proj` and `down_proj` experiments
-- that makes logits worth deeper follow-up, especially if output-side transfer and synchronization overhead can be reduced
+- once the full logits-vector download was removed, `qkv+gu+logits` became faster in median terms on all three sampled layers
+- this is the first remaining dense-hotspot experiment that produced a consistent sampled win after the earlier `o_proj` and `down_proj` misses
+- the result points directly at output-side handling and download avoidance as the strongest next dense-side lead
+- the next follow-up should determine whether this win survives in a fuller packed-first decode path and not just this one-layer hybrid slice
 
 ## Packed layer sweep baselines
 
