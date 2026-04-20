@@ -383,15 +383,26 @@ Observed samples:
   - upload bytes: `198410240`
   - download bytes: `1376256`
 - packed combined `qkv + gu` step:
-  - total: `10359.618 ms`
-  - compile: `72.471 ms`
-  - upload: `58.044 ms`
-  - gpu: `282.698 ms`
-  - download: `18.571 ms`
-  - gpu cache hits: `137`
-  - dispatches: `140`
-  - upload bytes: `264814592`
-  - download bytes: `1835008`
+  - earlier sample:
+    - total: `10359.618 ms`
+    - compile: `72.471 ms`
+    - upload: `58.044 ms`
+    - gpu: `282.698 ms`
+    - download: `18.571 ms`
+    - gpu cache hits: `137`
+    - dispatches: `140`
+    - upload bytes: `264814592`
+    - download bytes: `1835008`
+  - post-pairing sample:
+    - total: `10938.667 ms`
+    - compile: `30.393 ms`
+    - upload: `46.625 ms`
+    - gpu: `320.308 ms`
+    - download: `24.915 ms`
+    - gpu cache hits: `82`
+    - dispatches: `84`
+    - upload bytes: `264585216`
+    - download bytes: `1835008`
 
 Current interpretation:
 
@@ -430,19 +441,28 @@ Observed samples:
   - gpu cache hits: `55`
   - dispatches: `56`
 - packed combined `qkv + gu` full-span prefill:
-  - total: `10258.111 ms`
-  - compile: `84.826 ms`
-  - upload: `57.067 ms`
-  - gpu: `283.962 ms`
-  - download: `16.414 ms`
-  - gpu cache hits: `137`
-  - dispatches: `140`
+  - earlier sample:
+    - total: `10258.111 ms`
+    - compile: `84.826 ms`
+    - upload: `57.067 ms`
+    - gpu: `283.962 ms`
+    - download: `16.414 ms`
+    - gpu cache hits: `137`
+    - dispatches: `140`
+  - post-pairing sample:
+    - total: `9900.304 ms`
+    - compile: `50.981 ms`
+    - upload: `43.633 ms`
+    - gpu: `322.363 ms`
+    - download: `18.288 ms`
+    - gpu cache hits: `82`
+    - dispatches: `84`
 
 Current interpretation:
 
 - chunk-level prefill results closely track the step-id benchmark and confirm the same ranking: combined is best among the packed variants tested here
 - compile time is no longer the dominant cost in the chunk benchmark once runner shapes are reused within a single run
-- the remaining gap is overwhelmingly outside raw GPU kernel time, so future optimization should target batching, fewer dispatches, and less host-side work
+- paired dispatching cuts the combined path from `140` to `84` dispatches and improves the full-span prefill sample, but total wall time is still dominated by non-kernel overhead
 
 ## Packed model artifact baselines
 
@@ -505,7 +525,7 @@ Recent important improvement: memory-mapped weight loading reduced real-model st
 
 Recent important caution: the first broader `qkv + gu` hybrid decode benchmark is slightly slower than dense, so the next optimization pass should focus on reducing aggregate multi-projection overhead before adding more decode-path complexity.
 
-Recent important packed-runtime result: new all-layer sweep, token-id step, and full-span prefill benchmarks now capture cleanly with packed artifacts and show that compile cost can be reduced within a single run, but total packed wall time is still dominated by host-side orchestration rather than raw GPU execution.
+Recent important packed-runtime result: paired packed projection dispatches now reduce the combined path from `140` to `84` dispatches on the one-token step and full-span prefill benchmarks, with the full-span prefill sample improving from `10258.111 ms` to `9900.304 ms`.
 
 Recent important artifact result: the real Bonsai packed artifact flow now achieves about **7.11x size reduction** against source safetensors while keeping aggregate validation error very low (`max_abs_diff` about `0.000977`).
 

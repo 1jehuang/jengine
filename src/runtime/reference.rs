@@ -498,6 +498,81 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.download_bytes += rows * std::mem::size_of::<f32>();
         Ok(output)
     }
+
+    fn run_projection_pair(
+        &mut self,
+        first_name: &str,
+        first_rows: usize,
+        second_name: &str,
+        second_rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>), ReferenceError> {
+        let pair_key = format!("concat::{first_name}||{second_name}");
+        let (packed, pack_duration, pack_cache_hit) =
+            self.model.get_or_create_projection_pair_cache(
+                &pair_key,
+                first_name,
+                first_rows,
+                second_name,
+                second_rows,
+                cols,
+            )?;
+        let shape_key = (
+            packed.rows,
+            packed.cols,
+            packed.group_size,
+            packed.code_words.len(),
+            packed.scales.len(),
+        );
+        let (runner, compile_duration, gpu_cache_hit) = match self.shape_runners.entry(shape_key) {
+            Entry::Occupied(entry) => (entry.into_mut(), Duration::ZERO, true),
+            Entry::Vacant(entry) => {
+                let (runner, duration) = CachedGpuPackedMatvecRunner::new_uninitialized(
+                    packed.code_words.len(),
+                    packed.scales.len(),
+                    packed.group_size,
+                    packed.rows,
+                    packed.cols,
+                )
+                .map_err(|error| {
+                    ReferenceError::Decode(format!(
+                        "gpu session init failed for {first_name}+{second_name}: {error}"
+                    ))
+                })?;
+                (entry.insert(runner), duration, false)
+            }
+        };
+        self.metrics.pack_duration += pack_duration;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+
+        let weight_upload = runner
+            .update_weights(&packed.code_words, &packed.scales)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu weight upload failed for {first_name}+{second_name}: {error}"
+                ))
+            })?;
+
+        let (combined, report) = runner.run_with_output(input, None).map_err(|error| {
+            ReferenceError::Decode(format!(
+                "gpu projection failed for {first_name}+{second_name}: {error}"
+            ))
+        })?;
+        self.metrics.upload_duration += weight_upload + report.upload_duration;
+        self.metrics.gpu_duration += report.gpu_duration;
+        self.metrics.download_duration += report.download_duration;
+        self.metrics.dispatch_count += 1;
+        self.metrics.upload_bytes += packed.code_words.len() * std::mem::size_of::<u32>()
+            + packed.scales.len() * std::mem::size_of::<f32>()
+            + cols.div_ceil(2) * std::mem::size_of::<u32>();
+        self.metrics.download_bytes += (first_rows + second_rows) * std::mem::size_of::<f32>();
+
+        let (first, second) = combined.split_at(first_rows);
+        Ok((first.to_vec(), second.to_vec()))
+    }
 }
 
 pub struct ReferenceModel {
@@ -1129,6 +1204,60 @@ impl ReferenceModel {
         Ok((packed, duration, false))
     }
 
+    fn get_or_create_projection_pair_cache(
+        &self,
+        cache_key: &str,
+        first_name: &str,
+        first_rows: usize,
+        second_name: &str,
+        second_rows: usize,
+        cols: usize,
+    ) -> Result<(Rc<PackedProjectionCache>, Duration, bool), ReferenceError> {
+        if let Some(cached) = self
+            .cached_projection_packed
+            .borrow()
+            .get(cache_key)
+            .cloned()
+        {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let (first, first_duration, _) =
+            self.get_or_create_projection_cache(first_name, first_rows, cols)?;
+        let (second, second_duration, _) =
+            self.get_or_create_projection_cache(second_name, second_rows, cols)?;
+        if first.cols != second.cols {
+            return Err(ReferenceError::Decode(format!(
+                "cannot concatenate packed projections with different column counts: {first_name}={} vs {second_name}={}",
+                first.cols, second.cols
+            )));
+        }
+        if first.group_size != second.group_size {
+            return Err(ReferenceError::Decode(format!(
+                "cannot concatenate packed projections with different group sizes: {first_name}={} vs {second_name}={}",
+                first.group_size, second.group_size
+            )));
+        }
+
+        let mut code_words = Vec::with_capacity(first.code_words.len() + second.code_words.len());
+        code_words.extend_from_slice(&first.code_words);
+        code_words.extend_from_slice(&second.code_words);
+        let mut scales = Vec::with_capacity(first.scales.len() + second.scales.len());
+        scales.extend_from_slice(&first.scales);
+        scales.extend_from_slice(&second.scales);
+
+        let packed = Rc::new(PackedProjectionCache {
+            rows: first.rows + second.rows,
+            cols: first.cols,
+            group_size: first.group_size,
+            code_words,
+            scales,
+        });
+        self.cached_projection_packed
+            .borrow_mut()
+            .insert(cache_key.to_string(), packed.clone());
+        Ok((packed, first_duration + second_duration, false))
+    }
+
     fn get_or_create_projection_gpu(
         &self,
         tensor_name: &str,
@@ -1739,44 +1868,38 @@ impl ReferenceModel {
             metrics.norm_duration += started_at.elapsed();
 
             let started_at = Instant::now();
-            let mut q = if use_attention_qkv {
-                session.run_projection(
+            let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
+            let (mut q, mut k, v) = if use_attention_qkv {
+                let q = session.run_projection(
                     &format!("{prefix}.self_attn.q_proj.weight"),
                     self.config.hidden_size,
                     self.config.hidden_size,
                     &hidden_states,
-                )?
-            } else {
-                self.matvec_f16_resolved(
-                    &format!("{prefix}.self_attn.q_proj.weight"),
-                    &hidden_states,
-                )?
-            };
-            let mut k = if use_attention_qkv {
-                session.run_projection(
+                )?;
+                let (k, v) = session.run_projection_pair(
                     &format!("{prefix}.self_attn.k_proj.weight"),
-                    self.config.num_key_value_heads * self.config.head_dim,
+                    kv_rows,
+                    &format!("{prefix}.self_attn.v_proj.weight"),
+                    kv_rows,
                     self.config.hidden_size,
                     &hidden_states,
-                )?
+                )?;
+                (q, k, v)
             } else {
-                self.matvec_f16_resolved(
-                    &format!("{prefix}.self_attn.k_proj.weight"),
-                    &hidden_states,
-                )?
-            };
-            let v = if use_attention_qkv {
-                session.run_projection(
-                    &format!("{prefix}.self_attn.v_proj.weight"),
-                    self.config.num_key_value_heads * self.config.head_dim,
-                    self.config.hidden_size,
-                    &hidden_states,
-                )?
-            } else {
-                self.matvec_f16_resolved(
-                    &format!("{prefix}.self_attn.v_proj.weight"),
-                    &hidden_states,
-                )?
+                (
+                    self.matvec_f16_resolved(
+                        &format!("{prefix}.self_attn.q_proj.weight"),
+                        &hidden_states,
+                    )?,
+                    self.matvec_f16_resolved(
+                        &format!("{prefix}.self_attn.k_proj.weight"),
+                        &hidden_states,
+                    )?,
+                    self.matvec_f16_resolved(
+                        &format!("{prefix}.self_attn.v_proj.weight"),
+                        &hidden_states,
+                    )?,
+                )
             };
             metrics.qkv_duration += started_at.elapsed();
 
@@ -1838,25 +1961,26 @@ impl ReferenceModel {
             metrics.norm_duration += started_at.elapsed();
 
             let started_at = Instant::now();
-            let gate = if use_mlp_gu {
-                session.run_projection(
+            let (gate, up) = if use_mlp_gu {
+                session.run_projection_pair(
                     &format!("{prefix}.mlp.gate_proj.weight"),
                     self.config.intermediate_size,
-                    self.config.hidden_size,
-                    &hidden_states,
-                )?
-            } else {
-                self.matvec_f16_resolved(&format!("{prefix}.mlp.gate_proj.weight"), &hidden_states)?
-            };
-            let up = if use_mlp_gu {
-                session.run_projection(
                     &format!("{prefix}.mlp.up_proj.weight"),
                     self.config.intermediate_size,
                     self.config.hidden_size,
                     &hidden_states,
                 )?
             } else {
-                self.matvec_f16_resolved(&format!("{prefix}.mlp.up_proj.weight"), &hidden_states)?
+                (
+                    self.matvec_f16_resolved(
+                        &format!("{prefix}.mlp.gate_proj.weight"),
+                        &hidden_states,
+                    )?,
+                    self.matvec_f16_resolved(
+                        &format!("{prefix}.mlp.up_proj.weight"),
+                        &hidden_states,
+                    )?,
+                )
             };
             let mlp = swiglu(&gate, &up);
             let down = self.matvec_f16_resolved(&format!("{prefix}.mlp.down_proj.weight"), &mlp)?;
@@ -2517,44 +2641,38 @@ impl ReferenceModel {
             metrics.norm_duration += started_at.elapsed();
 
             let started_at = Instant::now();
-            let mut q = if use_attention_qkv {
-                session.run_projection(
+            let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
+            let (mut q, mut k, v) = if use_attention_qkv {
+                let q = session.run_projection(
                     &format!("{prefix}.self_attn.q_proj.weight"),
                     self.config.hidden_size,
                     self.config.hidden_size,
                     &hidden_states,
-                )?
-            } else {
-                self.matvec_f16_resolved(
-                    &format!("{prefix}.self_attn.q_proj.weight"),
-                    &hidden_states,
-                )?
-            };
-            let mut k = if use_attention_qkv {
-                session.run_projection(
+                )?;
+                let (k, v) = session.run_projection_pair(
                     &format!("{prefix}.self_attn.k_proj.weight"),
-                    self.config.num_key_value_heads * self.config.head_dim,
+                    kv_rows,
+                    &format!("{prefix}.self_attn.v_proj.weight"),
+                    kv_rows,
                     self.config.hidden_size,
                     &hidden_states,
-                )?
+                )?;
+                (q, k, v)
             } else {
-                self.matvec_f16_resolved(
-                    &format!("{prefix}.self_attn.k_proj.weight"),
-                    &hidden_states,
-                )?
-            };
-            let v = if use_attention_qkv {
-                session.run_projection(
-                    &format!("{prefix}.self_attn.v_proj.weight"),
-                    self.config.num_key_value_heads * self.config.head_dim,
-                    self.config.hidden_size,
-                    &hidden_states,
-                )?
-            } else {
-                self.matvec_f16_resolved(
-                    &format!("{prefix}.self_attn.v_proj.weight"),
-                    &hidden_states,
-                )?
+                (
+                    self.matvec_f16_resolved(
+                        &format!("{prefix}.self_attn.q_proj.weight"),
+                        &hidden_states,
+                    )?,
+                    self.matvec_f16_resolved(
+                        &format!("{prefix}.self_attn.k_proj.weight"),
+                        &hidden_states,
+                    )?,
+                    self.matvec_f16_resolved(
+                        &format!("{prefix}.self_attn.v_proj.weight"),
+                        &hidden_states,
+                    )?,
+                )
             };
             metrics.qkv_duration += started_at.elapsed();
 
@@ -2618,25 +2736,26 @@ impl ReferenceModel {
             metrics.norm_duration += started_at.elapsed();
 
             let started_at = Instant::now();
-            let gate = if use_mlp_gu {
-                session.run_projection(
+            let (gate, up) = if use_mlp_gu {
+                session.run_projection_pair(
                     &format!("{prefix}.mlp.gate_proj.weight"),
                     self.config.intermediate_size,
-                    self.config.hidden_size,
-                    &hidden_states,
-                )?
-            } else {
-                self.matvec_f16_resolved(&format!("{prefix}.mlp.gate_proj.weight"), &hidden_states)?
-            };
-            let up = if use_mlp_gu {
-                session.run_projection(
                     &format!("{prefix}.mlp.up_proj.weight"),
                     self.config.intermediate_size,
                     self.config.hidden_size,
                     &hidden_states,
                 )?
             } else {
-                self.matvec_f16_resolved(&format!("{prefix}.mlp.up_proj.weight"), &hidden_states)?
+                (
+                    self.matvec_f16_resolved(
+                        &format!("{prefix}.mlp.gate_proj.weight"),
+                        &hidden_states,
+                    )?,
+                    self.matvec_f16_resolved(
+                        &format!("{prefix}.mlp.up_proj.weight"),
+                        &hidden_states,
+                    )?,
+                )
             };
             let mlp = swiglu(&gate, &up);
             let down = self.matvec_f16_resolved(&format!("{prefix}.mlp.down_proj.weight"), &mlp)?;
@@ -3256,6 +3375,33 @@ mod tests {
         assert_eq!(attention.max_abs_diff, 0.0);
         assert_eq!(mlp.max_abs_diff, 0.0);
         assert_eq!(combined.max_abs_diff, 0.0);
+    }
+
+    #[test]
+    fn reduces_packed_dispatch_count_with_projection_pairing_on_synthetic_model() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let packed =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed model should load");
+        let layers = packed.config.num_hidden_layers;
+
+        let (_, attention) = packed
+            .benchmark_packed_prefill_chunk(Some(2), None, 0, layers, true, false, false)
+            .expect("attention prefill chunk should succeed");
+        let (_, mlp) = packed
+            .benchmark_packed_prefill_chunk(Some(2), None, 0, layers, false, true, false)
+            .expect("mlp prefill chunk should succeed");
+        let (_, combined) = packed
+            .benchmark_packed_prefill_chunk(Some(2), None, 0, layers, true, true, false)
+            .expect("combined prefill chunk should succeed");
+
+        assert_eq!(attention.dispatch_count, layers * 2);
+        assert_eq!(mlp.dispatch_count, layers);
+        assert_eq!(combined.dispatch_count, layers * 3);
     }
 
     use std::time::Duration;

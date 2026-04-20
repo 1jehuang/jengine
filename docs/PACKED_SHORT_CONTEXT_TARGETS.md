@@ -6,18 +6,45 @@ These are the near-term practical targets for packed decode on this machine, usi
 
 ## Current situation
 
-The packed runtime architecture is now in place, but stable end-to-end benchmark harvesting is still difficult in this harness for the longer packed decode runs.
+The packed runtime architecture is now in place, and the benchmark harnesses can now capture `mlp` and `combined` short-context runs reliably after adding staged progress output.
 
-So the immediate target should be modest and concrete.
+A paired-dispatch optimization also reduced the combined packed decode path from `140` GPU dispatches per one-token step or prefill span down to `84`.
+
+The `attention`-only short-context run is still slow enough that this harness may terminate it before the final summary prints, so its tok/s number is not yet stable here.
+
+## Latest measured short-context samples
+
+Command shape:
+
+```bash
+./target/release/bench_packed_toks \
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model hello 1 1 <variant>
+```
+
+Observed samples:
+
+- `mlp`
+  - total: `14441.214 ms`
+  - throughput: `0.069 tok/s`
+  - dispatches: `56`
+- `combined`
+  - total: `11873.378 ms`
+  - throughput: `0.084 tok/s`
+  - dispatches: `168`
+- `attention`
+  - run still terminates in this harness before the final summary is emitted
+  - staged progress confirms the decode work is running, but the result is not yet stable enough to record as a baseline here
+
+So the immediate target should remain modest and concrete.
 
 ## Near-term target
 
 ### Functional target
 
 - the packed short-context benchmark harness must run successfully for:
-  - `attention`
   - `mlp`
   - `combined`
+- the `attention`-only variant still needs a more stable capture path in this harness
 
 ### Performance target
 
@@ -29,15 +56,15 @@ This is a deliberately conservative near-term target. It is not the final ceilin
 
 ## Why this target
 
-- it should clearly beat the current worst-case prototype behavior
-- it is still below the long-term practical target range discussed earlier
-- it is realistic enough to use as a first milestone for the packed runtime phase
+- the current measured `combined` short-context run is only about `0.084 tok/s`, so there is still a large gap to close
+- a conservative `1.0 tok/s` target still represents a clear and meaningful packed-runtime win on this hardware
+- the paired-dispatch reduction already removed a chunk of obvious overhead, so the next improvements should come from further orchestration and batching work rather than just adding more projections
 
 ## Next target after first clean win
 
-Once the first clean packed short-context run is captured and reproducible, update this document with:
+After the first reproducible short-context win at or above `1.0 tok/s`, update this document with:
 
-- measured `attention` tok/s
-- measured `mlp` tok/s
-- measured `combined` tok/s
+- a stable measured `attention` tok/s capture
+- refreshed `mlp` tok/s
+- refreshed `combined` tok/s
 - the next target, likely in the multi-token-per-second range above `1.0 tok/s`

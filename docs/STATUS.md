@@ -49,8 +49,10 @@ From the latest real packed-artifact release runs:
 - all-layer attention `qkv` sweep: `2038.344 ms`
 - all-layer MLP `gu` sweep: `1827.961 ms`
 - all-layer combined `qkv + gu` sweep: `3866.305 ms`
-- one-token packed combined step: `10359.618 ms`
-- one-token packed combined full-span prefill: `10258.111 ms`
+- one-token packed combined step, post-pairing: `10938.667 ms` with `84` dispatches
+- one-token packed combined full-span prefill, post-pairing: `9900.304 ms` with `84` dispatches
+- short-context packed `mlp`: `14441.214 ms`, about `0.069 tok/s`
+- short-context packed `combined`: `11873.378 ms`, about `0.084 tok/s`
 
 ### Cached q_proj warm hybrid vs dense
 From the latest real one-token run:
@@ -66,19 +68,19 @@ From the latest real one-token run:
 
 ## Current bottlenecks
 
-1. Host-side orchestration and per-dispatch overhead dominate the current packed step and prefill paths
+1. Host-side orchestration and per-dispatch overhead still dominate the packed decode path, even after reducing the combined path from `140` to `84` dispatches
 2. MLP is still a major remaining cost center on the dense side
-3. Compile cost is still large for first-pass all-layer sweeps, even though intra-run shape reuse helps
-4. Raw GPU upload, compute, and download time are much smaller than total packed wall time
+3. Compile cost is still large for first-pass all-layer sweeps, though paired dispatches help the combined path more than compile avoidance alone
+4. Raw GPU upload, compute, and download time are still much smaller than total packed wall time
 
 ## Best next step
 
 The most valuable next milestone is:
 
-- reduce dispatch count and host-side launch overhead in the packed decode path
-- batch more work per submission or per layer where correctness allows
+- further batch work in the packed decode path so each dispatch covers more useful projection work
 - reuse compiled pipelines and runner state more aggressively across end-to-end decode steps
-- only after that, re-measure short-context packed tok/s and decide whether to broaden the offload surface further
+- reduce host-side launch overhead enough to move the combined short-context path meaningfully above the current `0.084 tok/s`
+- separately stabilize `attention`-only short-context capture so it can be tracked alongside `mlp` and `combined`
 
 ## Success bar for next milestone
 
@@ -86,4 +88,4 @@ Reach at least:
 
 - **<= 6.0 s** total for a one-token packed combined step on the current packed-artifact path
 - **<= 6.0 s** total for a one-token packed combined full-span prefill benchmark
-- clear reduction in dispatch count and host-side overhead share versus the current `140` dispatch combined path
+- short-context packed `combined` throughput clearly above the current `0.084 tok/s`
