@@ -3482,5 +3482,37 @@ mod tests {
         assert_eq!(combined.dispatch_count, layers * 3);
     }
 
+    #[test]
+    fn reuses_resident_projection_runners_without_repeat_weight_uploads_on_synthetic_model() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let packed =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed model should load");
+        let prompt_ids = [2usize];
+        let expected_dispatches = packed.config.num_hidden_layers * 3;
+
+        let first = packed
+            .benchmark_packed_step_from_token_ids(&prompt_ids, true, true)
+            .expect("first packed step should succeed");
+        let second = packed
+            .benchmark_packed_step_from_token_ids(&prompt_ids, true, true)
+            .expect("second packed step should succeed");
+
+        assert_eq!(first.dispatch_count, expected_dispatches);
+        assert_eq!(second.dispatch_count, expected_dispatches);
+        assert!(first.weight_upload_bytes > 0);
+        assert!(first.weight_upload_duration > Duration::ZERO);
+        assert!(first.compile_duration > Duration::ZERO);
+        assert_eq!(second.weight_upload_bytes, 0);
+        assert_eq!(second.weight_upload_duration, Duration::ZERO);
+        assert_eq!(second.compile_duration, Duration::ZERO);
+        assert_eq!(second.gpu_cache_hits, expected_dispatches);
+        assert_eq!(second.pack_cache_hits, expected_dispatches);
+    }
+
     use std::time::Duration;
 }
