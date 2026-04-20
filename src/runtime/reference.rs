@@ -1831,6 +1831,25 @@ impl ReferenceModel {
         max_new_tokens: usize,
         layer_idx: usize,
     ) -> Result<HybridProjectionDecodeMetrics, ReferenceError> {
+        self.benchmark_cached_hybrid_attention_mlp_decode(prompt, max_new_tokens, layer_idx, false)
+    }
+
+    pub fn benchmark_cached_hybrid_qkvo_gu_decode(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        layer_idx: usize,
+    ) -> Result<HybridProjectionDecodeMetrics, ReferenceError> {
+        self.benchmark_cached_hybrid_attention_mlp_decode(prompt, max_new_tokens, layer_idx, true)
+    }
+
+    fn benchmark_cached_hybrid_attention_mlp_decode(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        layer_idx: usize,
+        use_o_proj: bool,
+    ) -> Result<HybridProjectionDecodeMetrics, ReferenceError> {
         let tokenizer = self
             .tokenizer
             .as_ref()
@@ -1841,6 +1860,7 @@ impl ReferenceModel {
         let q_name = format!("{prefix}.self_attn.q_proj.weight");
         let k_name = format!("{prefix}.self_attn.k_proj.weight");
         let v_name = format!("{prefix}.self_attn.v_proj.weight");
+        let o_name = format!("{prefix}.self_attn.o_proj.weight");
         let gate_name = format!("{prefix}.mlp.gate_proj.weight");
         let up_name = format!("{prefix}.mlp.up_proj.weight");
 
@@ -1874,6 +1894,19 @@ impl ReferenceModel {
         pack_duration += pack;
         compile_duration += compile;
         upload_duration += weight_upload;
+
+        let o_gpu = if use_o_proj {
+            let (o_packed, pack, _) =
+                self.get_or_create_projection_cache(&o_name, hidden_rows, hidden_rows)?;
+            let (o_gpu, compile, weight_upload, _) =
+                self.get_or_create_projection_gpu(&o_name, &o_packed)?;
+            pack_duration += pack;
+            compile_duration += compile;
+            upload_duration += weight_upload;
+            Some(o_gpu)
+        } else {
+            None
+        };
 
         let (gate_packed, pack, _) =
             self.get_or_create_projection_cache(&gate_name, intermediate_rows, hidden_rows)?;
@@ -1919,6 +1952,7 @@ impl ReferenceModel {
                 &q_gpu,
                 &k_gpu,
                 &v_gpu,
+                o_gpu.as_ref(),
                 &gate_gpu,
                 &up_gpu,
             )?;
@@ -1943,6 +1977,7 @@ impl ReferenceModel {
                 &q_gpu,
                 &k_gpu,
                 &v_gpu,
+                o_gpu.as_ref(),
                 &gate_gpu,
                 &up_gpu,
             )?;
@@ -1955,7 +1990,11 @@ impl ReferenceModel {
             tokenizer.decode(&output_ids.iter().map(|id| *id as u32).collect::<Vec<_>>())?;
 
         Ok(HybridProjectionDecodeMetrics {
-            enabled_projections: "qkv+gu".to_string(),
+            enabled_projections: if use_o_proj {
+                "qkvo+gu".to_string()
+            } else {
+                "qkv+gu".to_string()
+            },
             total_duration: total_started.elapsed(),
             pack_duration,
             compile_duration,
@@ -3000,6 +3039,7 @@ impl ReferenceModel {
         q_gpu: &Rc<RefCell<CachedGpuPackedMatvecRunner>>,
         k_gpu: &Rc<RefCell<CachedGpuPackedMatvecRunner>>,
         v_gpu: &Rc<RefCell<CachedGpuPackedMatvecRunner>>,
+        o_gpu: Option<&Rc<RefCell<CachedGpuPackedMatvecRunner>>>,
         gate_gpu: &Rc<RefCell<CachedGpuPackedMatvecRunner>>,
         up_gpu: &Rc<RefCell<CachedGpuPackedMatvecRunner>>,
     ) -> Result<(Vec<f32>, Duration, Duration, Duration), ReferenceError> {
@@ -3122,9 +3162,27 @@ impl ReferenceModel {
                 self.config.num_key_value_heads,
                 self.config.head_dim,
             );
-            let attn_output = self
-                .weights
-                .matvec_f16(&format!("{prefix}.self_attn.o_proj.weight"), &attn)?;
+            let attn_output = if layer_idx == hybrid_layer_idx {
+                if let Some(o_gpu) = o_gpu {
+                    let (out, report) =
+                        o_gpu
+                            .borrow_mut()
+                            .run_with_output(&attn, None)
+                            .map_err(|error| {
+                                ReferenceError::Decode(format!("gpu o_proj failed: {error}"))
+                            })?;
+                    upload += report.upload_duration;
+                    gpu += report.gpu_duration;
+                    download += report.download_duration;
+                    out
+                } else {
+                    self.weights
+                        .matvec_f16(&format!("{prefix}.self_attn.o_proj.weight"), &attn)?
+                }
+            } else {
+                self.weights
+                    .matvec_f16(&format!("{prefix}.self_attn.o_proj.weight"), &attn)?
+            };
             hidden = residual
                 .iter()
                 .zip(attn_output.iter())
