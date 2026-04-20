@@ -214,4 +214,5 @@ Every milestone is expected to keep these green:
 - `docs/PACKED_RUNTIME_ARCHITECTURE.md` - packed-artifact runtime dataflow and ownership model
 - `docs/PACKED_RUNTIME_POLICY.md` - LM head and precision decisions for the packed-first runtime
 - `docs/PACKED_DECODE_BANDWIDTH.md` - first-order packed Vulkan bandwidth estimates
+- `docs/PACKED_SHORT_CONTEXT_TARGETS.md` - near-term packed decode tok/s targets
 - `docs/VULKAN_PLAN.md` - Vulkan backend plan based on measured hotspots
