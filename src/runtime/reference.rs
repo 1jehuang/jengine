@@ -353,6 +353,70 @@ impl HybridProjectionDecodeMetrics {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PackedGpuSessionMetrics {
+    pack_duration: Duration,
+    compile_duration: Duration,
+    upload_duration: Duration,
+    gpu_duration: Duration,
+    download_duration: Duration,
+    pack_cache_hits: usize,
+    gpu_cache_hits: usize,
+    dispatch_count: usize,
+    upload_bytes: usize,
+    download_bytes: usize,
+}
+
+struct PackedGpuSession<'a> {
+    model: &'a ReferenceModel,
+    metrics: PackedGpuSessionMetrics,
+}
+
+impl<'a> PackedGpuSession<'a> {
+    fn new(model: &'a ReferenceModel) -> Self {
+        Self {
+            model,
+            metrics: PackedGpuSessionMetrics::default(),
+        }
+    }
+
+    fn run_projection(
+        &mut self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Result<Vec<f32>, ReferenceError> {
+        let (packed, pack_duration, pack_cache_hit) =
+            self.model
+                .get_or_create_projection_cache(tensor_name, rows, cols)?;
+        let (runner, compile_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu(tensor_name, &packed)?;
+        self.metrics.pack_duration += pack_duration;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+
+        let (output, report) =
+            runner
+                .borrow_mut()
+                .run_with_output(input, None)
+                .map_err(|error| {
+                    ReferenceError::Decode(format!(
+                        "gpu projection failed for {tensor_name}: {error}"
+                    ))
+                })?;
+        self.metrics.upload_duration += report.upload_duration;
+        self.metrics.gpu_duration += report.gpu_duration;
+        self.metrics.download_duration += report.download_duration;
+        self.metrics.dispatch_count += 1;
+        self.metrics.upload_bytes += cols.div_ceil(2) * std::mem::size_of::<u32>();
+        self.metrics.download_bytes += rows * std::mem::size_of::<f32>();
+        Ok(output)
+    }
+}
+
 pub struct ReferenceModel {
     pub assets: BonsaiAssetPaths,
     pub config: BonsaiModelConfig,
@@ -1027,79 +1091,26 @@ impl ReferenceModel {
         let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
         let cols = self.config.hidden_size;
 
-        let mut pack_duration = Duration::ZERO;
-        let mut compile_duration = Duration::ZERO;
-        let mut upload_duration = Duration::ZERO;
-        let mut gpu_duration = Duration::ZERO;
-        let mut download_duration = Duration::ZERO;
+        let mut session = PackedGpuSession::new(self);
 
         let q_name = format!("{prefix}.self_attn.q_proj.weight");
         let k_name = format!("{prefix}.self_attn.k_proj.weight");
         let v_name = format!("{prefix}.self_attn.v_proj.weight");
         let o_name = format!("{prefix}.self_attn.o_proj.weight");
 
-        let q_gpu = if use_q {
-            let (packed, pack, _) = self.get_or_create_projection_cache(&q_name, q_rows, cols)?;
-            let (runner, compile, _) = self.get_or_create_projection_gpu(&q_name, &packed)?;
-            pack_duration += pack;
-            compile_duration += compile;
-            Some(runner)
-        } else {
-            None
-        };
-        let k_gpu = if use_k {
-            let (packed, pack, _) = self.get_or_create_projection_cache(&k_name, kv_rows, cols)?;
-            let (runner, compile, _) = self.get_or_create_projection_gpu(&k_name, &packed)?;
-            pack_duration += pack;
-            compile_duration += compile;
-            Some(runner)
-        } else {
-            None
-        };
-        let v_gpu = if use_v {
-            let (packed, pack, _) = self.get_or_create_projection_cache(&v_name, kv_rows, cols)?;
-            let (runner, compile, _) = self.get_or_create_projection_gpu(&v_name, &packed)?;
-            pack_duration += pack;
-            compile_duration += compile;
-            Some(runner)
-        } else {
-            None
-        };
-
         let total_started = Instant::now();
-        let mut q = if let Some(runner) = &q_gpu {
-            let (out, report) = runner
-                .borrow_mut()
-                .run_with_output(&hidden_states, None)
-                .map_err(|error| ReferenceError::Decode(format!("gpu q_proj failed: {error}")))?;
-            upload_duration += report.upload_duration;
-            gpu_duration += report.gpu_duration;
-            download_duration += report.download_duration;
-            out
+        let mut q = if use_q {
+            session.run_projection(&q_name, q_rows, cols, &hidden_states)?
         } else {
             self.weights.matvec_f16(&q_name, &hidden_states)?
         };
-        let mut k = if let Some(runner) = &k_gpu {
-            let (out, report) = runner
-                .borrow_mut()
-                .run_with_output(&hidden_states, None)
-                .map_err(|error| ReferenceError::Decode(format!("gpu k_proj failed: {error}")))?;
-            upload_duration += report.upload_duration;
-            gpu_duration += report.gpu_duration;
-            download_duration += report.download_duration;
-            out
+        let mut k = if use_k {
+            session.run_projection(&k_name, kv_rows, cols, &hidden_states)?
         } else {
             self.weights.matvec_f16(&k_name, &hidden_states)?
         };
-        let v = if let Some(runner) = &v_gpu {
-            let (out, report) = runner
-                .borrow_mut()
-                .run_with_output(&hidden_states, None)
-                .map_err(|error| ReferenceError::Decode(format!("gpu v_proj failed: {error}")))?;
-            upload_duration += report.upload_duration;
-            gpu_duration += report.gpu_duration;
-            download_duration += report.download_duration;
-            out
+        let v = if use_v {
+            session.run_projection(&v_name, kv_rows, cols, &hidden_states)?
         } else {
             self.weights.matvec_f16(&v_name, &hidden_states)?
         };
@@ -1146,18 +1157,7 @@ impl ReferenceModel {
         );
 
         let mixed_o = if use_o {
-            let (packed, pack, _) = self.get_or_create_projection_cache(&o_name, q_rows, q_rows)?;
-            let (runner, compile, _) = self.get_or_create_projection_gpu(&o_name, &packed)?;
-            pack_duration += pack;
-            compile_duration += compile;
-            let (out, report) = runner
-                .borrow_mut()
-                .run_with_output(&attn, None)
-                .map_err(|error| ReferenceError::Decode(format!("gpu o_proj failed: {error}")))?;
-            upload_duration += report.upload_duration;
-            gpu_duration += report.gpu_duration;
-            download_duration += report.download_duration;
-            out
+            session.run_projection(&o_name, q_rows, q_rows, &attn)?
         } else {
             self.weights.matvec_f16(&o_name, &attn)?
         };
@@ -1218,11 +1218,11 @@ impl ReferenceModel {
         Ok(AttentionProjectionMixMetrics {
             enabled_projections,
             total_duration,
-            pack_duration,
-            compile_duration,
-            upload_duration,
-            gpu_duration,
-            download_duration,
+            pack_duration: session.metrics.pack_duration,
+            compile_duration: session.metrics.compile_duration,
+            upload_duration: session.metrics.upload_duration,
+            gpu_duration: session.metrics.gpu_duration,
+            download_duration: session.metrics.download_duration,
             max_abs_diff,
             mean_abs_diff,
         })
@@ -1314,79 +1314,23 @@ impl ReferenceModel {
         let hidden_rows = self.config.hidden_size;
         let intermediate_rows = self.config.intermediate_size;
 
-        let mut pack_duration = Duration::ZERO;
-        let mut compile_duration = Duration::ZERO;
-        let mut upload_duration = Duration::ZERO;
-        let mut gpu_duration = Duration::ZERO;
-        let mut download_duration = Duration::ZERO;
-
-        let gate_gpu = if use_gate {
-            let (packed, pack, _) =
-                self.get_or_create_projection_cache(&gate_name, intermediate_rows, hidden_rows)?;
-            let (runner, compile, _) = self.get_or_create_projection_gpu(&gate_name, &packed)?;
-            pack_duration += pack;
-            compile_duration += compile;
-            Some(runner)
-        } else {
-            None
-        };
-        let up_gpu = if use_up {
-            let (packed, pack, _) =
-                self.get_or_create_projection_cache(&up_name, intermediate_rows, hidden_rows)?;
-            let (runner, compile, _) = self.get_or_create_projection_gpu(&up_name, &packed)?;
-            pack_duration += pack;
-            compile_duration += compile;
-            Some(runner)
-        } else {
-            None
-        };
+        let mut session = PackedGpuSession::new(self);
 
         let total_started = Instant::now();
-        let gate = if let Some(runner) = &gate_gpu {
-            let (out, report) = runner
-                .borrow_mut()
-                .run_with_output(&hidden_states, None)
-                .map_err(|error| {
-                    ReferenceError::Decode(format!("gpu gate_proj failed: {error}"))
-                })?;
-            upload_duration += report.upload_duration;
-            gpu_duration += report.gpu_duration;
-            download_duration += report.download_duration;
-            out
+        let gate = if use_gate {
+            session.run_projection(&gate_name, intermediate_rows, hidden_rows, &hidden_states)?
         } else {
             self.weights.matvec_f16(&gate_name, &hidden_states)?
         };
-        let up = if let Some(runner) = &up_gpu {
-            let (out, report) = runner
-                .borrow_mut()
-                .run_with_output(&hidden_states, None)
-                .map_err(|error| ReferenceError::Decode(format!("gpu up_proj failed: {error}")))?;
-            upload_duration += report.upload_duration;
-            gpu_duration += report.gpu_duration;
-            download_duration += report.download_duration;
-            out
+        let up = if use_up {
+            session.run_projection(&up_name, intermediate_rows, hidden_rows, &hidden_states)?
         } else {
             self.weights.matvec_f16(&up_name, &hidden_states)?
         };
         let mlp = swiglu(&gate, &up);
 
         let mixed_down = if use_down {
-            let (packed, pack, _) =
-                self.get_or_create_projection_cache(&down_name, hidden_rows, intermediate_rows)?;
-            let (runner, compile, _) = self.get_or_create_projection_gpu(&down_name, &packed)?;
-            pack_duration += pack;
-            compile_duration += compile;
-            let (out, report) =
-                runner
-                    .borrow_mut()
-                    .run_with_output(&mlp, None)
-                    .map_err(|error| {
-                        ReferenceError::Decode(format!("gpu down_proj failed: {error}"))
-                    })?;
-            upload_duration += report.upload_duration;
-            gpu_duration += report.gpu_duration;
-            download_duration += report.download_duration;
-            out
+            session.run_projection(&down_name, hidden_rows, intermediate_rows, &mlp)?
         } else {
             self.weights.matvec_f16(&down_name, &mlp)?
         };
@@ -1413,11 +1357,11 @@ impl ReferenceModel {
         Ok(MlpProjectionMixMetrics {
             enabled_projections,
             total_duration,
-            pack_duration,
-            compile_duration,
-            upload_duration,
-            gpu_duration,
-            download_duration,
+            pack_duration: session.metrics.pack_duration,
+            compile_duration: session.metrics.compile_duration,
+            upload_duration: session.metrics.upload_duration,
+            gpu_duration: session.metrics.gpu_duration,
+            download_duration: session.metrics.download_duration,
             max_abs_diff,
             mean_abs_diff,
         })
