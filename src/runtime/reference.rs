@@ -458,6 +458,13 @@ impl PackedDecodeMetrics {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct PackedDecodeResult {
+    pub output_token_ids: Vec<usize>,
+    pub output_text: String,
+    pub metrics: PackedDecodeMetrics,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct PackedDecodeValidationReport {
     pub enabled_projections: String,
     pub prompt_tokens: usize,
@@ -2474,11 +2481,47 @@ impl ReferenceModel {
         use_attention_qkv: bool,
         use_mlp_gu: bool,
     ) -> Result<PackedDecodeMetrics, ReferenceError> {
+        Ok(self
+            .generate_packed_greedy(prompt, max_new_tokens, use_attention_qkv, use_mlp_gu)?
+            .metrics)
+    }
+
+    pub fn generate_packed_greedy(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+    ) -> Result<PackedDecodeResult, ReferenceError> {
         let tokenizer = self
             .tokenizer
             .as_ref()
             .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
         let prompt_ids = self.encode_prompt_ids(tokenizer, prompt)?;
+        self.generate_packed_from_token_ids(
+            &prompt_ids,
+            max_new_tokens,
+            use_attention_qkv,
+            use_mlp_gu,
+        )
+    }
+
+    pub fn generate_packed_from_token_ids(
+        &self,
+        prompt_ids: &[usize],
+        max_new_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+    ) -> Result<PackedDecodeResult, ReferenceError> {
+        if prompt_ids.is_empty() {
+            return Err(ReferenceError::Decode(
+                "prompt_ids cannot be empty".to_string(),
+            ));
+        }
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
         let total_started = Instant::now();
         let mut metrics = DecodeMetrics {
             prompt_tokens: prompt_ids.len(),
@@ -2545,13 +2588,18 @@ impl ReferenceModel {
         let output_text =
             tokenizer.decode(&output_ids.iter().map(|id| *id as u32).collect::<Vec<_>>())?;
 
-        Ok(Self::finish_packed_decode_metrics(
+        let packed_metrics = Self::finish_packed_decode_metrics(
             Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
             total_started.elapsed(),
             non_offloaded_dense_duration,
             &session,
+            output_text.clone(),
+        );
+        Ok(PackedDecodeResult {
+            output_token_ids: output_ids,
             output_text,
-        ))
+            metrics: packed_metrics,
+        })
     }
 
     pub fn prefill_logits_for_variant(
@@ -3767,6 +3815,30 @@ mod tests {
         assert_eq!(result.metrics.generated_tokens, 1);
         assert!(result.metrics.logits_duration > Duration::ZERO);
         assert!(result.metrics.summarize().contains("generated_tokens=1"));
+    }
+
+    #[test]
+    fn runs_end_to_end_packed_gpu_decode_from_packed_artifact_on_synthetic_model() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let result = model
+            .generate_packed_greedy("tok2", 1, true, true)
+            .expect("packed gpu decode should succeed");
+
+        assert_eq!(result.output_token_ids, vec![2, 2]);
+        assert_eq!(result.output_text, "tok2 tok2");
+        assert_eq!(result.metrics.output_text, "tok2 tok2");
+        assert_eq!(
+            result.metrics.dispatch_count,
+            (model.config.num_hidden_layers * 2 + 1) * 2
+        );
+        assert!(result.metrics.gpu_duration > Duration::ZERO);
     }
 
     #[test]
