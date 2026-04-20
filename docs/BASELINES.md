@@ -309,21 +309,31 @@ JENGINE_NO_HEARTBEAT=1 ./target/release/bench_hybrid_qkv_gu \
 
 Observed samples:
 
-- layer `0`
-  - `qkv+gu`: `1310.133 ms`
-  - `qkvo+gu`: `1338.556 ms`
-- layer `14`
-  - `qkv+gu`: `1386.601 ms`
-  - `qkvo+gu`: `1393.474 ms`
-- layer `27`
-  - `qkv+gu`: `1393.079 ms`
-  - `qkvo+gu`: `1395.680 ms`
+- earlier samples
+  - layer `0`
+    - `qkv+gu`: `1310.133 ms`
+    - `qkvo+gu`: `1338.556 ms`
+  - layer `14`
+    - `qkv+gu`: `1386.601 ms`
+    - `qkvo+gu`: `1393.474 ms`
+  - layer `27`
+    - `qkv+gu`: `1393.079 ms`
+    - `qkvo+gu`: `1395.680 ms`
+- after the subgroup-row packed kernel improvement
+  - layer `0`
+    - `qkv+gu`: `1341.268 ms`
+    - `qkvo+gu`: `1373.316 ms`
+  - layer `14`
+    - `qkv+gu`: `1387.395 ms`
+    - `qkvo+gu`: `1408.045 ms`
+  - layer `27`
+    - `qkv+gu`: `1438.597 ms`
+    - `qkvo+gu`: `1475.124 ms`
 
 Current interpretation:
 
-- `qkv+gu` remains slightly faster than `qkvo+gu` on early, middle, and late sampled layers
-- `o_proj` offload is therefore not the next obvious decode-side win on this stack
-- the next dense-hotspot experiments should shift toward `down_proj` and logits
+- `qkv+gu` remains ahead of `qkvo+gu` even after the stronger subgroup-row packed kernel landed
+- so `o_proj` offload is still not the next clean decode-side win in the broader hybrid path
 
 ### Real cached `qkv + gu` vs `qkv + gud` layer samples
 
@@ -336,22 +346,32 @@ JENGINE_NO_HEARTBEAT=1 ./target/release/bench_hybrid_qkv_gu \
 
 Observed samples:
 
-- layer `0`
-  - `qkv+gu`: `1313.025 ms`
-  - `qkv+gud`: `1319.966 ms`
-- layer `14`
-  - `qkv+gu`: `1348.146 ms`
-  - `qkv+gud`: `1359.994 ms`
-- layer `27`
-  - `qkv+gu`: `1438.766 ms`
-  - `qkv+gud`: `1436.803 ms`
+- earlier samples
+  - layer `0`
+    - `qkv+gu`: `1313.025 ms`
+    - `qkv+gud`: `1319.966 ms`
+  - layer `14`
+    - `qkv+gu`: `1348.146 ms`
+    - `qkv+gud`: `1359.994 ms`
+  - layer `27`
+    - `qkv+gu`: `1438.766 ms`
+    - `qkv+gud`: `1436.803 ms`
+- after the subgroup-row packed kernel improvement
+  - layer `0`
+    - `qkv+gu`: `1341.268 ms`
+    - `qkv+gud`: `1341.461 ms`
+  - layer `14`
+    - `qkv+gu`: `1387.395 ms`
+    - `qkv+gud`: `1455.990 ms`
+  - layer `27`
+    - `qkv+gu`: `1438.597 ms`
+    - `qkv+gud`: `1469.006 ms`
 
 Current interpretation:
 
-- `qkv+gud` does not produce a clear end-to-end win over `qkv+gu`
-- the tiny layer `27` edge is within noise compared with the losses on layers `0` and `14`
-- `down_proj` therefore does not look like the next clean hybrid decode-side win either
-- the next dense-hotspot experiments should bias toward logits and larger packed-first execution changes
+- `qkv+gud` still does not produce a clear end-to-end win over `qkv+gu` even after the stronger packed kernel landed
+- so `down_proj` still does not look like the next clean hybrid decode-side win either
+- that keeps logits and broader packed-first execution as the stronger remaining dense-side directions
 
 ### Real cached `qkv + gu` vs `qkv + gu + logits` layer samples
 
