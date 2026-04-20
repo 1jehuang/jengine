@@ -309,6 +309,18 @@ With both `JENGINE_PREWARM_PACKED=1` and `JENGINE_PACKED_MLP_FULL=1`, the direct
 - mlp: `187.861 ms`
   - `mlp_down`: `65.885 ms`
 
+### Direct packed profiling now writes JSON traces to a stable local path
+
+The new `profile_packed_decode` binary now emits machine-readable JSON with:
+
+- decode metrics
+- packed metrics
+- per-dispatch packed trace events
+
+If no output path is given explicitly, it now writes to `.artifacts/profiles/profile_packed_decode_<timestamp>.json` by default.
+
+So we now have a stable local place for direct packed decode attribution artifacts instead of relying only on terminal output.
+
 ### Packed cache prewarm makes the direct packed benchmark much more practical
 
 A new `prewarm_packed_decode_caches(...)` API is now exposed on `ReferenceModel`, and the packed CLI / benchmark paths honor `JENGINE_PREWARM_PACKED=1`.

@@ -712,6 +712,7 @@ impl<'a> PackedGpuSession<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_dispatch_trace(
         &mut self,
         tensor_name: &str,
@@ -4288,6 +4289,19 @@ mod tests {
         assert_eq!(
             result.metrics.dispatch_count,
             (model.config.num_hidden_layers * 2 + 1) * 2
+        );
+        assert!(!result.dispatch_trace.is_empty());
+        assert!(
+            result
+                .dispatch_trace
+                .iter()
+                .any(|trace| trace.stage == "attention_qkv")
+        );
+        assert!(
+            result
+                .dispatch_trace
+                .iter()
+                .any(|trace| trace.stage == "logits_argmax")
         );
         assert!(result.metrics.gpu_duration > Duration::ZERO);
     }
