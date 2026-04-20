@@ -453,6 +453,16 @@ From the latest real one-token run:
 - compute: `15.424 ms`
 - download: `0.238 ms`
 
+### Practical current-architecture ceiling is now measurable
+
+From the strongest current warm direct sample with both full attention and full MLP offload enabled:
+
+- realized warm direct throughput: `3.458 tok/s`
+- GPU + transfer floor: about `4.44 tok/s`
+- GPU-only floor: about `5.77 tok/s`
+
+So the present packed decode architecture is now credibly in the **single-digit tok/s** regime on this hardware when fully warmed, but still nowhere near the earlier speculative `200 tok/s` idea. That much larger number would require another substantial architectural shift beyond the current packed decode design.
+
 ## Current bottlenecks
 
 1. The dominant cost in the first decode-wide attribution sample is still non-offloaded dense work, not GPU bandwidth saturation

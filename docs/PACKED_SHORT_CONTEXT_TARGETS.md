@@ -58,7 +58,33 @@ This is the new near-term target after clearing the older `1.0 tok/s` milestone.
 - the next useful benchmark question is therefore not whether packed decode can break `1 tok/s`, but whether it can sustain and stabilize multi-token-per-second behavior on the direct path
 - the main remaining gap is now in preserving the best warm-path structure for the direct benchmark rather than proving viability at all
 
-## Next target after first clean multi-token/s win
+## Practical current-architecture ceiling
+
+Using the strongest current direct warm sample:
+
+- `JENGINE_PREWARM_PACKED=1`
+- `JENGINE_PACKED_ATTENTION_FULL=1`
+- `JENGINE_PACKED_MLP_FULL=1`
+- warm second pass total: `289.158 ms`
+- warm second pass throughput: `3.458 tok/s`
+
+We can estimate two useful upper bounds for the **current architecture style**:
+
+1. **GPU + transfer floor**
+   - using `gpu_ms + download_ms + upload_ms`
+   - `173.172 + 51.888 + 0.070 = 225.130 ms`
+   - about **`4.44 tok/s`**
+
+2. **GPU-only floor**
+   - using only `gpu_ms`
+   - `173.172 ms`
+   - about **`5.77 tok/s`**
+
+Interpretation:
+
+- on the current architecture, even if we remove the remaining direct dense CPU work perfectly, we are still in the **single-digit tok/s** regime
+- that is dramatically better than where the project started, but it is also dramatically below the earlier speculative `200 tok/s` idea
+- so the real remaining work is not small polishing. Reaching anything much larger than this current single-digit band would require another substantial architectural shift beyond the present packed decode design
 
 After the first reproducible direct warm combined result at or above `4.0 tok/s`, update this document with:
 
