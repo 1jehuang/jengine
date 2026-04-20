@@ -434,20 +434,26 @@ JENGINE_PACKED_SHADER_VARIANT=xe2_32 cargo run --quiet --bin vulkan_packed_matve
 JENGINE_PACKED_SHADER_VARIANT=xe2_subgroup_row cargo run --quiet --bin vulkan_packed_matvec -- \
   /home/jeremy/models/bonsai-1.7b/model.safetensors \
   model.layers.0.self_attn.q_proj.weight 2048 2048
+
+JENGINE_PACKED_SHADER_VARIANT=default cargo run --quiet --bin vulkan_packed_matvec -- \
+  /home/jeremy/models/bonsai-1.7b/model.safetensors \
+  model.layers.0.self_attn.q_proj.weight 2048 2048
 ```
 
-Observed repeated medians:
+Observed repeated medians and checks:
 
-- default packed shader: `1.249 ms` GPU
+- forced legacy default packed shader: `1.249 ms` GPU
 - `xe2_32` packed shader: `1.244 ms` GPU
 - `xe2_subgroup_row` packed shader: `0.556 ms` GPU
+- plain default run on this Lunar Lake machine: about `0.538 ms` GPU
 
 Current interpretation:
 
 - a simple subgroup-aligned 32-thread local size is technically fine on this hardware but is basically a wash by itself
 - the subgroup-row rewrite is the first Xe2-oriented kernel change that materially moves the packed matvec
-- on this real `q_proj` tensor it is about **`2.25x`** faster than the current default packed shader on median GPU time
-- that makes further subgroup-oriented kernel experimentation worth continuing, especially if the win can survive integration into the broader packed runtime
+- on this real `q_proj` tensor it is about **`2.25x`** faster than the forced legacy default packed shader on median GPU time
+- the runner now auto-selects that subgroup-row path on this Lunar Lake Intel GPU unless `JENGINE_PACKED_SHADER_VARIANT` explicitly overrides it
+- that makes further subgroup-oriented runtime integration worth continuing
 
 ### Carry-up into the chunked combined packed upper bound
 

@@ -1,7 +1,7 @@
 use ash::util::read_spv;
 use ash::{Device, Entry, Instance, vk};
 use half::f16;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -200,8 +200,6 @@ impl CachedGpuPackedMatvecRunner {
         cols: usize,
     ) -> Result<(Self, Duration), GpuPackedMatvecError> {
         let compile_started = Instant::now();
-        let (shader_source, workgroup_size) = packed_shader_variant();
-        let shader_path = compile_shader(Path::new(shader_source))?;
 
         let entry = unsafe { Entry::load()? };
         let app_name = CString::new("jengine-packed-matvec")?;
@@ -216,6 +214,9 @@ impl CachedGpuPackedMatvecRunner {
         let instance = unsafe { entry.create_instance(&instance_ci, None)? };
 
         let (physical_device, queue_family_index) = pick_compute_device(&instance)?;
+        let device_properties = unsafe { instance.get_physical_device_properties(physical_device) };
+        let (shader_source, workgroup_size) = packed_shader_variant(&device_properties);
+        let shader_path = compile_shader(Path::new(shader_source))?;
         let priorities = [1.0f32];
         let queue_ci = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
@@ -617,14 +618,24 @@ struct BufferAllocation {
     size: u64,
 }
 
-fn packed_shader_variant() -> (&'static str, u32) {
+fn packed_shader_variant(properties: &vk::PhysicalDeviceProperties) -> (&'static str, u32) {
     match std::env::var("JENGINE_PACKED_SHADER_VARIANT")
         .ok()
         .as_deref()
     {
         Some("xe2_32") => ("shaders/packed_ternary_matvec_xe2_32.comp", 32),
         Some("xe2_subgroup_row") => ("shaders/packed_ternary_matvec_xe2_subgroup_row.comp", 1),
-        _ => ("shaders/packed_ternary_matvec.comp", 64),
+        Some("default") => ("shaders/packed_ternary_matvec.comp", 64),
+        _ => {
+            let device_name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
+                .to_str()
+                .unwrap_or_default();
+            if properties.vendor_id == 0x8086 && device_name.contains("(LNL)") {
+                ("shaders/packed_ternary_matvec_xe2_subgroup_row.comp", 1)
+            } else {
+                ("shaders/packed_ternary_matvec.comp", 64)
+            }
+        }
     }
 }
 
