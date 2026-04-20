@@ -777,6 +777,18 @@ impl CachedGpuPackedMatvecRunner {
         &self._shared_context
     }
 
+    pub fn output_buffer_handle(&self) -> vk::Buffer {
+        self.output_buffer.buffer
+    }
+
+    pub fn output_buffer_size(&self) -> u64 {
+        self.output_buffer.size
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
     pub fn read_output(&self) -> Result<(Vec<f32>, Duration), GpuPackedMatvecError> {
         let download_started = Instant::now();
         let gpu_output = read_f32_buffer(&self.output_buffer, self.rows)?;

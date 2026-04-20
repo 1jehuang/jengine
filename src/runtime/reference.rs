@@ -731,6 +731,16 @@ struct ResidentPackedProjection {
     report: crate::gpu::packed_matvec::GpuPackedMatvecReport,
 }
 
+#[allow(dead_code)]
+struct ResidentPackedPairProjection {
+    tensor_name: String,
+    first_rows: usize,
+    second_rows: usize,
+    cols: usize,
+    prepared: PreparedProjectionRunner,
+    report: crate::gpu::packed_matvec::GpuPackedMatvecReport,
+}
+
 struct ResidentGpuFinalNorm {
     runner: CachedWeightedRmsNormGpuRunner,
     report: crate::gpu::weighted_rms_norm::GpuWeightedRmsNormReport,
@@ -1286,6 +1296,55 @@ impl<'a> PackedGpuSession<'a> {
             download_bytes,
         );
         Ok((first.to_vec(), second.to_vec()))
+    }
+
+    #[allow(dead_code)]
+    fn run_projection_pair_resident(
+        &mut self,
+        first_name: &str,
+        first_rows: usize,
+        second_name: &str,
+        second_rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Result<ResidentPackedPairProjection, ReferenceError> {
+        let pair_key = format!("concat::{first_name}||{second_name}");
+        let (packed, pack_duration, pack_cache_hit) = self.model.get_or_create_projection_pair_cache(
+            &pair_key,
+            first_name,
+            first_rows,
+            second_name,
+            second_rows,
+            cols,
+        )?;
+        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu(&pair_key, &packed)?;
+        self.metrics.pack_duration += pack_duration;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.weight_upload_duration += weight_upload_duration;
+        self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+        let report = runner.borrow_mut().run_resident(input).map_err(|error| {
+            ReferenceError::Decode(format!(
+                "gpu projection failed for {first_name}+{second_name}: {error}"
+            ))
+        })?;
+        Ok(ResidentPackedPairProjection {
+            tensor_name: pair_key,
+            first_rows,
+            second_rows,
+            cols,
+            prepared: PreparedProjectionRunner {
+                packed,
+                runner,
+                compile_duration,
+                weight_upload_duration,
+                pack_cache_hit,
+                gpu_cache_hit,
+            },
+            report,
+        })
     }
 
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
