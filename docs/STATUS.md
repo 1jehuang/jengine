@@ -201,6 +201,26 @@ The packed-artifact `generate_greedy` / `generate_from_token_ids` path no longer
 
 That means the packed-first runtime is no longer just an opt-in helper or benchmark path. It is now the default generation control flow for packed-artifact models in the runtime.
 
+### Direct packed CPU fallback also shaved the chunked combined upper bound further
+
+After switching packed-model CPU fallback matvec and embedding lookup to use direct packed decode instead of unpacking whole tensors first, the chunked combined upper bound improved again:
+
+- prior subgroup-row combined upper bound: `11885.064 ms`
+- current combined upper bound: `11458.751 ms`
+
+The new reconstructed combined sample is:
+
+- total: `11458.751 ms`
+- compile: `1358.502 ms`
+- upload: `21.392 ms`
+- gpu: `224.086 ms`
+- download: `29.585 ms`
+- non-offloaded dense: `9064.034 ms`
+- orchestration: `761.142 ms`
+- dispatches: `57`
+
+So this CPU-side packed-first cleanup bought another roughly **`3.6%`** improvement over the earlier subgroup-row carry-up sample, and about **`6.2%`** over the older default-shader chunked combined upper bound.
+
 ### Cached q_proj warm hybrid vs dense
 
 From the latest real one-token run:
@@ -228,7 +248,8 @@ From the latest real one-token run:
 10. A simple subgroup-aligned `32`-thread local-size tweak was effectively a wash, but a larger subgroup-row rewrite improved the real 2048x2048 packed `q_proj` microbenchmark from `1.249 ms` to `0.556 ms` median GPU time, about `2.25x` faster, and this Lunar Lake machine now auto-selects that faster path by default
 11. Carrying that subgroup-row shader into the chunked combined packed path reduced the reconstructed upper bound from `12212.554 ms` to `11885.064 ms`, only about `2.7%` total, which confirms that dense-side work is still the main limiter
 12. Packed-artifact `generate_greedy` now routes into the packed decode path automatically, so the packed-first runtime is no longer just benchmark-only infrastructure
-13. The next meaningful wins now come from carrying that kind of kernel-level win through more of the broader runtime while still reducing dense-side work and synchronization overhead
+13. Direct packed CPU fallback for embedding lookup and matvec further reduced the chunked combined upper bound from `11885.064 ms` to `11458.751 ms`, showing that avoiding full unpack on the CPU side is also a real win
+14. The next meaningful wins now come from carrying that kind of kernel-level win through more of the broader runtime while still reducing dense-side work and synchronization overhead
 
 ## Best next step
 

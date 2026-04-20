@@ -1,7 +1,9 @@
 use crate::model::config::BonsaiModelConfig;
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::packed::{PackedIoError, PackedTensorFile};
-use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128, unpack_ternary_g128};
+use crate::runtime::repack::{
+    embedding_lookup_packed_ternary, matvec_packed_ternary, pack_ternary_g128, unpack_ternary_g128,
+};
 use crate::runtime::weights::{WeightError, WeightStore};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -174,26 +176,25 @@ impl PackedModelStore {
         name: &str,
         token_id: usize,
     ) -> Result<Option<Vec<f32>>, PackedModelError> {
-        let Some(entry) = self.entries_by_name.get(name) else {
+        let Some(packed) = self.load_packed_tensor_file(name)? else {
             return Ok(None);
         };
-        if entry.shape.len() != 2 {
+        let tensor = packed.tensor;
+        if tensor.shape.len() != 2 {
             return Err(PackedModelError::Encode(format!(
                 "{name}: embedding lookup requires rank-2 tensor"
             )));
         }
-        let vocab = entry.shape[0];
-        let hidden = entry.shape[1];
+        let vocab = tensor.shape[0];
         if token_id >= vocab {
             return Err(PackedModelError::Encode(format!(
                 "{name}: token_id {token_id} out of range for vocab {vocab}"
             )));
         }
-        let values = self.load_vector_f32(name)?.ok_or_else(|| {
-            PackedModelError::Encode(format!("{name}: tensor disappeared during packed load"))
-        })?;
-        let start = token_id * hidden;
-        Ok(Some(values[start..start + hidden].to_vec()))
+        Ok(Some(
+            embedding_lookup_packed_ternary(&tensor, token_id)
+                .map_err(|error| PackedModelError::Encode(format!("{name}: {error}")))?,
+        ))
     }
 
     pub fn matvec_f32(

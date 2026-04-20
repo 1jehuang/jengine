@@ -477,7 +477,7 @@ Current interpretation:
 
 ### Carry-up into the chunked combined packed upper bound
 
-Using the same 7-layer chunk chaining workflow as the packed combined upper bound, but with `JENGINE_PACKED_SHADER_VARIANT=xe2_subgroup_row`, produced:
+Using the same 7-layer chunk chaining workflow as the packed combined upper bound, but with `JENGINE_PACKED_SHADER_VARIANT=xe2_subgroup_row`, first produced:
 
 - total: `11885.064 ms`
 - compile: `1364.736 ms`
@@ -488,16 +488,27 @@ Using the same 7-layer chunk chaining workflow as the packed combined upper boun
 - orchestration: `773.164 ms`
 - dispatches: `57`
 
-Compared with the default-shader chunked combined upper bound:
+Then, after switching packed-model CPU fallback embedding lookup and matvec over to direct packed decode instead of whole-tensor unpack, the same chunked combined workflow produced:
 
-- total improved from `12212.554 ms` to `11885.064 ms`
-- gpu time improved from `657.716 ms` to `250.854 ms`
+- total: `11458.751 ms`
+- compile: `1358.502 ms`
+- upload: `21.392 ms`
+- gpu: `224.086 ms`
+- download: `29.585 ms`
+- non-offloaded dense: `9064.034 ms`
+- orchestration: `761.142 ms`
+- dispatches: `57`
+
+Compared with the older default-shader chunked combined upper bound:
+
+- total improved from `12212.554 ms` to `11458.751 ms`
+- gpu time improved from `657.716 ms` to `224.086 ms`
 
 Current interpretation:
 
 - the subgroup-row win does survive into the broader packed path
-- but only as about a **`2.7%`** total upper-bound improvement in the current chunked combined capture
-- that gap between microbenchmark win and end-to-end win reinforces that dense-side work still dominates the current packed runtime
+- and avoiding full unpack on the CPU-side packed fallback also helps materially
+- but even after both of those changes, dense-side work is still the largest bucket in the current chunked combined capture
 - packed-artifact `generate_greedy` now routes into the packed decode path automatically, which means the packed-first runtime is now the default generation path for packed-artifact models rather than only an opt-in benchmark helper
 
 ## Chunked packed capture workarounds

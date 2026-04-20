@@ -177,6 +177,38 @@ pub fn unpack_ternary_g128(packed: &PackedTernaryTensor) -> Result<Vec<f32>, Rep
     Ok(values)
 }
 
+pub fn embedding_lookup_packed_ternary(
+    packed: &PackedTernaryTensor,
+    row_index: usize,
+) -> Result<Vec<f32>, RepackError> {
+    if packed.shape.len() != 2 {
+        return Err(RepackError::Shape(
+            "packed embedding lookup requires a rank-2 tensor".to_string(),
+        ));
+    }
+    let rows = packed.shape[0];
+    let cols = packed.shape[1];
+    if row_index >= rows {
+        return Err(RepackError::Shape(format!(
+            "row_index {row_index} out of range for {rows} rows"
+        )));
+    }
+    let row_start = row_index * cols;
+    let row_end = row_start + cols;
+    let mut values = Vec::with_capacity(cols);
+    for element_index in row_start..row_end {
+        let scale = packed.scales[element_index / packed.group_size];
+        let code = get_code(&packed.packed_codes, element_index);
+        values.push(match code {
+            0 => 0.0,
+            1 => scale,
+            2 => -scale,
+            _ => 0.0,
+        });
+    }
+    Ok(values)
+}
+
 pub fn matvec_packed_ternary_reference(
     packed: &PackedTernaryTensor,
     input: &[f32],
@@ -366,8 +398,9 @@ fn get_code(bytes: &[u8], element_index: usize) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        TERNARY_G128_GROUP_SIZE, analyze_ternary_packability, matvec_packed_ternary,
-        matvec_packed_ternary_reference, pack_ternary_g128, unpack_ternary_g128,
+        TERNARY_G128_GROUP_SIZE, analyze_ternary_packability, embedding_lookup_packed_ternary,
+        matvec_packed_ternary, matvec_packed_ternary_reference, pack_ternary_g128,
+        unpack_ternary_g128,
     };
 
     #[test]
@@ -387,6 +420,16 @@ mod tests {
         assert_eq!(report.groups, 1);
         assert_eq!(report.perfect_groups, 1);
         assert!(report.reduction_ratio_vs_fp16 > 7.0);
+    }
+
+    #[test]
+    fn embedding_lookup_decodes_only_target_row() {
+        let values = vec![
+            0.0f32, 1.5, -1.5, 0.0, 1.5, -1.5, 0.0, 1.5, -1.5, 0.0, 1.5, -1.5,
+        ];
+        let (packed, _) = pack_ternary_g128(&values, vec![3, 4], 1e-6).unwrap();
+        let row = embedding_lookup_packed_ternary(&packed, 1).unwrap();
+        assert_eq!(row, vec![1.5, -1.5, 0.0, 1.5]);
     }
 
     #[test]
