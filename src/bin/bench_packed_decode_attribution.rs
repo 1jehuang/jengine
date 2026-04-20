@@ -1,4 +1,6 @@
+use jengine::report::append_jsonl_record;
 use jengine::runtime::reference::ReferenceModel;
+use serde_json::json;
 use std::io::{self, Write};
 use std::sync::{
     Arc,
@@ -137,6 +139,23 @@ fn main() {
             stream_window_pct_of_hw,
             metrics.summarize(),
         ));
+        let _ = append_jsonl_record(
+            "bench_packed_decode_attribution.jsonl",
+            &json!({
+                "kind": "iteration",
+                "benchmark": "bench_packed_decode_attribution",
+                "variant": variant,
+                "iteration": iteration + 1,
+                "prompt": prompt,
+                "max_new_tokens": max_new_tokens,
+                "hardware_gbps": hardware_bandwidth_gbps,
+                "per_generated_token_ms": per_generated_token_ms,
+                "per_generated_streamed_mb": per_generated_streamed_mb,
+                "e2e_pct_of_hw": e2e_pct_of_hw,
+                "stream_window_pct_of_hw": stream_window_pct_of_hw,
+                "summary": metrics.summarize(),
+            }),
+        );
     }
     lines.push(format!(
         "avg_variant={} iterations={} avg_total_ms={:.3} avg_e2e_gbps={:.3} avg_stream_window_gbps={:.3}",
@@ -146,6 +165,20 @@ fn main() {
         e2e_gbps_sum / iterations as f64,
         stream_window_gbps_sum / iterations as f64,
     ));
+    let _ = append_jsonl_record(
+        "bench_packed_decode_attribution.jsonl",
+        &json!({
+            "kind": "aggregate",
+            "benchmark": "bench_packed_decode_attribution",
+            "variant": variant,
+            "prompt": prompt,
+            "max_new_tokens": max_new_tokens,
+            "iterations": iterations,
+            "avg_total_ms": total_ms_sum / iterations as f64,
+            "avg_e2e_gbps": e2e_gbps_sum / iterations as f64,
+            "avg_stream_window_gbps": stream_window_gbps_sum / iterations as f64,
+        }),
+    );
     let summary = format!("{}\n", lines.join("\n"));
 
     if let Some(out_path) = out_path {

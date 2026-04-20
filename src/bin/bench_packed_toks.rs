@@ -1,4 +1,6 @@
+use jengine::report::append_jsonl_record;
 use jengine::runtime::reference::ReferenceModel;
+use serde_json::json;
 use std::io::{self, Write};
 use std::sync::{
     Arc,
@@ -110,11 +112,38 @@ fn main() {
             tok_s,
             result.summarize(),
         );
+        let _ = append_jsonl_record(
+            "bench_packed_toks.jsonl",
+            &json!({
+                "kind": "iteration",
+                "benchmark": "bench_packed_toks",
+                "variant": variant,
+                "iteration": iteration + 1,
+                "prompt": prompt,
+                "max_new_tokens": max_new_tokens,
+                "total_ms": total,
+                "tok_s": tok_s,
+                "summary": result.summarize(),
+            }),
+        );
     }
     let avg_total_ms = total_ms / iterations as f64;
     let avg_tok_s = tok_s_values.iter().sum::<f64>() / iterations as f64;
     println!(
         "avg_variant={} avg_total_ms={:.3} avg_tok_s={:.3}",
         variant, avg_total_ms, avg_tok_s
+    );
+    let _ = append_jsonl_record(
+        "bench_packed_toks.jsonl",
+        &json!({
+            "kind": "aggregate",
+            "benchmark": "bench_packed_toks",
+            "variant": variant,
+            "prompt": prompt,
+            "max_new_tokens": max_new_tokens,
+            "iterations": iterations,
+            "avg_total_ms": avg_total_ms,
+            "avg_tok_s": avg_tok_s,
+        }),
     );
 }

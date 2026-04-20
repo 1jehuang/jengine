@@ -1,6 +1,44 @@
 use crate::model::tokenizer::PromptAnalysis;
 use crate::runtime::reference::{DecodeMetrics, MemoryReport};
-use std::path::Path;
+use serde_json::Value;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub fn profile_log_dir() -> PathBuf {
+    std::env::var_os("JENGINE_PROFILE_LOG_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".artifacts/profiles"))
+}
+
+pub fn ensure_profile_log_dir() -> Result<PathBuf, std::io::Error> {
+    let dir = profile_log_dir();
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn timestamped_profile_path(prefix: &str, extension: &str) -> Result<PathBuf, std::io::Error> {
+    let dir = ensure_profile_log_dir()?;
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    Ok(dir.join(format!("{prefix}_{unix_ms}.{extension}")))
+}
+
+pub fn write_json_value(path: impl AsRef<Path>, value: &Value) -> Result<(), std::io::Error> {
+    let serialized = serde_json::to_string_pretty(value).expect("JSON should serialize");
+    fs::write(path, serialized)
+}
+
+pub fn append_jsonl_record(file_name: &str, value: &Value) -> Result<PathBuf, std::io::Error> {
+    let path = ensure_profile_log_dir()?.join(file_name);
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    serde_json::to_writer(&mut file, value).expect("JSONL should serialize");
+    writeln!(file)?;
+    Ok(path)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BenchIterationRecord {

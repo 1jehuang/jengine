@@ -1,7 +1,8 @@
+use jengine::report::{timestamped_profile_path, write_json_value};
 use jengine::runtime::reference::{DecodeMetrics, PackedDecodeMetrics, ReferenceModel};
 use serde_json::json;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
@@ -57,16 +58,6 @@ fn packed_metrics_json(metrics: &PackedDecodeMetrics) -> serde_json::Value {
         "e2e_gbps": metrics.effective_end_to_end_bandwidth_gbps(),
         "stream_window_gbps": metrics.effective_stream_window_bandwidth_gbps(),
     })
-}
-
-fn default_profile_out_path() -> PathBuf {
-    let dir = PathBuf::from(".artifacts/profiles");
-    std::fs::create_dir_all(&dir).expect("profile log directory should exist");
-    let unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    dir.join(format!("profile_packed_decode_{unix_ms}.json"))
 }
 
 fn main() {
@@ -126,10 +117,11 @@ fn main() {
     });
     let output = serde_json::to_string_pretty(&document).expect("profile JSON should serialize");
 
-    let out_path = out_path
-        .map(PathBuf::from)
-        .unwrap_or_else(default_profile_out_path);
-    std::fs::write(&out_path, &output).expect("profile JSON should write");
+    let out_path = out_path.map(PathBuf::from).unwrap_or_else(|| {
+        timestamped_profile_path("profile_packed_decode", "json")
+            .expect("profile log path should build")
+    });
+    write_json_value(&out_path, &document).expect("profile JSON should write");
     eprintln!("profile_json_path={}", out_path.display());
     println!("{output}");
 }
