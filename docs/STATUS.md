@@ -163,20 +163,22 @@ A new local hardware probe now confirms that the Lunar Lake iGPU exposes the key
 
 That does **not** prove a better kernel will be faster yet, but it does mean the hardware and driver are exposing the right building blocks. So an Xe2/XMX-oriented shader path is now a credible engineering direction rather than a speculative one.
 
-### First Xe2-oriented shader experiment is only a tiny microbenchmark nudge
+### First larger Xe2-oriented shader rewrite is a real microbenchmark win
 
-A first subgroup-aligned experiment now exists via `JENGINE_PACKED_SHADER_VARIANT=xe2_32`, which swaps the packed shader from a `64`-thread local size to a `32`-thread local size to match the reported subgroup size on Lunar Lake.
+The first meaningful subgroup-oriented rewrite now exists as `JENGINE_PACKED_SHADER_VARIANT=xe2_subgroup_row`, which assigns one workgroup per row and uses subgroup reduction across the packed-column loop.
 
 Repeated real `q_proj` tensor samples on the 2048x2048 tensor gave:
 
-- default variant median packed GPU time: `1.248 ms`
-- `xe2_32` variant median packed GPU time: `1.244 ms`
+- default packed shader median GPU time: `1.249 ms`
+- subgroup-row Xe2 shader median GPU time: `0.556 ms`
 
-That is only about a `0.3%` improvement, which is too small to treat as a decisive win. So this first Xe2-oriented experiment is best read as:
+That is about a **`2.25x`** GPU-time speedup on this real packed matvec microbenchmark.
 
-- the idea is technically viable
-- the hardware supports it
-- but this particular change by itself is **not** the breakthrough
+So the Xe2 investigation now has a concrete result:
+
+- simple local-size retuning alone was not enough
+- but a more subgroup-oriented kernel structure **can** materially improve packed throughput on this Intel Arc iGPU
+- the next question is how much of that microbenchmark win survives once it is threaded through the broader packed runtime
 
 ### Cached q_proj warm hybrid vs dense
 
@@ -202,8 +204,8 @@ From the latest real one-token run:
 7. Chunked packed capture now works around the `rc=143` kill window and confirms the latest path shapes, with chunked upper bounds of `12212.554 ms` for combined at `57` dispatches and `17779.632 ms` for attention-only at `29` dispatches
 8. The new chunked attention-only capture shows that attention-side offload alone is still losing badly to the current combined packed path here
 9. The Intel Lunar Lake Vulkan stack does expose cooperative matrix, integer dot, subgroup size control, and float16/int8 features, so an Xe2-oriented kernel path is plausible and worth active investigation
-10. The first subgroup-aligned 32-thread packed shader experiment only moved the 2048x2048 `q_proj` microbenchmark from `1.248 ms` to `1.244 ms` median GPU time, so larger kernel changes are still needed
-11. The next meaningful wins now come from reducing dense-side work and synchronization overhead, not from merely making runner reuse exist at all
+10. A simple subgroup-aligned `32`-thread local-size tweak was effectively a wash, but a larger subgroup-row rewrite improved the real 2048x2048 packed `q_proj` microbenchmark from `1.249 ms` to `0.556 ms` median GPU time, about `2.25x` faster
+11. The next meaningful wins now come from carrying that kind of kernel-level win through the broader runtime while still reducing dense-side work and synchronization overhead
 
 ## Best next step
 

@@ -430,18 +430,24 @@ cargo run --quiet --bin vulkan_packed_matvec -- \
 JENGINE_PACKED_SHADER_VARIANT=xe2_32 cargo run --quiet --bin vulkan_packed_matvec -- \
   /home/jeremy/models/bonsai-1.7b/model.safetensors \
   model.layers.0.self_attn.q_proj.weight 2048 2048
+
+JENGINE_PACKED_SHADER_VARIANT=xe2_subgroup_row cargo run --quiet --bin vulkan_packed_matvec -- \
+  /home/jeremy/models/bonsai-1.7b/model.safetensors \
+  model.layers.0.self_attn.q_proj.weight 2048 2048
 ```
 
 Observed repeated medians:
 
-- default packed shader: `1.248 ms` GPU
+- default packed shader: `1.249 ms` GPU
 - `xe2_32` packed shader: `1.244 ms` GPU
+- `xe2_subgroup_row` packed shader: `0.556 ms` GPU
 
 Current interpretation:
 
-- a subgroup-aligned 32-thread local size is technically fine on this hardware
-- but the observed improvement is only about `0.3%`, which is too small to treat as a meaningful win
-- so the first Xe2-oriented tweak is inconclusive, and larger kernel changes would still be needed to move the overall runtime materially
+- a simple subgroup-aligned 32-thread local size is technically fine on this hardware but is basically a wash by itself
+- the subgroup-row rewrite is the first Xe2-oriented kernel change that materially moves the packed matvec
+- on this real `q_proj` tensor it is about **`2.25x`** faster than the current default packed shader on median GPU time
+- that makes further subgroup-oriented kernel experimentation worth continuing, especially if the win can survive integration into the broader packed runtime
 
 ## Chunked packed capture workarounds
 

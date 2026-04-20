@@ -623,6 +623,7 @@ fn packed_shader_variant() -> (&'static str, u32) {
         .as_deref()
     {
         Some("xe2_32") => ("shaders/packed_ternary_matvec_xe2_32.comp", 32),
+        Some("xe2_subgroup_row") => ("shaders/packed_ternary_matvec_xe2_subgroup_row.comp", 1),
         _ => ("shaders/packed_ternary_matvec.comp", 64),
     }
 }
@@ -650,6 +651,7 @@ fn compile_shader(path: &Path) -> Result<PathBuf, GpuPackedMatvecError> {
     ));
     let output = Command::new("glslc")
         .arg(path)
+        .arg("--target-spv=spv1.3")
         .arg("-o")
         .arg(&tmp)
         .output()?;
