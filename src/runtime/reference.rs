@@ -1581,6 +1581,341 @@ impl ReferenceModel {
         })
     }
 
+    pub fn benchmark_dense_step_from_token_ids(
+        &self,
+        prompt_ids: &[usize],
+    ) -> Result<DecodeMetrics, ReferenceError> {
+        if prompt_ids.is_empty() {
+            return Err(ReferenceError::Decode(
+                "prompt_ids cannot be empty".to_string(),
+            ));
+        }
+
+        let total_started = Instant::now();
+        let mut metrics = DecodeMetrics {
+            prompt_tokens: prompt_ids.len(),
+            generated_tokens: 0,
+            total_duration: Duration::ZERO,
+            embedding_duration: Duration::ZERO,
+            norm_duration: Duration::ZERO,
+            qkv_duration: Duration::ZERO,
+            attention_duration: Duration::ZERO,
+            mlp_duration: Duration::ZERO,
+            logits_duration: Duration::ZERO,
+        };
+        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len());
+        for (position, &token_id) in prompt_ids.iter().enumerate() {
+            let _ = self.forward_step(token_id, position, &mut cache, &mut metrics)?;
+        }
+        metrics.total_duration = total_started.elapsed();
+        Ok(metrics)
+    }
+
+    pub fn benchmark_packed_step_from_token_ids(
+        &self,
+        prompt_ids: &[usize],
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+    ) -> Result<PackedDecodeMetrics, ReferenceError> {
+        if prompt_ids.is_empty() {
+            return Err(ReferenceError::Decode(
+                "prompt_ids cannot be empty".to_string(),
+            ));
+        }
+
+        let total_started = Instant::now();
+        let mut metrics = DecodeMetrics {
+            prompt_tokens: prompt_ids.len(),
+            generated_tokens: 0,
+            total_duration: Duration::ZERO,
+            embedding_duration: Duration::ZERO,
+            norm_duration: Duration::ZERO,
+            qkv_duration: Duration::ZERO,
+            attention_duration: Duration::ZERO,
+            mlp_duration: Duration::ZERO,
+            logits_duration: Duration::ZERO,
+        };
+        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len());
+        let mut session = PackedGpuSession::new(self);
+        for (position, &token_id) in prompt_ids.iter().enumerate() {
+            let _ = self.forward_step_packed_decode(
+                token_id,
+                position,
+                &mut cache,
+                &mut metrics,
+                &mut session,
+                use_attention_qkv,
+                use_mlp_gu,
+            )?;
+        }
+
+        let mut enabled = String::new();
+        if use_attention_qkv {
+            enabled.push_str("qkv");
+        }
+        if use_mlp_gu {
+            if !enabled.is_empty() {
+                enabled.push('+');
+            }
+            enabled.push_str("gu");
+        }
+        if enabled.is_empty() {
+            enabled.push_str("dense");
+        }
+
+        Ok(PackedDecodeMetrics {
+            enabled_projections: enabled,
+            total_duration: total_started.elapsed(),
+            pack_duration: session.metrics.pack_duration,
+            compile_duration: session.metrics.compile_duration,
+            upload_duration: session.metrics.upload_duration,
+            gpu_duration: session.metrics.gpu_duration,
+            download_duration: session.metrics.download_duration,
+            pack_cache_hits: session.metrics.pack_cache_hits,
+            gpu_cache_hits: session.metrics.gpu_cache_hits,
+            dispatch_count: session.metrics.dispatch_count,
+            upload_bytes: session.metrics.upload_bytes,
+            download_bytes: session.metrics.download_bytes,
+            output_text: String::new(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn benchmark_packed_prefill_chunk(
+        &self,
+        token_id: Option<usize>,
+        hidden_in: Option<&[f32]>,
+        start_layer: usize,
+        end_layer: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        include_logits: bool,
+    ) -> Result<(Vec<f32>, PackedDecodeMetrics), ReferenceError> {
+        if start_layer >= end_layer || end_layer > self.config.num_hidden_layers {
+            return Err(ReferenceError::Decode(format!(
+                "invalid layer range [{start_layer}, {end_layer}) for {} layers",
+                self.config.num_hidden_layers
+            )));
+        }
+
+        let total_started = Instant::now();
+        let mut metrics = DecodeMetrics {
+            prompt_tokens: 1,
+            generated_tokens: 0,
+            total_duration: Duration::ZERO,
+            embedding_duration: Duration::ZERO,
+            norm_duration: Duration::ZERO,
+            qkv_duration: Duration::ZERO,
+            attention_duration: Duration::ZERO,
+            mlp_duration: Duration::ZERO,
+            logits_duration: Duration::ZERO,
+        };
+        let mut session = PackedGpuSession::new(self);
+        let mut hidden = if let Some(hidden_in) = hidden_in {
+            hidden_in.to_vec()
+        } else {
+            let token_id = token_id.ok_or_else(|| {
+                ReferenceError::Decode(
+                    "token_id is required when hidden_in is not provided".to_string(),
+                )
+            })?;
+            let started_at = Instant::now();
+            let hidden = self.embedding_lookup_resolved("model.embed_tokens.weight", token_id)?;
+            metrics.embedding_duration += started_at.elapsed();
+            hidden
+        };
+
+        let (cos, sin) = rope_cos_sin(&self.rope, &[0]);
+
+        for layer_idx in start_layer..end_layer {
+            let prefix = format!("model.layers.{layer_idx}");
+            let residual = hidden.clone();
+
+            let started_at = Instant::now();
+            let input_norm_weight =
+                self.load_vector_f32_resolved(&format!("{prefix}.input_layernorm.weight"))?;
+            let mut hidden_states =
+                weighted_rms_norm(&hidden, &input_norm_weight, self.config.rms_norm_eps as f32);
+            metrics.norm_duration += started_at.elapsed();
+
+            let started_at = Instant::now();
+            let mut q = if use_attention_qkv {
+                session.run_projection(
+                    &format!("{prefix}.self_attn.q_proj.weight"),
+                    self.config.hidden_size,
+                    self.config.hidden_size,
+                    &hidden_states,
+                )?
+            } else {
+                self.matvec_f16_resolved(
+                    &format!("{prefix}.self_attn.q_proj.weight"),
+                    &hidden_states,
+                )?
+            };
+            let mut k = if use_attention_qkv {
+                session.run_projection(
+                    &format!("{prefix}.self_attn.k_proj.weight"),
+                    self.config.num_key_value_heads * self.config.head_dim,
+                    self.config.hidden_size,
+                    &hidden_states,
+                )?
+            } else {
+                self.matvec_f16_resolved(
+                    &format!("{prefix}.self_attn.k_proj.weight"),
+                    &hidden_states,
+                )?
+            };
+            let v = if use_attention_qkv {
+                session.run_projection(
+                    &format!("{prefix}.self_attn.v_proj.weight"),
+                    self.config.num_key_value_heads * self.config.head_dim,
+                    self.config.hidden_size,
+                    &hidden_states,
+                )?
+            } else {
+                self.matvec_f16_resolved(
+                    &format!("{prefix}.self_attn.v_proj.weight"),
+                    &hidden_states,
+                )?
+            };
+            metrics.qkv_duration += started_at.elapsed();
+
+            let started_at = Instant::now();
+            let q_norm_weight =
+                self.load_vector_f32_resolved(&format!("{prefix}.self_attn.q_norm.weight"))?;
+            let k_norm_weight =
+                self.load_vector_f32_resolved(&format!("{prefix}.self_attn.k_norm.weight"))?;
+            apply_head_rms_norm_weighted(
+                &mut q,
+                self.config.num_attention_heads,
+                self.config.head_dim,
+                &q_norm_weight,
+                self.config.rms_norm_eps as f32,
+            );
+            apply_head_rms_norm_weighted(
+                &mut k,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+                &k_norm_weight,
+                self.config.rms_norm_eps as f32,
+            );
+            apply_rotary_single(
+                &mut q,
+                &mut k,
+                &cos,
+                &sin,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+            );
+            metrics.norm_duration += started_at.elapsed();
+
+            let started_at = Instant::now();
+            let attn = attention_single_query(
+                &q,
+                &k,
+                &v,
+                1,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+            );
+            let attn_output =
+                self.matvec_f16_resolved(&format!("{prefix}.self_attn.o_proj.weight"), &attn)?;
+            hidden = residual
+                .iter()
+                .zip(attn_output.iter())
+                .map(|(left, right)| left + right)
+                .collect();
+            metrics.attention_duration += started_at.elapsed();
+
+            let residual = hidden.clone();
+            let started_at = Instant::now();
+            let post_norm_weight = self
+                .load_vector_f32_resolved(&format!("{prefix}.post_attention_layernorm.weight"))?;
+            hidden_states =
+                weighted_rms_norm(&hidden, &post_norm_weight, self.config.rms_norm_eps as f32);
+            metrics.norm_duration += started_at.elapsed();
+
+            let started_at = Instant::now();
+            let gate = if use_mlp_gu {
+                session.run_projection(
+                    &format!("{prefix}.mlp.gate_proj.weight"),
+                    self.config.intermediate_size,
+                    self.config.hidden_size,
+                    &hidden_states,
+                )?
+            } else {
+                self.matvec_f16_resolved(&format!("{prefix}.mlp.gate_proj.weight"), &hidden_states)?
+            };
+            let up = if use_mlp_gu {
+                session.run_projection(
+                    &format!("{prefix}.mlp.up_proj.weight"),
+                    self.config.intermediate_size,
+                    self.config.hidden_size,
+                    &hidden_states,
+                )?
+            } else {
+                self.matvec_f16_resolved(&format!("{prefix}.mlp.up_proj.weight"), &hidden_states)?
+            };
+            let mlp = swiglu(&gate, &up);
+            let down = self.matvec_f16_resolved(&format!("{prefix}.mlp.down_proj.weight"), &mlp)?;
+            hidden = residual
+                .iter()
+                .zip(down.iter())
+                .map(|(left, right)| left + right)
+                .collect();
+            metrics.mlp_duration += started_at.elapsed();
+        }
+
+        if include_logits {
+            let started_at = Instant::now();
+            let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
+            hidden =
+                weighted_rms_norm(&hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
+            metrics.norm_duration += started_at.elapsed();
+
+            let started_at = Instant::now();
+            let _ = self
+                .weights
+                .matvec_f16("model.embed_tokens.weight", &hidden)?;
+            metrics.logits_duration += started_at.elapsed();
+        }
+
+        let mut enabled = String::new();
+        if use_attention_qkv {
+            enabled.push_str("qkv");
+        }
+        if use_mlp_gu {
+            if !enabled.is_empty() {
+                enabled.push('+');
+            }
+            enabled.push_str("gu");
+        }
+        if enabled.is_empty() {
+            enabled.push_str("dense");
+        }
+
+        Ok((
+            hidden,
+            PackedDecodeMetrics {
+                enabled_projections: enabled,
+                total_duration: total_started.elapsed(),
+                pack_duration: session.metrics.pack_duration,
+                compile_duration: session.metrics.compile_duration,
+                upload_duration: session.metrics.upload_duration,
+                gpu_duration: session.metrics.gpu_duration,
+                download_duration: session.metrics.download_duration,
+                pack_cache_hits: session.metrics.pack_cache_hits,
+                gpu_cache_hits: session.metrics.gpu_cache_hits,
+                dispatch_count: session.metrics.dispatch_count,
+                upload_bytes: session.metrics.upload_bytes,
+                download_bytes: session.metrics.download_bytes,
+                output_text: String::new(),
+            },
+        ))
+    }
+
     pub fn benchmark_packed_decode(
         &self,
         prompt: &str,

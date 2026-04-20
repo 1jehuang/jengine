@@ -1,4 +1,4 @@
-use jengine::runtime::reference::{PackedDecodeMetrics, ReferenceModel};
+use jengine::runtime::reference::ReferenceModel;
 use std::io::{self, Write};
 use std::sync::{
     Arc,
@@ -38,8 +38,15 @@ fn run_stage<T>(name: &str, op: impl FnOnce() -> T) -> T {
     result
 }
 
-fn render(label: &str, metrics: &PackedDecodeMetrics) -> String {
-    format!("variant={label} {}", metrics.summarize())
+fn parse_prompt_ids(raw: &str) -> Vec<usize> {
+    raw.split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            part.trim()
+                .parse::<usize>()
+                .expect("prompt token ids must be integers")
+        })
+        .collect()
 }
 
 fn main() {
@@ -49,15 +56,15 @@ fn main() {
     let artifact_dir = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "/home/jeremy/jengine/.artifacts/jengine-packed-model".to_string());
-    let prompt = std::env::args()
-        .nth(3)
-        .unwrap_or_else(|| "hello".to_string());
-    let max_new_tokens = std::env::args()
-        .nth(4)
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(1);
-    let variant = std::env::args().nth(5).unwrap_or_else(|| "all".to_string());
-    let out_path = std::env::args().nth(6);
+    let prompt_ids_raw = std::env::args().nth(3).unwrap_or_else(|| "42".to_string());
+    let variant = std::env::args().nth(4).unwrap_or_else(|| "all".to_string());
+    let out_path = std::env::args().nth(5);
+
+    let prompt_ids = parse_prompt_ids(&prompt_ids_raw);
+    assert!(
+        !prompt_ids.is_empty(),
+        "prompt token id list cannot be empty"
+    );
 
     let run_dense = variant == "all" || variant == "dense";
     let dense_model = if run_dense {
@@ -74,45 +81,41 @@ fn main() {
 
     let mut lines = Vec::new();
     if let Some(dense_model) = &dense_model {
-        let dense = run_stage("dense_decode", || {
+        let dense = run_stage("dense_step", || {
             dense_model
-                .generate_greedy(&prompt, max_new_tokens)
-                .expect("dense decode should succeed")
+                .benchmark_dense_step_from_token_ids(&prompt_ids)
+                .expect("dense step should succeed")
         });
-        lines.push(format!(
-            "dense={} output={}",
-            dense.metrics.summarize(),
-            dense.output_text,
-        ));
+        lines.push(format!("variant=dense {}", dense.summarize()));
     }
     if variant == "attention" || variant == "all" {
-        let attention_only = run_stage("packed_attention_decode", || {
+        let metrics = run_stage("packed_attention_step", || {
             packed_model
-                .benchmark_packed_decode(&prompt, max_new_tokens, true, false)
-                .expect("packed attention decode should succeed")
+                .benchmark_packed_step_from_token_ids(&prompt_ids, true, false)
+                .expect("packed attention step should succeed")
         });
-        lines.push(render("qkv", &attention_only));
+        lines.push(format!("variant=attention {}", metrics.summarize()));
     }
     if variant == "mlp" || variant == "all" {
-        let mlp_only = run_stage("packed_mlp_decode", || {
+        let metrics = run_stage("packed_mlp_step", || {
             packed_model
-                .benchmark_packed_decode(&prompt, max_new_tokens, false, true)
-                .expect("packed mlp decode should succeed")
+                .benchmark_packed_step_from_token_ids(&prompt_ids, false, true)
+                .expect("packed mlp step should succeed")
         });
-        lines.push(render("gu", &mlp_only));
+        lines.push(format!("variant=mlp {}", metrics.summarize()));
     }
     if variant == "combined" || variant == "all" {
-        let combined = run_stage("packed_combined_decode", || {
+        let metrics = run_stage("packed_combined_step", || {
             packed_model
-                .benchmark_packed_decode(&prompt, max_new_tokens, true, true)
-                .expect("packed combined decode should succeed")
+                .benchmark_packed_step_from_token_ids(&prompt_ids, true, true)
+                .expect("packed combined step should succeed")
         });
-        lines.push(render("qkv+gu", &combined));
+        lines.push(format!("variant=combined {}", metrics.summarize()));
     }
 
     let summary = format!("{}\n", lines.join("\n"));
     if let Some(out_path) = out_path {
-        std::fs::write(&out_path, &summary).expect("packed decode summary should write");
+        std::fs::write(&out_path, &summary).expect("step benchmark summary should write");
     }
     print!("{summary}");
 }

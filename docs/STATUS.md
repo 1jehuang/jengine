@@ -43,6 +43,15 @@ Jengine can now:
 
 ## Latest measured highlights
 
+### Packed benchmark harnesses now capture cleanly
+From the latest real packed-artifact release runs:
+
+- all-layer attention `qkv` sweep: `2038.344 ms`
+- all-layer MLP `gu` sweep: `1827.961 ms`
+- all-layer combined `qkv + gu` sweep: `3866.305 ms`
+- one-token packed combined step: `10359.618 ms`
+- one-token packed combined full-span prefill: `10258.111 ms`
+
 ### Cached q_proj warm hybrid vs dense
 From the latest real one-token run:
 
@@ -57,22 +66,24 @@ From the latest real one-token run:
 
 ## Current bottlenecks
 
-1. MLP is still a major remaining cost center
-2. Only q_proj is currently offloaded in the hybrid runtime path
-3. The rest of attention-side projections still run on CPU
-4. Upload and compute costs are now visible after removing repack and compile costs
+1. Host-side orchestration and per-dispatch overhead dominate the current packed step and prefill paths
+2. MLP is still a major remaining cost center on the dense side
+3. Compile cost is still large for first-pass all-layer sweeps, even though intra-run shape reuse helps
+4. Raw GPU upload, compute, and download time are much smaller than total packed wall time
 
 ## Best next step
 
 The most valuable next milestone is:
 
-- extend cached packed GPU offload to `k_proj`, `v_proj`, and `o_proj`
-- benchmark projection mixes like `q`, `qkv`, and `qkvo`
-- then expand into MLP projections
+- reduce dispatch count and host-side launch overhead in the packed decode path
+- batch more work per submission or per layer where correctness allows
+- reuse compiled pipelines and runner state more aggressively across end-to-end decode steps
+- only after that, re-measure short-context packed tok/s and decide whether to broaden the offload surface further
 
 ## Success bar for next milestone
 
 Reach at least:
 
-- **<= 4.0 s** total for a one-token cached attention-only hybrid run
-- **>= 0.25 tok/s** generated throughput
+- **<= 6.0 s** total for a one-token packed combined step on the current packed-artifact path
+- **<= 6.0 s** total for a one-token packed combined full-span prefill benchmark
+- clear reduction in dispatch count and host-side overhead share versus the current `140` dispatch combined path

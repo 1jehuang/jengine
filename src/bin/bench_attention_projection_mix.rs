@@ -14,6 +14,11 @@ fn flush_progress(message: &str) {
 
 fn run_stage<T>(name: &str, op: impl FnOnce() -> T) -> T {
     flush_progress(&format!("phase={name}:start"));
+    if std::env::var_os("JENGINE_NO_HEARTBEAT").is_some() {
+        let result = op();
+        flush_progress(&format!("phase={name}:done"));
+        return result;
+    }
     let done = Arc::new(AtomicBool::new(false));
     let done_worker = done.clone();
     let stage_name = name.to_string();
@@ -41,41 +46,50 @@ fn main() {
     let root = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "/home/jeremy/models/bonsai-1.7b".to_string());
+    let artifact_dir = std::env::args().nth(2);
     let layer_idx = std::env::args()
-        .nth(2)
+        .nth(3)
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0);
     let token_id = std::env::args()
-        .nth(3)
+        .nth(4)
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(42);
-    let out_path = std::env::args().nth(4);
+    let variant = std::env::args().nth(5).unwrap_or_else(|| "all".to_string());
+    let out_path = std::env::args().nth(6);
 
-    let model = run_stage("load_model", || {
-        ReferenceModel::load_from_root(&root).expect("reference model should load")
+    let model = run_stage("load_model", || match artifact_dir.as_deref() {
+        Some(dir) => ReferenceModel::load_from_root_with_packed_artifact(&root, dir)
+            .expect("packed reference model should load"),
+        None => ReferenceModel::load_from_root(&root).expect("reference model should load"),
     });
-    let q = run_stage("variant_q", || {
-        model
-            .benchmark_attention_projection_mix(layer_idx, token_id, true, false, false, false)
-            .expect("q-only variant should succeed")
-    });
-    let qkv = run_stage("variant_qkv", || {
-        model
-            .benchmark_attention_projection_mix(layer_idx, token_id, true, true, true, false)
-            .expect("qkv variant should succeed")
-    });
-    let qkvo = run_stage("variant_qkvo", || {
-        model
-            .benchmark_attention_projection_mix(layer_idx, token_id, true, true, true, true)
-            .expect("qkvo variant should succeed")
-    });
+    let mut lines = Vec::new();
+    if variant == "q" || variant == "all" {
+        let q = run_stage("variant_q", || {
+            model
+                .benchmark_attention_projection_mix(layer_idx, token_id, true, false, false, false)
+                .expect("q-only variant should succeed")
+        });
+        lines.push(render("q", &q));
+    }
+    if variant == "qkv" || variant == "all" {
+        let qkv = run_stage("variant_qkv", || {
+            model
+                .benchmark_attention_projection_mix(layer_idx, token_id, true, true, true, false)
+                .expect("qkv variant should succeed")
+        });
+        lines.push(render("qkv", &qkv));
+    }
+    if variant == "qkvo" || variant == "all" {
+        let qkvo = run_stage("variant_qkvo", || {
+            model
+                .benchmark_attention_projection_mix(layer_idx, token_id, true, true, true, true)
+                .expect("qkvo variant should succeed")
+        });
+        lines.push(render("qkvo", &qkvo));
+    }
 
-    let summary = format!(
-        "{}\n{}\n{}\n",
-        render("q", &q),
-        render("qkv", &qkv),
-        render("qkvo", &qkvo)
-    );
+    let summary = format!("{}\n", lines.join("\n"));
     if let Some(out_path) = out_path {
         std::fs::write(&out_path, &summary).expect("attention mix summary should write");
     }

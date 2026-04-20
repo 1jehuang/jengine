@@ -14,6 +14,11 @@ fn flush_progress(message: &str) {
 
 fn run_stage<T>(name: &str, op: impl FnOnce() -> T) -> T {
     flush_progress(&format!("phase={name}:start"));
+    if std::env::var_os("JENGINE_NO_HEARTBEAT").is_some() {
+        let result = op();
+        flush_progress(&format!("phase={name}:done"));
+        return result;
+    }
     let done = Arc::new(AtomicBool::new(false));
     let done_worker = done.clone();
     let stage_name = name.to_string();

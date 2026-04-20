@@ -298,6 +298,152 @@ Current interpretation:
   - cached runner initialization footprint across more projections
   - transfer / execution overhead once more projections participate
 
+## Packed layer sweep baselines
+
+### Real all-layer packed projection sweep
+
+Command shape:
+
+```bash
+env JENGINE_NO_HEARTBEAT=1 ./target/release/bench_packed_layer_sweep \
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model 42
+```
+
+Observed sample:
+
+- attention `qkv` over all 28 layers:
+  - total: `2038.344 ms`
+  - pack: `0.000 ms`
+  - compile: `1350.200 ms`
+  - upload: `15.630 ms`
+  - gpu: `114.352 ms`
+  - download: `4.856 ms`
+  - max abs diff: `0.094574`
+- MLP `gu` over all 28 layers:
+  - total: `1827.961 ms`
+  - pack: `0.000 ms`
+  - compile: `751.991 ms`
+  - upload: `32.522 ms`
+  - gpu: `165.853 ms`
+  - download: `8.977 ms`
+  - max abs diff: `0.168579`
+- combined `qkv + gu` over all 28 layers:
+  - total: `3866.305 ms`
+  - pack: `0.000 ms`
+  - compile: `2102.191 ms`
+  - upload: `48.151 ms`
+  - gpu: `280.205 ms`
+  - download: `13.833 ms`
+
+Current interpretation:
+
+- compile cost still dominates the first full-layer sweep, even with persistent packed artifacts
+- raw GPU execution plus transfer time is much smaller than total wall time in this first-pass sweep
+- the next performance win should come from stronger pipeline reuse across benchmark phases and decode steps
+
+## Packed step-id baselines
+
+### Real one-token token-id packed step comparison
+
+Command shape:
+
+```bash
+env JENGINE_NO_HEARTBEAT=1 ./target/release/bench_packed_step_ids \
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model 42 <variant> .artifacts/step_ids_<variant>.txt
+```
+
+Observed samples:
+
+- dense one-token step:
+  - total: `1599.766 ms`
+  - embed: `0.008 ms`
+  - norm: `8.013 ms`
+  - qkv: `383.907 ms`
+  - attention: `80.507 ms`
+  - mlp: `924.377 ms`
+  - logits: `202.766 ms`
+- packed attention `qkv` step:
+  - total: `17771.496 ms`
+  - compile: `122.139 ms`
+  - upload: `16.057 ms`
+  - gpu: `109.337 ms`
+  - download: `3.969 ms`
+  - gpu cache hits: `82`
+  - dispatches: `84`
+  - upload bytes: `66404352`
+  - download bytes: `458752`
+- packed MLP `gu` step:
+  - total: `11816.556 ms`
+  - compile: `52.621 ms`
+  - upload: `35.406 ms`
+  - gpu: `178.836 ms`
+  - download: `8.309 ms`
+  - gpu cache hits: `55`
+  - dispatches: `56`
+  - upload bytes: `198410240`
+  - download bytes: `1376256`
+- packed combined `qkv + gu` step:
+  - total: `10359.618 ms`
+  - compile: `72.471 ms`
+  - upload: `58.044 ms`
+  - gpu: `282.698 ms`
+  - download: `18.571 ms`
+  - gpu cache hits: `137`
+  - dispatches: `140`
+  - upload bytes: `264814592`
+  - download bytes: `1835008`
+
+Current interpretation:
+
+- lower-level packed projection execution is working, but end-to-end one-token packed step latency is still much worse than dense
+- the packed combined step is materially better than packed attention-only or packed MLP-only in this benchmark, but still far from competitive overall
+- host-side orchestration and per-dispatch overhead now look like the main bottleneck in the packed step path
+
+## Packed prefill chunk baselines
+
+### Real full-span packed prefill chunk comparison
+
+Command shape:
+
+```bash
+env JENGINE_NO_HEARTBEAT=1 ./target/release/bench_packed_prefill_chunk \
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model 42 0 28 <variant> - - \
+  .artifacts/prefill_<variant>_full.txt 1
+```
+
+Observed samples:
+
+- packed attention `qkv` full-span prefill:
+  - total: `18730.666 ms`
+  - compile: `29.374 ms`
+  - upload: `16.616 ms`
+  - gpu: `107.570 ms`
+  - download: `5.592 ms`
+  - gpu cache hits: `82`
+  - dispatches: `84`
+- packed MLP `gu` full-span prefill:
+  - total: `11987.256 ms`
+  - compile: `45.577 ms`
+  - upload: `36.469 ms`
+  - gpu: `181.333 ms`
+  - download: `8.122 ms`
+  - gpu cache hits: `55`
+  - dispatches: `56`
+- packed combined `qkv + gu` full-span prefill:
+  - total: `10258.111 ms`
+  - compile: `84.826 ms`
+  - upload: `57.067 ms`
+  - gpu: `283.962 ms`
+  - download: `16.414 ms`
+  - gpu cache hits: `137`
+  - dispatches: `140`
+
+Current interpretation:
+
+- chunk-level prefill results closely track the step-id benchmark and confirm the same ranking: combined is best among the packed variants tested here
+- compile time is no longer the dominant cost in the chunk benchmark once runner shapes are reused within a single run
+- the remaining gap is overwhelmingly outside raw GPU kernel time, so future optimization should target batching, fewer dispatches, and less host-side work
+
 ## Packed model artifact baselines
 
 ### Real Bonsai packed artifact creation
@@ -358,6 +504,8 @@ For apples-to-apples future comparisons, prefer the release workflow in `docs/RE
 Recent important improvement: memory-mapped weight loading reduced real-model startup overhead enough for the cached hybrid q_proj benchmark path to become observable in this harness.
 
 Recent important caution: the first broader `qkv + gu` hybrid decode benchmark is slightly slower than dense, so the next optimization pass should focus on reducing aggregate multi-projection overhead before adding more decode-path complexity.
+
+Recent important packed-runtime result: new all-layer sweep, token-id step, and full-span prefill benchmarks now capture cleanly with packed artifacts and show that compile cost can be reduced within a single run, but total packed wall time is still dominated by host-side orchestration rather than raw GPU execution.
 
 Recent important artifact result: the real Bonsai packed artifact flow now achieves about **7.11x size reduction** against source safetensors while keeping aggregate validation error very low (`max_abs_diff` about `0.000977`).
 
