@@ -129,6 +129,23 @@ pub fn run_packed_ternary_matvec_with_output(
     Ok((output, report))
 }
 
+pub fn run_packed_ternary_matvec_raw_f32_with_output(
+    code_words: &[u32],
+    scales: &[f32],
+    group_size: usize,
+    rows: usize,
+    cols: usize,
+    input: &[f32],
+    reference: Option<&[f32]>,
+) -> Result<(Vec<f32>, GpuPackedMatvecReport), GpuPackedMatvecError> {
+    let (mut runner, compile_duration) = CachedGpuPackedMatvecRunner::new_raw_f32_input(
+        code_words, scales, group_size, rows, cols,
+    )?;
+    let (output, mut report) = runner.run_with_output(input, reference)?;
+    report.compile_duration = compile_duration;
+    Ok((output, report))
+}
+
 pub struct SharedGpuPackedContext {
     _entry: Entry,
     instance: Instance,
@@ -136,6 +153,12 @@ pub struct SharedGpuPackedContext {
     queue: vk::Queue,
     physical_device: vk::PhysicalDevice,
     queue_family_index: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedRunnerInputMode {
+    PackedHalfPairs,
+    RawF32,
 }
 
 impl SharedGpuPackedContext {
@@ -200,6 +223,7 @@ pub struct CachedGpuPackedMatvecRunner {
     cols: usize,
     group_size: usize,
     packed_cols: usize,
+    input_mode: PackedRunnerInputMode,
     workgroup_size: u32,
     descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
@@ -267,6 +291,25 @@ impl CachedGpuPackedMatvecRunner {
         Self::new_with_context(context, code_words, scales, group_size, rows, cols)
     }
 
+    pub fn new_raw_f32_input(
+        code_words: &[u32],
+        scales: &[f32],
+        group_size: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Self, Duration), GpuPackedMatvecError> {
+        let context = SharedGpuPackedContext::new()?;
+        Self::new_with_context_and_input_mode(
+            context,
+            code_words,
+            scales,
+            group_size,
+            rows,
+            cols,
+            PackedRunnerInputMode::RawF32,
+        )
+    }
+
     pub fn new_with_context(
         context: Arc<SharedGpuPackedContext>,
         code_words: &[u32],
@@ -275,6 +318,26 @@ impl CachedGpuPackedMatvecRunner {
         rows: usize,
         cols: usize,
     ) -> Result<(Self, Duration), GpuPackedMatvecError> {
+        Self::new_with_context_and_input_mode(
+            context,
+            code_words,
+            scales,
+            group_size,
+            rows,
+            cols,
+            PackedRunnerInputMode::PackedHalfPairs,
+        )
+    }
+
+    pub fn new_with_context_and_input_mode(
+        context: Arc<SharedGpuPackedContext>,
+        code_words: &[u32],
+        scales: &[f32],
+        group_size: usize,
+        rows: usize,
+        cols: usize,
+        input_mode: PackedRunnerInputMode,
+    ) -> Result<(Self, Duration), GpuPackedMatvecError> {
         let compile_started = Instant::now();
 
         let instance = context.instance.clone();
@@ -282,11 +345,18 @@ impl CachedGpuPackedMatvecRunner {
         let queue = context.queue;
         let physical_device = context.physical_device;
         let queue_family_index = context.queue_family_index;
-        let (shader_source, workgroup_size) = context.shader_choice();
+        let (shader_source, workgroup_size) = match input_mode {
+            PackedRunnerInputMode::PackedHalfPairs => context.shader_choice(),
+            PackedRunnerInputMode::RawF32 => ("shaders/packed_ternary_matvec_f32_input.comp", 64),
+        };
         let shader_path = compile_shader(Path::new(shader_source))?;
 
         let packed_cols = cols.div_ceil(2);
         let output_bytes = rows * std::mem::size_of::<f32>();
+        let vector_bytes = match input_mode {
+            PackedRunnerInputMode::PackedHalfPairs => packed_cols * 4,
+            PackedRunnerInputMode::RawF32 => cols * std::mem::size_of::<f32>(),
+        };
         let code_buffer = create_host_visible_buffer(
             &instance,
             &device,
@@ -305,7 +375,7 @@ impl CachedGpuPackedMatvecRunner {
             &instance,
             &device,
             physical_device,
-            (packed_cols * 4) as u64,
+            vector_bytes as u64,
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
         let output_buffer = create_host_visible_buffer(
@@ -317,7 +387,7 @@ impl CachedGpuPackedMatvecRunner {
         )?;
         write_u32_buffer(&code_buffer, code_words)?;
         write_f32_buffer(&scale_buffer, scales)?;
-        zero_buffer(&vector_buffer, packed_cols * 4)?;
+        zero_buffer(&vector_buffer, vector_bytes)?;
         zero_buffer(&output_buffer, output_bytes)?;
 
         let descriptor_layout_bindings = [
@@ -445,6 +515,7 @@ impl CachedGpuPackedMatvecRunner {
             cols,
             group_size,
             packed_cols,
+            input_mode,
             workgroup_size,
             descriptor_set_layout,
             pipeline_layout,
@@ -499,6 +570,27 @@ impl CachedGpuPackedMatvecRunner {
             group_size,
             rows,
             cols,
+        )
+    }
+
+    pub fn new_uninitialized_raw_f32_input_with_context(
+        context: Arc<SharedGpuPackedContext>,
+        code_word_len: usize,
+        scale_len: usize,
+        group_size: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Self, Duration), GpuPackedMatvecError> {
+        let zero_code_words = vec![0u32; code_word_len];
+        let zero_scales = vec![0.0f32; scale_len];
+        Self::new_with_context_and_input_mode(
+            context,
+            &zero_code_words,
+            &zero_scales,
+            group_size,
+            rows,
+            cols,
+            PackedRunnerInputMode::RawF32,
         )
     }
 
@@ -597,19 +689,33 @@ impl CachedGpuPackedMatvecRunner {
                 self.cols
             )));
         }
-        let vector_words = pack_f16_pairs(input);
-        if vector_words.len() != self.packed_cols {
-            return Err(GpuPackedMatvecError::Shape(format!(
-                "packed input length {} does not match packed cols {}",
-                vector_words.len(),
-                self.packed_cols
-            )));
+        match self.input_mode {
+            PackedRunnerInputMode::PackedHalfPairs => {
+                let vector_words = pack_f16_pairs(input);
+                if vector_words.len() != self.packed_cols {
+                    return Err(GpuPackedMatvecError::Shape(format!(
+                        "packed input length {} does not match packed cols {}",
+                        vector_words.len(),
+                        self.packed_cols
+                    )));
+                }
+                let upload_started = Instant::now();
+                write_u32_buffer(&self.vector_buffer, &vector_words)?;
+                let upload_duration = upload_started.elapsed();
+                let gpu_duration = self.submit_and_wait()?;
+                Ok((upload_duration, gpu_duration))
+            }
+            PackedRunnerInputMode::RawF32 => {
+                let upload_started = Instant::now();
+                write_f32_buffer(&self.vector_buffer, input)?;
+                let upload_duration = upload_started.elapsed();
+                let gpu_duration = self.submit_and_wait()?;
+                Ok((upload_duration, gpu_duration))
+            }
         }
+    }
 
-        let upload_started = Instant::now();
-        write_u32_buffer(&self.vector_buffer, &vector_words)?;
-        let upload_duration = upload_started.elapsed();
-
+    fn submit_and_wait(&self) -> Result<Duration, GpuPackedMatvecError> {
         let submit_info = [
             vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer))
         ];
@@ -622,8 +728,7 @@ impl CachedGpuPackedMatvecRunner {
                 .queue_submit(self.queue, &submit_info, self.fence)?;
             self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
         }
-        let gpu_duration = gpu_started.elapsed();
-        Ok((upload_duration, gpu_duration))
+        Ok(gpu_started.elapsed())
     }
 
     fn record_command_buffer(&self) -> Result<(), GpuPackedMatvecError> {

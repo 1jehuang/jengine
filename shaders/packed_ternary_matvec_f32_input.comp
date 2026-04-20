@@ -1,0 +1,55 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer CodeBuffer {
+    uint code_words[];
+};
+
+layout(std430, binding = 1) readonly buffer ScaleBuffer {
+    float scales[];
+};
+
+layout(std430, binding = 2) readonly buffer VectorBuffer {
+    float input_data[];
+};
+
+layout(std430, binding = 3) writeonly buffer OutputBuffer {
+    float output_data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+    uint group_size;
+    uint packed_cols;
+} pc;
+
+float ternary_value(uint element_index) {
+    uint word_index = element_index / 16u;
+    uint bit_shift = (element_index % 16u) * 2u;
+    uint code = (code_words[word_index] >> bit_shift) & 0x3u;
+    float scale = scales[element_index / pc.group_size];
+    if (code == 1u) {
+        return scale;
+    }
+    if (code == 2u) {
+        return -scale;
+    }
+    return 0.0;
+}
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+
+    float sum = 0.0;
+    uint row_start = row * pc.cols;
+    for (uint col = 0u; col < pc.cols; ++col) {
+        float m = ternary_value(row_start + col);
+        sum += m * input_data[col];
+    }
+    output_data[row] = sum;
+}
