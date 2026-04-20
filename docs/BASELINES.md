@@ -478,6 +478,7 @@ Current interpretation:
 - the subgroup-row win does survive into the broader packed path
 - but only as about a **`2.7%`** total upper-bound improvement in the current chunked combined capture
 - that gap between microbenchmark win and end-to-end win reinforces that dense-side work still dominates the current packed runtime
+- packed-artifact `generate_greedy` now routes into the packed decode path automatically, which means the packed-first runtime is now the default generation path for packed-artifact models rather than only an opt-in benchmark helper
 
 ## Chunked packed capture workarounds
 

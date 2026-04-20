@@ -200,6 +200,12 @@ Compared with the earlier default-shader chunked combined upper bound:
 
 So the kernel-level win is real and it does survive upward, but only as about a **`2.7%`** total upper-bound improvement in this current broader packed path because dense-side work still dominates.
 
+### Packed-first generation is now the default control path for packed-artifact models
+
+The packed-artifact `generate_greedy` / `generate_from_token_ids` path no longer falls back through the dense-style reference loop. It now routes into the packed decode path automatically when a packed model artifact is loaded.
+
+That means the packed-first runtime is no longer just an opt-in helper or benchmark path. It is now the default generation control flow for packed-artifact models in the runtime.
+
 ### Cached q_proj warm hybrid vs dense
 
 From the latest real one-token run:
@@ -226,7 +232,8 @@ From the latest real one-token run:
 9. The Intel Lunar Lake Vulkan stack does expose cooperative matrix, integer dot, subgroup size control, and float16/int8 features, so an Xe2-oriented kernel path is plausible and worth active investigation
 10. A simple subgroup-aligned `32`-thread local-size tweak was effectively a wash, but a larger subgroup-row rewrite improved the real 2048x2048 packed `q_proj` microbenchmark from `1.249 ms` to `0.556 ms` median GPU time, about `2.25x` faster, and this Lunar Lake machine now auto-selects that faster path by default
 11. Carrying that subgroup-row shader into the chunked combined packed path reduced the reconstructed upper bound from `12212.554 ms` to `11885.064 ms`, only about `2.7%` total, which confirms that dense-side work is still the main limiter
-12. The next meaningful wins now come from carrying that kind of kernel-level win through more of the broader runtime while still reducing dense-side work and synchronization overhead
+12. Packed-artifact `generate_greedy` now routes into the packed decode path automatically, so the packed-first runtime is no longer just benchmark-only infrastructure
+13. The next meaningful wins now come from carrying that kind of kernel-level win through more of the broader runtime while still reducing dense-side work and synchronization overhead
 
 ## Best next step
 

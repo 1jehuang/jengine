@@ -461,6 +461,7 @@ impl PackedDecodeMetrics {
 pub struct PackedDecodeResult {
     pub output_token_ids: Vec<usize>,
     pub output_text: String,
+    pub decode_metrics: DecodeMetrics,
     pub metrics: PackedDecodeMetrics,
 }
 
@@ -1135,6 +1136,16 @@ impl ReferenceModel {
             return Err(ReferenceError::Decode(
                 "prompt_ids cannot be empty".to_string(),
             ));
+        }
+
+        if self.packed_model.is_some() {
+            let packed =
+                self.generate_packed_from_token_ids(prompt_ids, max_new_tokens, true, true)?;
+            return Ok(DecodeResult {
+                output_token_ids: packed.output_token_ids,
+                output_text: packed.output_text,
+                metrics: packed.decode_metrics,
+            });
         }
 
         let started_at = Instant::now();
@@ -2599,6 +2610,7 @@ impl ReferenceModel {
         Ok(PackedDecodeResult {
             output_token_ids: output_ids,
             output_text,
+            decode_metrics: metrics,
             metrics: packed_metrics,
         })
     }
