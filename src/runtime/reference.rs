@@ -282,6 +282,7 @@ struct LayerTensorNames {
 
 type CachedProjectionGpuRunner = Rc<RefCell<CachedGpuPackedMatvecRunner>>;
 type CachedProjectionGpuCacheEntry = (CachedProjectionGpuRunner, Duration, Duration, bool);
+type ProjectionTripletOutputs = (Vec<f32>, Vec<f32>, Vec<f32>);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttentionProjectionMixMetrics {
@@ -599,6 +600,70 @@ impl<'a> PackedGpuSession<'a> {
 
         let (first, second) = combined.split_at(first_rows);
         Ok((first.to_vec(), second.to_vec()))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn run_projection_triplet(
+        &mut self,
+        first_name: &str,
+        first_rows: usize,
+        second_name: &str,
+        second_rows: usize,
+        third_name: &str,
+        third_rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Result<ProjectionTripletOutputs, ReferenceError> {
+        let triplet_key = format!("concat::{first_name}||{second_name}||{third_name}");
+        let (packed, pack_duration, pack_cache_hit) =
+            self.model.get_or_create_projection_triplet_cache(
+                &triplet_key,
+                first_name,
+                first_rows,
+                second_name,
+                second_rows,
+                third_name,
+                third_rows,
+                cols,
+            )?;
+        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu(&triplet_key, &packed)?;
+        self.metrics.pack_duration += pack_duration;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.weight_upload_duration += weight_upload_duration;
+        self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+
+        let (combined, report) =
+            runner
+                .borrow_mut()
+                .run_with_output(input, None)
+                .map_err(|error| {
+                    ReferenceError::Decode(format!(
+                        "gpu projection failed for {first_name}+{second_name}+{third_name}: {error}"
+                    ))
+                })?;
+        self.metrics.activation_upload_duration += report.upload_duration;
+        self.metrics.upload_duration += weight_upload_duration + report.upload_duration;
+        self.metrics.gpu_duration += report.gpu_duration;
+        self.metrics.download_duration += report.download_duration;
+        self.metrics.dispatch_count += 1;
+        let weight_bytes = packed.code_words.len() * std::mem::size_of::<u32>()
+            + packed.scales.len() * std::mem::size_of::<f32>();
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        if !gpu_cache_hit {
+            self.metrics.weight_upload_bytes += weight_bytes;
+        }
+        self.metrics.activation_upload_bytes += activation_upload_bytes;
+        self.metrics.upload_bytes +=
+            usize::from(!gpu_cache_hit) * weight_bytes + activation_upload_bytes;
+        self.metrics.download_bytes +=
+            (first_rows + second_rows + third_rows) * std::mem::size_of::<f32>();
+
+        let (first, tail) = combined.split_at(first_rows);
+        let (second, third) = tail.split_at(second_rows);
+        Ok((first.to_vec(), second.to_vec(), third.to_vec()))
     }
 }
 
@@ -1363,6 +1428,75 @@ impl ReferenceModel {
         Ok((packed, first_duration + second_duration, false))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn get_or_create_projection_triplet_cache(
+        &self,
+        cache_key: &str,
+        first_name: &str,
+        first_rows: usize,
+        second_name: &str,
+        second_rows: usize,
+        third_name: &str,
+        third_rows: usize,
+        cols: usize,
+    ) -> Result<(Rc<PackedProjectionCache>, Duration, bool), ReferenceError> {
+        if let Some(cached) = self
+            .cached_projection_packed
+            .borrow()
+            .get(cache_key)
+            .cloned()
+        {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let (first, first_duration, _) =
+            self.get_or_create_projection_cache(first_name, first_rows, cols)?;
+        let (second, second_duration, _) =
+            self.get_or_create_projection_cache(second_name, second_rows, cols)?;
+        let (third, third_duration, _) =
+            self.get_or_create_projection_cache(third_name, third_rows, cols)?;
+
+        if first.cols != second.cols || first.cols != third.cols {
+            return Err(ReferenceError::Decode(format!(
+                "cannot concatenate packed projections with different column counts: {first_name}={}, {second_name}={}, {third_name}={}",
+                first.cols, second.cols, third.cols
+            )));
+        }
+        if first.group_size != second.group_size || first.group_size != third.group_size {
+            return Err(ReferenceError::Decode(format!(
+                "cannot concatenate packed projections with different group sizes: {first_name}={}, {second_name}={}, {third_name}={}",
+                first.group_size, second.group_size, third.group_size
+            )));
+        }
+
+        let mut code_words = Vec::with_capacity(
+            first.code_words.len() + second.code_words.len() + third.code_words.len(),
+        );
+        code_words.extend_from_slice(&first.code_words);
+        code_words.extend_from_slice(&second.code_words);
+        code_words.extend_from_slice(&third.code_words);
+        let mut scales =
+            Vec::with_capacity(first.scales.len() + second.scales.len() + third.scales.len());
+        scales.extend_from_slice(&first.scales);
+        scales.extend_from_slice(&second.scales);
+        scales.extend_from_slice(&third.scales);
+
+        let packed = Rc::new(PackedProjectionCache {
+            rows: first.rows + second.rows + third.rows,
+            cols: first.cols,
+            group_size: first.group_size,
+            code_words,
+            scales,
+        });
+        self.cached_projection_packed
+            .borrow_mut()
+            .insert(cache_key.to_string(), packed.clone());
+        Ok((
+            packed,
+            first_duration + second_duration + third_duration,
+            false,
+        ))
+    }
+
     fn get_or_create_projection_gpu(
         &self,
         tensor_name: &str,
@@ -1977,21 +2111,16 @@ impl ReferenceModel {
             let started_at = Instant::now();
             let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
             let (mut q, mut k, v) = if use_attention_qkv {
-                let q = session.run_projection(
+                session.run_projection_triplet(
                     &layer_tensors.q_proj_weight,
                     self.config.hidden_size,
-                    self.config.hidden_size,
-                    &hidden_states,
-                )?;
-                let (k, v) = session.run_projection_pair(
                     &layer_tensors.k_proj_weight,
                     kv_rows,
                     &layer_tensors.v_proj_weight,
                     kv_rows,
                     self.config.hidden_size,
                     &hidden_states,
-                )?;
-                (q, k, v)
+                )?
             } else {
                 (
                     self.matvec_f16_resolved(&layer_tensors.q_proj_weight, &hidden_states)?,
@@ -2712,21 +2841,16 @@ impl ReferenceModel {
             let started_at = Instant::now();
             let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
             let (mut q, mut k, v) = if use_attention_qkv {
-                let q = session.run_projection(
+                session.run_projection_triplet(
                     &layer_tensors.q_proj_weight,
                     self.config.hidden_size,
-                    self.config.hidden_size,
-                    &hidden_states,
-                )?;
-                let (k, v) = session.run_projection_pair(
                     &layer_tensors.k_proj_weight,
                     kv_rows,
                     &layer_tensors.v_proj_weight,
                     kv_rows,
                     self.config.hidden_size,
                     &hidden_states,
-                )?;
-                (q, k, v)
+                )?
             } else {
                 (
                     self.matvec_f16_resolved(&layer_tensors.q_proj_weight, &hidden_states)?,
@@ -3477,9 +3601,9 @@ mod tests {
             .benchmark_packed_prefill_chunk(Some(2), None, 0, layers, true, true, false)
             .expect("combined prefill chunk should succeed");
 
-        assert_eq!(attention.dispatch_count, layers * 2);
+        assert_eq!(attention.dispatch_count, layers);
         assert_eq!(mlp.dispatch_count, layers);
-        assert_eq!(combined.dispatch_count, layers * 3);
+        assert_eq!(combined.dispatch_count, layers * 2);
     }
 
     #[test]
@@ -3493,7 +3617,7 @@ mod tests {
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed model should load");
         let prompt_ids = [2usize];
-        let expected_dispatches = packed.config.num_hidden_layers * 3;
+        let expected_dispatches = packed.config.num_hidden_layers * 2;
 
         let first = packed
             .benchmark_packed_step_from_token_ids(&prompt_ids, true, true)
