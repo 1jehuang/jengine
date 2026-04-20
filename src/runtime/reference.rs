@@ -1014,6 +1014,8 @@ impl ReferenceModel {
         &self,
         use_attention_qkv: bool,
         use_mlp_gu: bool,
+        use_attention_full: bool,
+        use_mlp_full: bool,
     ) -> Result<(), ReferenceError> {
         if self.packed_model.is_none() {
             return Ok(());
@@ -1038,6 +1040,15 @@ impl ReferenceModel {
                     self.config.hidden_size,
                 )?;
                 let _ = self.get_or_create_projection_gpu(&triplet_key, &packed)?;
+                if use_attention_full {
+                    let (packed, _, _) = self.get_or_create_projection_cache(
+                        &layer_tensors.o_proj_weight,
+                        self.config.hidden_size,
+                        self.config.hidden_size,
+                    )?;
+                    let _ =
+                        self.get_or_create_projection_gpu(&layer_tensors.o_proj_weight, &packed)?;
+                }
             }
             if use_mlp_gu {
                 let pair_key = format!(
@@ -1053,7 +1064,7 @@ impl ReferenceModel {
                     self.config.hidden_size,
                 )?;
                 let _ = self.get_or_create_projection_gpu(&pair_key, &packed)?;
-                if Self::packed_use_mlp_full() {
+                if use_mlp_full {
                     let (packed, _, _) = self.get_or_create_projection_cache(
                         &layer_tensors.down_proj_weight,
                         self.config.hidden_size,

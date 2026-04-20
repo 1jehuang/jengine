@@ -105,9 +105,16 @@ fn main() {
             .expect("packed model should load")
     });
     if std::env::var_os("JENGINE_PREWARM_PACKED").is_some() {
+        let use_attention_full = std::env::var_os("JENGINE_PACKED_ATTENTION_FULL").is_some();
+        let use_mlp_full = std::env::var_os("JENGINE_PACKED_MLP_FULL").is_some();
         run_stage("prewarm_packed", || {
             packed_model
-                .prewarm_packed_decode_caches(use_attention_qkv, use_mlp_gu)
+                .prewarm_packed_decode_caches(
+                    use_attention_qkv,
+                    use_mlp_gu,
+                    use_attention_full,
+                    use_mlp_full,
+                )
                 .expect("packed decode prewarm should succeed")
         });
     }
