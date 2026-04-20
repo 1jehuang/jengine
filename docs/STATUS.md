@@ -221,6 +221,37 @@ A representative recent sample is:
 
 That is a major improvement over the older chunked combined upper bounds. The most important new conclusion is that the **MLP stage is now clearly the largest remaining stage-level bucket, and within it `down_proj` is by far the dominant subcomponent**.
 
+### Warm one-process chunked capture shows what cache reuse buys us
+
+A new one-process chunked runner (`bench_packed_chunked_upper_bound`) now lets us execute the same 7-layer chunk plan twice inside one process so model-level cache reuse can actually show up in the numbers.
+
+For the `combined` variant on this machine:
+
+- iteration 1 aggregate:
+  - total: `5869.436 ms`
+  - compile: `1825.886 ms`
+  - weight upload: `20.538 ms`
+  - gpu: `74.905 ms`
+  - download: `24.657 ms`
+  - non-offloaded dense: `3076.297 ms`
+  - orchestration: `847.140 ms`
+  - dispatches: `57`
+- iteration 2 aggregate, warm in-process:
+  - total: `2819.341 ms`
+  - compile: `0.000 ms`
+  - weight upload: `0.000 ms`
+  - gpu: `73.787 ms`
+  - download: `32.924 ms`
+  - non-offloaded dense: `2710.366 ms`
+  - orchestration: `2.227 ms`
+  - dispatches: `57`
+  - `pack_cache_hits=57`
+  - `gpu_cache_hits=57`
+
+That warm in-process combined upper bound is about **`0.355 tok/s`** for one-token decode, which is the first time this packed path has clearly moved beyond the old sub-`0.25 tok/s` territory in a measurement that preserves cache reuse.
+
+It also reinforces the same next target: once compile and weight upload are removed, the remaining dominant bucket is still the MLP tail, especially `down_proj`.
+
 ### Naive full-MLP offload is not the right next fix
 
 An env-gated experiment (`JENGINE_PACKED_MLP_FULL=1`) that offloads `down_proj` inside the broader packed path regressed badly:
@@ -298,10 +329,11 @@ From the latest real one-token run:
 11. Carrying that subgroup-row shader into the chunked combined packed path reduced the reconstructed upper bound from `12212.554 ms` to `11885.064 ms`, only about `2.7%` total, which confirms that dense-side work is still the main limiter
 12. Packed-artifact `generate_greedy` now routes into the packed decode path automatically, so the packed-first runtime is no longer just benchmark-only infrastructure
 13. With the rebuilt release chunked capture path, the latest combined upper bound is now in the mid-`4.5 s` range, and the stage breakdown shows `mlp_ms=2872.509` as the largest remaining stage-level bucket
-14. The new MLP sub-breakdown shows `mlp_down_ms=1913.680`, which means `down_proj` handling is the dominant subcomponent inside the MLP tail even though naive full offload regresses
-15. A direct real-tensor microbenchmark still shows `down_proj` packed GPU kernel time at only `0.869 ms` versus `123.933 ms` dense CPU and `133.083 ms` packed CPU, which means the problem is structural integration overhead rather than raw GPU math throughput
-16. A naive full-MLP packed experiment (`JENGINE_PACKED_MLP_FULL=1`) regressed badly, so the next MLP-side fix is not simply turning `down_proj` into another standalone packed projection
-17. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the MLP tail with a more structural redesign around `down_proj` while still reducing remaining dense-side work and synchronization overhead
+14. The one-process chunked runner shows a warm in-process combined upper bound of `2819.341 ms` with `pack_cache_hits=57` and `gpu_cache_hits=57`, which is about `0.355 tok/s` for one-token decode and confirms that cache reuse now matters a lot
+15. The new MLP sub-breakdown shows `mlp_down_ms=1913.680`, which means `down_proj` handling is the dominant subcomponent inside the MLP tail even though naive full offload regresses
+16. A direct real-tensor microbenchmark still shows `down_proj` packed GPU kernel time at only `0.869 ms` versus `123.933 ms` dense CPU and `133.083 ms` packed CPU, which means the problem is structural integration overhead rather than raw GPU math throughput
+17. A naive full-MLP packed experiment (`JENGINE_PACKED_MLP_FULL=1`) regressed badly, so the next MLP-side fix is not simply turning `down_proj` into another standalone packed projection
+18. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the MLP tail with a more structural redesign around `down_proj` while still reducing remaining dense-side work and synchronization overhead
 
 ## Best next step
 

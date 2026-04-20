@@ -507,6 +507,44 @@ Current interpretation:
 - and inside that stage, `down_proj` dominates the measured MLP sub-breakdown
 - that points the next optimization pass toward the MLP tail and broader packed-first execution, not back toward attention-only offload
 
+### One-process warm chunked combined upper bound
+
+Command shape:
+
+```bash
+JENGINE_NO_HEARTBEAT=1 ./target/release/bench_packed_chunked_upper_bound \
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model 42 combined 7 2
+```
+
+Observed sample:
+
+- iteration 1 aggregate:
+  - total: `5869.436 ms`
+  - compile: `1825.886 ms`
+  - weight upload: `20.538 ms`
+  - gpu: `74.905 ms`
+  - download: `24.657 ms`
+  - non-offloaded dense: `3076.297 ms`
+  - orchestration: `847.140 ms`
+  - dispatches: `57`
+- iteration 2 aggregate, warm in-process:
+  - total: `2819.341 ms`
+  - compile: `0.000 ms`
+  - weight upload: `0.000 ms`
+  - gpu: `73.787 ms`
+  - download: `32.924 ms`
+  - non-offloaded dense: `2710.366 ms`
+  - orchestration: `2.227 ms`
+  - dispatches: `57`
+  - `pack_cache_hits=57`
+  - `gpu_cache_hits=57`
+
+Current interpretation:
+
+- once model-level cache reuse is actually preserved across all chunks, the packed combined upper bound improves much further
+- the warm in-process upper bound is about `0.355 tok/s` for one-token decode
+- compile and weight upload effectively disappear on the warm pass, but the MLP tail is still the main remaining runtime bucket
+
 ### Chunked MLP-only packed upper bound
 
 Using the same helper on the `mlp` variant now produces:
