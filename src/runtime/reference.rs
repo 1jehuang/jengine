@@ -231,7 +231,7 @@ pub struct DecodeResult {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum PackedDecodeStepResult {
+pub enum PackedDecodeStepResult {
     Logits(Vec<f32>),
     NextToken(usize),
 }
@@ -510,6 +510,151 @@ pub struct PackedDecodeResult {
     pub decode_metrics: DecodeMetrics,
     pub metrics: PackedDecodeMetrics,
     pub dispatch_trace: Vec<PackedDispatchTrace>,
+}
+
+pub struct PersistentPackedDecodeSession<'a> {
+    model: &'a ReferenceModel,
+    cache: Vec<LayerCache>,
+    gpu_session: PackedGpuSession<'a>,
+    metrics: DecodeMetrics,
+    attention_stage_metrics: PackedAttentionStageMetrics,
+    mlp_stage_metrics: PackedMlpStageMetrics,
+    non_offloaded_dense_duration: Duration,
+    next_position: usize,
+    use_attention_qkv: bool,
+    use_mlp_gu: bool,
+    use_attention_full: bool,
+    use_mlp_full: bool,
+    argmax_only: bool,
+}
+
+impl<'a> PersistentPackedDecodeSession<'a> {
+    fn new(
+        model: &'a ReferenceModel,
+        expected_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        argmax_only: bool,
+    ) -> Self {
+        Self {
+            model,
+            cache: model.allocate_layer_cache_vec(expected_tokens),
+            gpu_session: PackedGpuSession::new(model),
+            metrics: DecodeMetrics {
+                prompt_tokens: 0,
+                generated_tokens: 0,
+                total_duration: Duration::ZERO,
+                embedding_duration: Duration::ZERO,
+                norm_duration: Duration::ZERO,
+                qkv_duration: Duration::ZERO,
+                attention_duration: Duration::ZERO,
+                mlp_duration: Duration::ZERO,
+                logits_duration: Duration::ZERO,
+            },
+            attention_stage_metrics: PackedAttentionStageMetrics::default(),
+            mlp_stage_metrics: PackedMlpStageMetrics::default(),
+            non_offloaded_dense_duration: Duration::ZERO,
+            next_position: 0,
+            use_attention_qkv,
+            use_mlp_gu,
+            use_attention_full: use_attention_qkv && ReferenceModel::packed_use_attention_full(),
+            use_mlp_full: use_mlp_gu && ReferenceModel::packed_use_mlp_full(),
+            argmax_only,
+        }
+    }
+
+    pub fn push_prompt_token(
+        &mut self,
+        token_id: usize,
+    ) -> Result<PackedDecodeStepResult, ReferenceError> {
+        self.metrics.prompt_tokens += 1;
+        self.step_token(token_id)
+    }
+
+    pub fn push_generated_token(
+        &mut self,
+        token_id: usize,
+    ) -> Result<PackedDecodeStepResult, ReferenceError> {
+        self.metrics.generated_tokens += 1;
+        self.step_token(token_id)
+    }
+
+    fn step_token(&mut self, token_id: usize) -> Result<PackedDecodeStepResult, ReferenceError> {
+        let result = self.model.forward_step_packed_decode(
+            token_id,
+            self.next_position,
+            &mut self.cache,
+            &mut self.metrics,
+            &mut self.attention_stage_metrics,
+            &mut self.mlp_stage_metrics,
+            &mut self.non_offloaded_dense_duration,
+            &mut self.gpu_session,
+            self.use_attention_qkv,
+            self.use_mlp_gu,
+            self.use_attention_full,
+            self.use_mlp_full,
+            self.argmax_only,
+        )?;
+        self.next_position += 1;
+        Ok(result)
+    }
+
+    pub fn dispatch_trace(&self) -> &[PackedDispatchTrace] {
+        &self.gpu_session.dispatch_trace
+    }
+
+    pub fn finish_metrics(
+        self,
+        enabled_projections: String,
+        total_duration: Duration,
+        output_text: String,
+    ) -> PackedDecodeMetrics {
+        ReferenceModel::finish_packed_decode_metrics(
+            enabled_projections,
+            total_duration,
+            &self.metrics,
+            &self.attention_stage_metrics,
+            &self.mlp_stage_metrics,
+            self.non_offloaded_dense_duration,
+            &self.gpu_session,
+            output_text,
+        )
+    }
+
+    pub fn finish_result(
+        self,
+        enabled_projections: String,
+        total_duration: Duration,
+        output_token_ids: Vec<usize>,
+        output_text: String,
+    ) -> PackedDecodeResult {
+        let PersistentPackedDecodeSession {
+            metrics: decode_metrics,
+            attention_stage_metrics,
+            mlp_stage_metrics,
+            non_offloaded_dense_duration,
+            gpu_session,
+            ..
+        } = self;
+        let metrics = ReferenceModel::finish_packed_decode_metrics(
+            enabled_projections,
+            total_duration,
+            &decode_metrics,
+            &attention_stage_metrics,
+            &mlp_stage_metrics,
+            non_offloaded_dense_duration,
+            &gpu_session,
+            output_text.clone(),
+        );
+        let dispatch_trace = gpu_session.dispatch_trace;
+        PackedDecodeResult {
+            output_token_ids,
+            output_text,
+            decode_metrics,
+            metrics,
+            dispatch_trace,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1300,6 +1445,22 @@ impl ReferenceModel {
         )?;
         let _ = self.get_or_create_projection_gpu("model.embed_tokens.weight", &logits_packed)?;
         Ok(())
+    }
+
+    pub fn begin_packed_decode_session(
+        &self,
+        expected_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        argmax_only: bool,
+    ) -> PersistentPackedDecodeSession<'_> {
+        PersistentPackedDecodeSession::new(
+            self,
+            expected_tokens,
+            use_attention_qkv,
+            use_mlp_gu,
+            argmax_only,
+        )
     }
 
     fn packed_cache_bytes(&self) -> usize {
@@ -2584,46 +2745,16 @@ impl ReferenceModel {
         }
 
         let total_started = Instant::now();
-        let mut metrics = DecodeMetrics {
-            prompt_tokens: prompt_ids.len(),
-            generated_tokens: 0,
-            total_duration: Duration::ZERO,
-            embedding_duration: Duration::ZERO,
-            norm_duration: Duration::ZERO,
-            qkv_duration: Duration::ZERO,
-            attention_duration: Duration::ZERO,
-            mlp_duration: Duration::ZERO,
-            logits_duration: Duration::ZERO,
-        };
-        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len());
-        let mut session = PackedGpuSession::new(self);
-        let mut non_offloaded_dense_duration = Duration::ZERO;
-        let mut attention_stage_metrics = PackedAttentionStageMetrics::default();
-        let mut mlp_stage_metrics = PackedMlpStageMetrics::default();
+        let mut session =
+            self.begin_packed_decode_session(prompt_ids.len(), use_attention_qkv, use_mlp_gu, true);
         for (position, &token_id) in prompt_ids.iter().enumerate() {
-            let _ = self.forward_step_packed_decode(
-                token_id,
-                position,
-                &mut cache,
-                &mut metrics,
-                &mut attention_stage_metrics,
-                &mut mlp_stage_metrics,
-                &mut non_offloaded_dense_duration,
-                &mut session,
-                use_attention_qkv,
-                use_mlp_gu,
-                true,
-            )?;
+            debug_assert_eq!(position, session.next_position);
+            let _ = session.push_prompt_token(token_id)?;
         }
 
-        Ok(Self::finish_packed_decode_metrics(
+        Ok(session.finish_metrics(
             Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
             total_started.elapsed(),
-            &metrics,
-            &attention_stage_metrics,
-            &mlp_stage_metrics,
-            non_offloaded_dense_duration,
-            &session,
             String::new(),
         ))
     }
@@ -2968,38 +3099,17 @@ impl ReferenceModel {
             .as_ref()
             .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
         let total_started = Instant::now();
-        let mut metrics = DecodeMetrics {
-            prompt_tokens: prompt_ids.len(),
-            generated_tokens: 0,
-            total_duration: Duration::ZERO,
-            embedding_duration: Duration::ZERO,
-            norm_duration: Duration::ZERO,
-            qkv_duration: Duration::ZERO,
-            attention_duration: Duration::ZERO,
-            mlp_duration: Duration::ZERO,
-            logits_duration: Duration::ZERO,
-        };
-        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens);
-        let mut session = PackedGpuSession::new(self);
-        let mut non_offloaded_dense_duration = Duration::ZERO;
-        let mut attention_stage_metrics = PackedAttentionStageMetrics::default();
-        let mut mlp_stage_metrics = PackedMlpStageMetrics::default();
+        let mut session = self.begin_packed_decode_session(
+            prompt_ids.len() + max_new_tokens,
+            use_attention_qkv,
+            use_mlp_gu,
+            true,
+        );
         let mut last_next_token = None;
 
         for (position, &token_id) in prompt_ids.iter().enumerate() {
-            let step = self.forward_step_packed_decode(
-                token_id,
-                position,
-                &mut cache,
-                &mut metrics,
-                &mut attention_stage_metrics,
-                &mut mlp_stage_metrics,
-                &mut non_offloaded_dense_duration,
-                &mut session,
-                use_attention_qkv,
-                use_mlp_gu,
-                true,
-            )?;
+            debug_assert_eq!(position, session.next_position);
+            let step = session.push_prompt_token(token_id)?;
             last_next_token = Some(match step {
                 PackedDecodeStepResult::NextToken(token_id) => token_id,
                 PackedDecodeStepResult::Logits(_) => {
@@ -3014,20 +3124,8 @@ impl ReferenceModel {
                 ReferenceError::Decode("argmax failed on empty logits".to_string())
             })?;
             output_ids.push(next_token);
-            metrics.generated_tokens += 1;
-            let step = self.forward_step_packed_decode(
-                next_token,
-                prompt_ids.len() + generation_index,
-                &mut cache,
-                &mut metrics,
-                &mut attention_stage_metrics,
-                &mut mlp_stage_metrics,
-                &mut non_offloaded_dense_duration,
-                &mut session,
-                use_attention_qkv,
-                use_mlp_gu,
-                true,
-            )?;
+            debug_assert_eq!(prompt_ids.len() + generation_index, session.next_position);
+            let step = session.push_generated_token(next_token)?;
             last_next_token = Some(match step {
                 PackedDecodeStepResult::NextToken(token_id) => token_id,
                 PackedDecodeStepResult::Logits(_) => {
@@ -3039,23 +3137,12 @@ impl ReferenceModel {
         let output_text =
             tokenizer.decode(&output_ids.iter().map(|id| *id as u32).collect::<Vec<_>>())?;
 
-        let packed_metrics = Self::finish_packed_decode_metrics(
+        Ok(session.finish_result(
             Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
             total_started.elapsed(),
-            &metrics,
-            &attention_stage_metrics,
-            &mlp_stage_metrics,
-            non_offloaded_dense_duration,
-            &session,
-            output_text.clone(),
-        );
-        Ok(PackedDecodeResult {
-            output_token_ids: output_ids,
+            output_ids,
             output_text,
-            decode_metrics: metrics,
-            metrics: packed_metrics,
-            dispatch_trace: session.dispatch_trace,
-        })
+        ))
     }
 
     pub fn prefill_logits_for_variant(
@@ -3085,6 +3172,8 @@ impl ReferenceModel {
         let mut non_offloaded_dense_duration = Duration::ZERO;
         let mut attention_stage_metrics = PackedAttentionStageMetrics::default();
         let mut mlp_stage_metrics = PackedMlpStageMetrics::default();
+        let use_attention_full = use_attention_qkv && Self::packed_use_attention_full();
+        let use_mlp_full = use_mlp_gu && Self::packed_use_mlp_full();
         let mut last_logits = Vec::new();
         for (position, &token_id) in prompt_ids.iter().enumerate() {
             last_logits = match self.forward_step_packed_decode(
@@ -3098,6 +3187,8 @@ impl ReferenceModel {
                 &mut session,
                 use_attention_qkv,
                 use_mlp_gu,
+                use_attention_full,
+                use_mlp_full,
                 false,
             )? {
                 PackedDecodeStepResult::Logits(logits) => logits,
@@ -3552,6 +3643,8 @@ impl ReferenceModel {
         session: &mut PackedGpuSession<'_>,
         use_attention_qkv: bool,
         use_mlp_gu: bool,
+        use_attention_full: bool,
+        use_mlp_full: bool,
         argmax_only: bool,
     ) -> Result<PackedDecodeStepResult, ReferenceError> {
         let started_at = Instant::now();
@@ -3661,7 +3754,6 @@ impl ReferenceModel {
                 "attention_single_query",
                 attn_elapsed,
             );
-            let use_attention_full = use_attention_qkv && Self::packed_use_attention_full();
             let oproj_started_at = Instant::now();
             let attn_output = if use_attention_full {
                 session.run_projection(
@@ -3738,7 +3830,6 @@ impl ReferenceModel {
                     dense_started_at,
                 )
             };
-            let use_mlp_full = use_mlp_gu && Self::packed_use_mlp_full();
             let swiglu_started_at = Instant::now();
             let mlp = swiglu(&gate, &up);
             let swiglu_elapsed = swiglu_started_at.elapsed();
@@ -4200,7 +4291,7 @@ fn attention_single_query(
 
 #[cfg(test)]
 mod tests {
-    use super::ReferenceModel;
+    use super::{PackedDecodeStepResult, ReferenceModel};
     use crate::runtime::packed_model::write_packed_model_artifact;
     use half::f16;
     use safetensors::tensor::{Dtype, TensorView, serialize};
@@ -4405,6 +4496,46 @@ mod tests {
         assert!(summary.contains("attention_oproj_ms="));
         assert!(summary.contains("mlp_down_ms="));
         assert!(result.metrics.gpu_duration > Duration::ZERO);
+    }
+
+    #[test]
+    fn reuses_persistent_packed_decode_session_across_generation_loop() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let mut session = model.begin_packed_decode_session(2, true, true, true);
+        let predicted = match session
+            .push_prompt_token(2)
+            .expect("prompt token should decode")
+        {
+            PackedDecodeStepResult::NextToken(token_id) => token_id,
+            PackedDecodeStepResult::Logits(_) => unreachable!("argmax-only session should predict"),
+        };
+        assert_eq!(predicted, 2);
+        let predicted = match session
+            .push_generated_token(predicted)
+            .expect("generated token should decode")
+        {
+            PackedDecodeStepResult::NextToken(token_id) => token_id,
+            PackedDecodeStepResult::Logits(_) => unreachable!("argmax-only session should predict"),
+        };
+        assert_eq!(predicted, 2);
+
+        let result = session.finish_result(
+            ReferenceModel::packed_enabled_label(true, true),
+            Duration::ZERO,
+            vec![2, 2],
+            "tok2 tok2".to_string(),
+        );
+        assert_eq!(result.output_token_ids, vec![2, 2]);
+        assert_eq!(result.decode_metrics.prompt_tokens, 1);
+        assert_eq!(result.decode_metrics.generated_tokens, 1);
+        assert!(!result.dispatch_trace.is_empty());
     }
 
     #[test]
