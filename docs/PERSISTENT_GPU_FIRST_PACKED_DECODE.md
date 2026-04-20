@@ -176,6 +176,24 @@ Keep the following on GPU across the one-token path:
 
 Only the final token id should need to return to the CPU.
 
+### Milestone 2a: activation format bridge
+
+Shared Vulkan context is necessary, but it is not sufficient for true GPU-resident chaining.
+
+The current packed runner still has a format mismatch:
+
+- packed projection outputs are resident GPU `f32` vectors
+- the next packed projection still expects CPU-packed half-pair uploads
+
+So a real GPU-resident decode path needs an activation format bridge.
+
+Two plausible designs are:
+
+1. a raw-`f32` input packed runner path that can consume the previous GPU output buffer directly
+2. a GPU-side pack/convert stage that turns GPU `f32` activations into the packed half-pair input format expected by the current shader path
+
+Until one of those exists, shared context alone cannot eliminate CPU-visible intermediate activation traffic.
+
 ### Milestone 3: GPU-native logits and token selection
 
 Move logits projection and token selection fully onto the GPU.
