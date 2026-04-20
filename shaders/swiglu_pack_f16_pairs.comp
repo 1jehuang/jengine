@@ -1,0 +1,38 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputBuffer {
+    float input_data[];
+};
+
+layout(std430, binding = 1) writeonly buffer OutputBuffer {
+    uint output_data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint len;
+} pc;
+
+float sigmoid(float x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint packed_len = (pc.len + 1u) / 2u;
+    if (idx >= packed_len) {
+        return;
+    }
+    uint base = idx * 2u;
+    float gate0 = input_data[base];
+    float up0 = input_data[base + pc.len];
+    float out0 = (gate0 * sigmoid(gate0)) * up0;
+    float out1 = 0.0;
+    if (base + 1u < pc.len) {
+        float gate1 = input_data[base + 1u];
+        float up1 = input_data[base + 1u + pc.len];
+        out1 = (gate1 * sigmoid(gate1)) * up1;
+    }
+    output_data[idx] = packHalf2x16(vec2(out0, out1));
+}

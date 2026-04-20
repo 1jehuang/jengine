@@ -3,5 +3,6 @@ pub mod pack_f16_pairs;
 pub mod packed_matvec;
 pub mod swiglu;
 pub mod swiglu_combined;
+pub mod swiglu_pack_f16_pairs;
 pub mod vulkan;
 pub mod weighted_rms_norm;
