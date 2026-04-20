@@ -112,26 +112,38 @@ So logits is now the first remaining dense-hotspot experiment with median wins a
 
 ### Chunked capture now works around the `rc=143` kill window
 
-By chaining `bench_packed_prefill_chunk` across four 7-layer spans and only including logits on the last chunk, we can now reconstruct a full combined packed one-token upper bound without each individual chunk getting killed by the harness.
+By chaining `bench_packed_prefill_chunk` across four 7-layer spans and only including logits on the last chunk, we can now reconstruct full packed one-token upper bounds without each individual chunk getting killed by the harness.
 
-Current chunked reconstructed combined sample:
+Current chunked reconstructed samples:
 
-- total: `12212.554 ms`
-- compile: `1712.426 ms`
-- upload: `22.052 ms`
-- gpu: `657.716 ms`
-- download: `35.070 ms`
-- non-offloaded dense: `8987.582 ms`
-- orchestration: `797.694 ms`
-- dispatches: `57`
+- combined:
+  - total: `12212.554 ms`
+  - compile: `1712.426 ms`
+  - upload: `22.052 ms`
+  - gpu: `657.716 ms`
+  - download: `35.070 ms`
+  - non-offloaded dense: `8987.582 ms`
+  - orchestration: `797.694 ms`
+  - dispatches: `57`
+- attention-only:
+  - total: `17779.632 ms`
+  - compile: `464.922 ms`
+  - upload: `9.696 ms`
+  - gpu: `108.760 ms`
+  - download: `22.253 ms`
+  - non-offloaded dense: `16865.714 ms`
+  - orchestration: `308.283 ms`
+  - dispatches: `29`
 
 Important caveat:
 
-- this is an **upper bound**, not a clean apples-to-apples replacement for the one-process packed step benchmark
+- these are **upper bounds**, not clean apples-to-apples replacements for the one-process packed step benchmark
 - each chunk runs in a fresh process, so cross-chunk runner reuse and weight residency are lost
 - that means compile and upload costs are overstated relative to the intended warm in-process path
 
-Still, this is useful because it confirms the latest packed path structure and dispatch count while giving us a kill-window-safe capture path until the direct full-step benchmark can complete cleanly.
+Still, this is useful because it confirms the latest packed path structure and dispatch counts while giving us a kill-window-safe capture path until the direct full-step benchmark can complete cleanly.
+
+The key conclusion from the new attention-only sample is that attention-side offload alone is **not** beating the current combined packed path here.
 
 ### Cached q_proj warm hybrid vs dense
 
@@ -154,8 +166,9 @@ From the latest real one-token run:
 4. The `o_proj` hybrid experiment did not beat `qkv+gu` on layers `0`, `14`, or `27`, so broadening attention-side offload blindly is not the next win
 5. The follow-up `down_proj` hybrid experiment also failed to produce a clear end-to-end gain, so it is not the best next dense-side bet either
 6. After removing full logits-vector download from the hybrid logits path, `qkv+gu+logits` became the first remaining dense-hotspot experiment with median wins across all three sampled layers
-7. Chunked combined packed capture now works around the `rc=143` kill window and confirms the latest combined path shape at `57` dispatches, but still overstates total cost because each chunk loses warm in-process cache reuse
-8. The next meaningful wins now come from reducing dense-side work and synchronization overhead, not from merely making runner reuse exist at all
+7. Chunked packed capture now works around the `rc=143` kill window and confirms the latest path shapes, with chunked upper bounds of `12212.554 ms` for combined at `57` dispatches and `17779.632 ms` for attention-only at `29` dispatches
+8. The new chunked attention-only capture shows that attention-side offload alone is still losing badly to the current combined packed path here
+9. The next meaningful wins now come from reducing dense-side work and synchronization overhead, not from merely making runner reuse exist at all
 
 ## Best next step
 

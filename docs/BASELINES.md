@@ -383,33 +383,44 @@ Current interpretation:
 
 ## Chunked packed capture workarounds
 
-### Real combined packed step upper bound via 7-layer chunk chaining
+### Real combined and attention-only packed step upper bounds via 7-layer chunk chaining
 
 Command shape, run as four chained chunk invocations:
 
 ```bash
 JENGINE_NO_HEARTBEAT=1 ./target/release/bench_packed_prefill_chunk \
   /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model \
-  42 <start_layer> <end_layer> combined <hidden_in> <hidden_out> <summary_out> <include_logits>
+  42 <start_layer> <end_layer> <variant> <hidden_in> <hidden_out> <summary_out> <include_logits>
 ```
 
-Observed reconstructed sample from chunks `[0,7)`, `[7,14)`, `[14,21)`, and `[21,28)` with logits only on the last chunk:
+Observed reconstructed samples from chunks `[0,7)`, `[7,14)`, `[14,21)`, and `[21,28)` with logits only on the last chunk:
 
-- total: `12212.554 ms`
-- compile: `1712.426 ms`
-- upload: `22.052 ms`
-- gpu: `657.716 ms`
-- download: `35.070 ms`
-- non-offloaded dense: `8987.582 ms`
-- orchestration: `797.694 ms`
-- dispatches: `57`
+- combined:
+  - total: `12212.554 ms`
+  - compile: `1712.426 ms`
+  - upload: `22.052 ms`
+  - gpu: `657.716 ms`
+  - download: `35.070 ms`
+  - non-offloaded dense: `8987.582 ms`
+  - orchestration: `797.694 ms`
+  - dispatches: `57`
+- attention-only:
+  - total: `17779.632 ms`
+  - compile: `464.922 ms`
+  - upload: `9.696 ms`
+  - gpu: `108.760 ms`
+  - download: `22.253 ms`
+  - non-offloaded dense: `16865.714 ms`
+  - orchestration: `308.283 ms`
+  - dispatches: `29`
 
 Current interpretation:
 
-- this is a usable kill-window-safe capture path for the latest combined packed structure
-- but it is an **upper bound**, because each chunk runs in a fresh process and loses warm in-process cache reuse
+- this is a usable kill-window-safe capture path for the latest packed structures
+- but these are **upper bounds**, because each chunk runs in a fresh process and loses warm in-process cache reuse
 - compile and weight-upload costs are therefore overstated relative to the intended one-process warm path
-- even so, it confirms that the latest combined packed path shape is now `57` dispatches when logits stay on the argmax-only path
+- even so, the new attention-only sample is decisive enough to show that qkv-only packed offload is currently much worse than the chunked combined packed path
+- that means the remaining best lead is still broader packed-first decode plus output-side handling, not attention-only offload by itself
 
 ## Packed layer sweep baselines
 
