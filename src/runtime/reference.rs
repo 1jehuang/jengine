@@ -10,7 +10,7 @@ use crate::runtime::packed_model::{PackedModelError, PackedModelStore};
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
 use crate::runtime::weights::{WeightError, WeightStore};
 use std::cell::RefCell;
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -265,6 +265,9 @@ struct PackedProjectionCache {
     scales: Vec<f32>,
 }
 
+type CachedProjectionGpuRunner = Rc<RefCell<CachedGpuPackedMatvecRunner>>;
+type CachedProjectionGpuCacheEntry = (CachedProjectionGpuRunner, Duration, Duration, bool);
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttentionProjectionMixMetrics {
     pub enabled_projections: String,
@@ -470,7 +473,6 @@ struct PackedGpuSessionMetrics {
 struct PackedGpuSession<'a> {
     model: &'a ReferenceModel,
     metrics: PackedGpuSessionMetrics,
-    shape_runners: HashMap<(usize, usize, usize, usize, usize), CachedGpuPackedMatvecRunner>,
 }
 
 impl<'a> PackedGpuSession<'a> {
@@ -478,7 +480,6 @@ impl<'a> PackedGpuSession<'a> {
         Self {
             model,
             metrics: PackedGpuSessionMetrics::default(),
-            shape_runners: HashMap::new(),
         }
     }
 
@@ -492,59 +493,38 @@ impl<'a> PackedGpuSession<'a> {
         let (packed, pack_duration, pack_cache_hit) =
             self.model
                 .get_or_create_projection_cache(tensor_name, rows, cols)?;
-        let shape_key = (
-            packed.rows,
-            packed.cols,
-            packed.group_size,
-            packed.code_words.len(),
-            packed.scales.len(),
-        );
-        let (runner, compile_duration, gpu_cache_hit) = match self.shape_runners.entry(shape_key) {
-            Entry::Occupied(entry) => (entry.into_mut(), Duration::ZERO, true),
-            Entry::Vacant(entry) => {
-                let (runner, duration) = CachedGpuPackedMatvecRunner::new_uninitialized(
-                    packed.code_words.len(),
-                    packed.scales.len(),
-                    packed.group_size,
-                    packed.rows,
-                    packed.cols,
-                )
-                .map_err(|error| {
-                    ReferenceError::Decode(format!(
-                        "gpu session init failed for {tensor_name}: {error}"
-                    ))
-                })?;
-                (entry.insert(runner), duration, false)
-            }
-        };
+        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu(tensor_name, &packed)?;
         self.metrics.pack_duration += pack_duration;
         self.metrics.compile_duration += compile_duration;
+        self.metrics.weight_upload_duration += weight_upload_duration;
         self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
 
-        let weight_upload = runner
-            .update_weights(&packed.code_words, &packed.scales)
-            .map_err(|error| {
-                ReferenceError::Decode(format!(
-                    "gpu weight upload failed for {tensor_name}: {error}"
-                ))
-            })?;
-
-        let (output, report) = runner.run_with_output(input, None).map_err(|error| {
-            ReferenceError::Decode(format!("gpu projection failed for {tensor_name}: {error}"))
-        })?;
-        self.metrics.weight_upload_duration += weight_upload;
+        let (output, report) =
+            runner
+                .borrow_mut()
+                .run_with_output(input, None)
+                .map_err(|error| {
+                    ReferenceError::Decode(format!(
+                        "gpu projection failed for {tensor_name}: {error}"
+                    ))
+                })?;
         self.metrics.activation_upload_duration += report.upload_duration;
-        self.metrics.upload_duration += weight_upload + report.upload_duration;
+        self.metrics.upload_duration += weight_upload_duration + report.upload_duration;
         self.metrics.gpu_duration += report.gpu_duration;
         self.metrics.download_duration += report.download_duration;
         self.metrics.dispatch_count += 1;
         let weight_bytes = packed.code_words.len() * std::mem::size_of::<u32>()
             + packed.scales.len() * std::mem::size_of::<f32>();
         let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
-        self.metrics.weight_upload_bytes += weight_bytes;
+        if !gpu_cache_hit {
+            self.metrics.weight_upload_bytes += weight_bytes;
+        }
         self.metrics.activation_upload_bytes += activation_upload_bytes;
-        self.metrics.upload_bytes += weight_bytes + activation_upload_bytes;
+        self.metrics.upload_bytes +=
+            usize::from(!gpu_cache_hit) * weight_bytes + activation_upload_bytes;
         self.metrics.download_bytes += rows * std::mem::size_of::<f32>();
         Ok(output)
     }
@@ -568,61 +548,38 @@ impl<'a> PackedGpuSession<'a> {
                 second_rows,
                 cols,
             )?;
-        let shape_key = (
-            packed.rows,
-            packed.cols,
-            packed.group_size,
-            packed.code_words.len(),
-            packed.scales.len(),
-        );
-        let (runner, compile_duration, gpu_cache_hit) = match self.shape_runners.entry(shape_key) {
-            Entry::Occupied(entry) => (entry.into_mut(), Duration::ZERO, true),
-            Entry::Vacant(entry) => {
-                let (runner, duration) = CachedGpuPackedMatvecRunner::new_uninitialized(
-                    packed.code_words.len(),
-                    packed.scales.len(),
-                    packed.group_size,
-                    packed.rows,
-                    packed.cols,
-                )
-                .map_err(|error| {
-                    ReferenceError::Decode(format!(
-                        "gpu session init failed for {first_name}+{second_name}: {error}"
-                    ))
-                })?;
-                (entry.insert(runner), duration, false)
-            }
-        };
+        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu(&pair_key, &packed)?;
         self.metrics.pack_duration += pack_duration;
         self.metrics.compile_duration += compile_duration;
+        self.metrics.weight_upload_duration += weight_upload_duration;
         self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
 
-        let weight_upload = runner
-            .update_weights(&packed.code_words, &packed.scales)
-            .map_err(|error| {
-                ReferenceError::Decode(format!(
-                    "gpu weight upload failed for {first_name}+{second_name}: {error}"
-                ))
-            })?;
-
-        let (combined, report) = runner.run_with_output(input, None).map_err(|error| {
-            ReferenceError::Decode(format!(
-                "gpu projection failed for {first_name}+{second_name}: {error}"
-            ))
-        })?;
-        self.metrics.weight_upload_duration += weight_upload;
+        let (combined, report) =
+            runner
+                .borrow_mut()
+                .run_with_output(input, None)
+                .map_err(|error| {
+                    ReferenceError::Decode(format!(
+                        "gpu projection failed for {first_name}+{second_name}: {error}"
+                    ))
+                })?;
         self.metrics.activation_upload_duration += report.upload_duration;
-        self.metrics.upload_duration += weight_upload + report.upload_duration;
+        self.metrics.upload_duration += weight_upload_duration + report.upload_duration;
         self.metrics.gpu_duration += report.gpu_duration;
         self.metrics.download_duration += report.download_duration;
         self.metrics.dispatch_count += 1;
         let weight_bytes = packed.code_words.len() * std::mem::size_of::<u32>()
             + packed.scales.len() * std::mem::size_of::<f32>();
         let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
-        self.metrics.weight_upload_bytes += weight_bytes;
+        if !gpu_cache_hit {
+            self.metrics.weight_upload_bytes += weight_bytes;
+        }
         self.metrics.activation_upload_bytes += activation_upload_bytes;
-        self.metrics.upload_bytes += weight_bytes + activation_upload_bytes;
+        self.metrics.upload_bytes +=
+            usize::from(!gpu_cache_hit) * weight_bytes + activation_upload_bytes;
         self.metrics.download_bytes += (first_rows + second_rows) * std::mem::size_of::<f32>();
 
         let (first, second) = combined.split_at(first_rows);
@@ -641,7 +598,7 @@ pub struct ReferenceModel {
     cached_hybrid_qproj: RefCell<HashMap<usize, Rc<HybridQProjCache>>>,
     cached_hybrid_qproj_gpu: RefCell<HashMap<usize, Rc<RefCell<CachedGpuPackedMatvecRunner>>>>,
     cached_projection_packed: RefCell<HashMap<String, Rc<PackedProjectionCache>>>,
-    cached_projection_gpu: RefCell<HashMap<String, Rc<RefCell<CachedGpuPackedMatvecRunner>>>>,
+    cached_projection_gpu: RefCell<HashMap<String, CachedProjectionGpuRunner>>,
 }
 
 impl ReferenceModel {
@@ -1373,18 +1330,18 @@ impl ReferenceModel {
         &self,
         tensor_name: &str,
         packed: &PackedProjectionCache,
-    ) -> Result<(Rc<RefCell<CachedGpuPackedMatvecRunner>>, Duration, bool), ReferenceError> {
+    ) -> Result<CachedProjectionGpuCacheEntry, ReferenceError> {
         if let Some(cached) = self
             .cached_projection_gpu
             .borrow()
             .get(tensor_name)
             .cloned()
         {
-            return Ok((cached, Duration::ZERO, true));
+            return Ok((cached, Duration::ZERO, Duration::ZERO, true));
         }
-        let (runner, duration) = CachedGpuPackedMatvecRunner::new(
-            &packed.code_words,
-            &packed.scales,
+        let (mut runner, duration) = CachedGpuPackedMatvecRunner::new_uninitialized(
+            packed.code_words.len(),
+            packed.scales.len(),
             packed.group_size,
             packed.rows,
             packed.cols,
@@ -1392,11 +1349,18 @@ impl ReferenceModel {
         .map_err(|error| {
             ReferenceError::Decode(format!("gpu packed init failed for {tensor_name}: {error}"))
         })?;
+        let weight_upload_duration = runner
+            .update_weights(&packed.code_words, &packed.scales)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu weight upload failed for {tensor_name}: {error}"
+                ))
+            })?;
         let runner = Rc::new(RefCell::new(runner));
         self.cached_projection_gpu
             .borrow_mut()
             .insert(tensor_name.to_string(), runner.clone());
-        Ok((runner, duration, false))
+        Ok((runner, duration, weight_upload_duration, false))
     }
 
     pub fn benchmark_attention_projection_mix(
@@ -1718,33 +1682,43 @@ impl ReferenceModel {
 
         let (q_packed, pack, _) =
             self.get_or_create_projection_cache(&q_name, hidden_rows, hidden_rows)?;
-        let (q_gpu, compile, _) = self.get_or_create_projection_gpu(&q_name, &q_packed)?;
+        let (q_gpu, compile, weight_upload, _) =
+            self.get_or_create_projection_gpu(&q_name, &q_packed)?;
         pack_duration += pack;
         compile_duration += compile;
+        let mut upload_duration = weight_upload;
 
         let (k_packed, pack, _) =
             self.get_or_create_projection_cache(&k_name, kv_rows, hidden_rows)?;
-        let (k_gpu, compile, _) = self.get_or_create_projection_gpu(&k_name, &k_packed)?;
+        let (k_gpu, compile, weight_upload, _) =
+            self.get_or_create_projection_gpu(&k_name, &k_packed)?;
         pack_duration += pack;
         compile_duration += compile;
+        upload_duration += weight_upload;
 
         let (v_packed, pack, _) =
             self.get_or_create_projection_cache(&v_name, kv_rows, hidden_rows)?;
-        let (v_gpu, compile, _) = self.get_or_create_projection_gpu(&v_name, &v_packed)?;
+        let (v_gpu, compile, weight_upload, _) =
+            self.get_or_create_projection_gpu(&v_name, &v_packed)?;
         pack_duration += pack;
         compile_duration += compile;
+        upload_duration += weight_upload;
 
         let (gate_packed, pack, _) =
             self.get_or_create_projection_cache(&gate_name, intermediate_rows, hidden_rows)?;
-        let (gate_gpu, compile, _) = self.get_or_create_projection_gpu(&gate_name, &gate_packed)?;
+        let (gate_gpu, compile, weight_upload, _) =
+            self.get_or_create_projection_gpu(&gate_name, &gate_packed)?;
         pack_duration += pack;
         compile_duration += compile;
+        upload_duration += weight_upload;
 
         let (up_packed, pack, _) =
             self.get_or_create_projection_cache(&up_name, intermediate_rows, hidden_rows)?;
-        let (up_gpu, compile, _) = self.get_or_create_projection_gpu(&up_name, &up_packed)?;
+        let (up_gpu, compile, weight_upload, _) =
+            self.get_or_create_projection_gpu(&up_name, &up_packed)?;
         pack_duration += pack;
         compile_duration += compile;
+        upload_duration += weight_upload;
 
         let total_started = Instant::now();
         let mut metrics = DecodeMetrics {
@@ -1759,7 +1733,7 @@ impl ReferenceModel {
             logits_duration: Duration::ZERO,
         };
         let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens);
-        let mut upload = Duration::ZERO;
+        let mut upload = upload_duration;
         let mut gpu = Duration::ZERO;
         let mut download = Duration::ZERO;
         let mut last_logits = Vec::new();

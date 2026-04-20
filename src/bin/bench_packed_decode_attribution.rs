@@ -68,45 +68,71 @@ fn main() {
         .nth(6)
         .and_then(|value| value.parse::<f64>().ok())
         .unwrap_or(137.0);
-    let out_path = std::env::args().nth(7);
+    let iterations = std::env::args()
+        .nth(7)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    let out_path = std::env::args().nth(8);
 
     let (use_attention_qkv, use_mlp_gu) = parse_variant(&variant);
     let model = run_stage("load_packed_model", || {
         ReferenceModel::load_from_root_with_packed_artifact(&root, &artifact_dir)
             .expect("packed model should load")
     });
-    let metrics = run_stage("packed_decode_attribution", || {
-        model
-            .benchmark_packed_decode(&prompt, max_new_tokens, use_attention_qkv, use_mlp_gu)
-            .expect("packed decode attribution benchmark should succeed")
-    });
+    let mut lines = Vec::with_capacity(iterations + 1);
+    let mut total_ms_sum = 0.0f64;
+    let mut e2e_gbps_sum = 0.0f64;
+    let mut stream_window_gbps_sum = 0.0f64;
+    for iteration in 0..iterations {
+        let metrics = run_stage(
+            &format!("packed_decode_attribution_iter_{}", iteration + 1),
+            || {
+                model
+                    .benchmark_packed_decode(&prompt, max_new_tokens, use_attention_qkv, use_mlp_gu)
+                    .expect("packed decode attribution benchmark should succeed")
+            },
+        );
 
-    let generated = max_new_tokens.max(1) as f64;
-    let per_generated_token_ms = metrics.total_duration.as_secs_f64() * 1_000.0 / generated;
-    let per_generated_streamed_mb = metrics.total_streamed_bytes() as f64 / generated / 1_000_000.0;
-    let e2e_pct_of_hw = if hardware_bandwidth_gbps <= f64::EPSILON {
-        0.0
-    } else {
-        metrics.effective_end_to_end_bandwidth_gbps() / hardware_bandwidth_gbps * 100.0
-    };
-    let stream_window_pct_of_hw = if hardware_bandwidth_gbps <= f64::EPSILON {
-        0.0
-    } else {
-        metrics.effective_stream_window_bandwidth_gbps() / hardware_bandwidth_gbps * 100.0
-    };
-
-    let summary = format!(
-        "variant={} prompt={} max_new_tokens={} per_generated_token_ms={:.3} per_generated_streamed_mb={:.3} hardware_gbps={:.3} e2e_pct_of_hw={:.3} stream_window_pct_of_hw={:.3} {}\n",
+        let generated = max_new_tokens.max(1) as f64;
+        let per_generated_token_ms = metrics.total_duration.as_secs_f64() * 1_000.0 / generated;
+        let per_generated_streamed_mb =
+            metrics.total_streamed_bytes() as f64 / generated / 1_000_000.0;
+        let e2e_pct_of_hw = if hardware_bandwidth_gbps <= f64::EPSILON {
+            0.0
+        } else {
+            metrics.effective_end_to_end_bandwidth_gbps() / hardware_bandwidth_gbps * 100.0
+        };
+        let stream_window_pct_of_hw = if hardware_bandwidth_gbps <= f64::EPSILON {
+            0.0
+        } else {
+            metrics.effective_stream_window_bandwidth_gbps() / hardware_bandwidth_gbps * 100.0
+        };
+        total_ms_sum += metrics.total_duration.as_secs_f64() * 1_000.0;
+        e2e_gbps_sum += metrics.effective_end_to_end_bandwidth_gbps();
+        stream_window_gbps_sum += metrics.effective_stream_window_bandwidth_gbps();
+        lines.push(format!(
+            "iteration={} variant={} prompt={} max_new_tokens={} per_generated_token_ms={:.3} per_generated_streamed_mb={:.3} hardware_gbps={:.3} e2e_pct_of_hw={:.3} stream_window_pct_of_hw={:.3} {}",
+            iteration + 1,
+            variant,
+            prompt,
+            max_new_tokens,
+            per_generated_token_ms,
+            per_generated_streamed_mb,
+            hardware_bandwidth_gbps,
+            e2e_pct_of_hw,
+            stream_window_pct_of_hw,
+            metrics.summarize(),
+        ));
+    }
+    lines.push(format!(
+        "avg_variant={} iterations={} avg_total_ms={:.3} avg_e2e_gbps={:.3} avg_stream_window_gbps={:.3}",
         variant,
-        prompt,
-        max_new_tokens,
-        per_generated_token_ms,
-        per_generated_streamed_mb,
-        hardware_bandwidth_gbps,
-        e2e_pct_of_hw,
-        stream_window_pct_of_hw,
-        metrics.summarize(),
-    );
+        iterations,
+        total_ms_sum / iterations as f64,
+        e2e_gbps_sum / iterations as f64,
+        stream_window_gbps_sum / iterations as f64,
+    ));
+    let summary = format!("{}\n", lines.join("\n"));
 
     if let Some(out_path) = out_path {
         std::fs::write(&out_path, &summary).expect("attribution summary should write");

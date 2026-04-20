@@ -56,6 +56,7 @@ From the latest real combined packed decode attribution run:
 - end-to-end effective bandwidth: `0.042 GB/s`
 - stream-window effective bandwidth: `0.642 GB/s`
 - percent of `137 GB/s` hardware ceiling in stream-window terms: about `0.468%`
+- resident per-projection GPU runners are now reusing weights and compiled state across decode steps within a session, evidenced by `gpu_cache_hits=166` across `168` dispatches and only one step's worth of weight uploads
 
 ### Packed benchmark harnesses now capture cleanly
 From the latest real packed-artifact release runs:
@@ -84,8 +85,8 @@ From the latest real one-token run:
 
 1. The dominant cost in the first decode-wide attribution sample is still non-offloaded dense work, not GPU bandwidth saturation
 2. Host-side orchestration and per-dispatch overhead still matter, but they are smaller than the remaining dense-side work in the current combined path
-3. Compile cost is still large for first-pass all-layer sweeps, though paired dispatches help the combined path more than compile avoidance alone
-4. Raw GPU upload, compute, and download time are still much smaller than total packed wall time, and measured decode-wide bandwidth is far below the hardware ceiling
+3. Raw GPU upload, compute, and download time are still much smaller than total packed wall time, and measured decode-wide bandwidth is far below the hardware ceiling
+4. The next meaningful wins now come from reducing dense-side work and synchronization overhead, not from merely making runner reuse exist at all
 
 ## Best next step
 

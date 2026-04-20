@@ -95,6 +95,8 @@ Observed sample:
 - stream-window bandwidth: `0.642 GB/s`
 - percent of `137 GB/s` hardware ceiling, end-to-end: `0.030%`
 - percent of `137 GB/s` hardware ceiling, stream window only: `0.468%`
+- `gpu_cache_hits=166` across `168` dispatches, which shows the resident runner path is reusing compiled GPU runners after the first small set of misses
+- `weight_upload_bytes=528,482,304` across two decode steps, which indicates packed weights are now uploaded only for the first step and then reused on the next step within the same decode session
 
 ## Interpretation
 
