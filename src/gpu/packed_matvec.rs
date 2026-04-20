@@ -138,9 +138,8 @@ pub fn run_packed_ternary_matvec_raw_f32_with_output(
     input: &[f32],
     reference: Option<&[f32]>,
 ) -> Result<(Vec<f32>, GpuPackedMatvecReport), GpuPackedMatvecError> {
-    let (mut runner, compile_duration) = CachedGpuPackedMatvecRunner::new_raw_f32_input(
-        code_words, scales, group_size, rows, cols,
-    )?;
+    let (mut runner, compile_duration) =
+        CachedGpuPackedMatvecRunner::new_raw_f32_input(code_words, scales, group_size, rows, cols)?;
     let (output, mut report) = runner.run_with_output(input, reference)?;
     report.compile_duration = compile_duration;
     Ok((output, report))
@@ -782,9 +781,13 @@ impl CachedGpuPackedMatvecRunner {
         Ok(gpu_started.elapsed())
     }
 
-    fn copy_input_from_output_buffer(&self, source: &Self) -> Result<Duration, GpuPackedMatvecError> {
+    fn copy_input_from_output_buffer(
+        &self,
+        source: &Self,
+    ) -> Result<Duration, GpuPackedMatvecError> {
         let byte_len = self.cols * std::mem::size_of::<f32>();
-        if byte_len as u64 > source.output_buffer.size || byte_len as u64 > self.vector_buffer.size {
+        if byte_len as u64 > source.output_buffer.size || byte_len as u64 > self.vector_buffer.size
+        {
             return Err(GpuPackedMatvecError::Shape(format!(
                 "copy {} bytes exceeds source {} or destination {} buffer size",
                 byte_len, source.output_buffer.size, self.vector_buffer.size
@@ -796,10 +799,8 @@ impl CachedGpuPackedMatvecRunner {
             .command_buffer_count(1);
         let copy_command = unsafe { self.device.allocate_command_buffers(&alloc)?[0] };
         unsafe {
-            self.device.begin_command_buffer(
-                copy_command,
-                &vk::CommandBufferBeginInfo::default(),
-            )?;
+            self.device
+                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
             let region = [vk::BufferCopy::default().size(byte_len as u64)];
             self.device.cmd_copy_buffer(
                 copy_command,
@@ -810,12 +811,15 @@ impl CachedGpuPackedMatvecRunner {
             self.device.end_command_buffer(copy_command)?;
             self.device.reset_fences(&[self.fence])?;
         }
-        let submit_info = [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
+        let submit_info =
+            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
         let started = Instant::now();
         unsafe {
-            self.device.queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
             self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-            self.device.free_command_buffers(self.command_pool, &[copy_command]);
+            self.device
+                .free_command_buffers(self.command_pool, &[copy_command]);
         }
         Ok(started.elapsed())
     }

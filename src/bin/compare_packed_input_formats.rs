@@ -81,15 +81,16 @@ fn main() {
         cols,
     )
     .expect("source runner should initialize");
-    let (mut chained_runner, _) = CachedGpuPackedMatvecRunner::new_uninitialized_raw_f32_input_with_context(
-        shared_context,
-        code_words.len(),
-        packed.scales.len(),
-        packed.group_size,
-        rows,
-        cols,
-    )
-    .expect("chained runner should initialize");
+    let (mut chained_runner, _) =
+        CachedGpuPackedMatvecRunner::new_uninitialized_raw_f32_input_with_context(
+            shared_context,
+            code_words.len(),
+            packed.scales.len(),
+            packed.group_size,
+            rows,
+            cols,
+        )
+        .expect("chained runner should initialize");
     chained_runner
         .update_weights(&code_words, &packed.scales)
         .expect("chained runner weights should upload");
