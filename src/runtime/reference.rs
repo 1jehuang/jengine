@@ -4,6 +4,7 @@ use crate::gpu::pack_f16_pairs::CachedGpuPackF16PairsRunner;
 use crate::gpu::packed_matvec::{
     CachedGpuPackedMatvecRunner, SharedGpuPackedContext, run_packed_ternary_matvec_with_output,
 };
+use crate::gpu::swiglu_combined::CachedGpuSwigluCombinedRunner;
 use crate::gpu::weighted_rms_norm::CachedGpuWeightedRmsNormRunner;
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
@@ -295,6 +296,8 @@ type CachedWeightedRmsNormGpuRunner = Rc<RefCell<CachedGpuWeightedRmsNormRunner>
 type CachedWeightedRmsNormGpuCacheEntry = (CachedWeightedRmsNormGpuRunner, Duration, bool);
 type CachedPackF16PairsGpuRunner = Rc<RefCell<CachedGpuPackF16PairsRunner>>;
 type CachedPackF16PairsGpuCacheEntry = (CachedPackF16PairsGpuRunner, Duration, bool);
+type CachedSwigluCombinedGpuRunner = Rc<RefCell<CachedGpuSwigluCombinedRunner>>;
+type CachedSwigluCombinedGpuCacheEntry = (CachedSwigluCombinedGpuRunner, Duration, bool);
 type ProjectionTripletOutputs = (Vec<f32>, Vec<f32>, Vec<f32>);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -755,6 +758,14 @@ struct ResidentGpuPackedActivation {
     gpu_cache_hit: bool,
 }
 
+#[allow(dead_code)]
+struct ResidentGpuSwigluCombined {
+    runner: CachedSwigluCombinedGpuRunner,
+    report: crate::gpu::swiglu_combined::GpuSwigluCombinedReport,
+    compile_duration: Duration,
+    gpu_cache_hit: bool,
+}
+
 struct PackedGpuSession<'a> {
     model: &'a ReferenceModel,
     metrics: PackedGpuSessionMetrics,
@@ -1057,7 +1068,7 @@ impl<'a> PackedGpuSession<'a> {
         final_norm: ResidentGpuFinalNorm,
     ) -> Result<ResidentGpuPackedActivation, ReferenceError> {
         let (runner, compile_duration, gpu_cache_hit) =
-            self.model.get_or_create_pack_f16_pairs_gpu()?;
+            self.model.get_or_create_pack_f16_pairs_gpu(final_norm.runner.borrow().len())?;
         let report = runner
             .borrow_mut()
             .run_resident_from_f32_buffer(
@@ -1103,6 +1114,87 @@ impl<'a> PackedGpuSession<'a> {
             download_bytes: 0,
         });
         Ok(ResidentGpuPackedActivation {
+            runner,
+            report,
+            compile_duration,
+            gpu_cache_hit,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn run_swiglu_combined_resident(
+        &mut self,
+        pair: ResidentPackedPairProjection,
+    ) -> Result<ResidentGpuSwigluCombined, ReferenceError> {
+        let weight_upload_bytes = usize::from(!pair.prepared.gpu_cache_hit)
+            * (pair.prepared.packed.code_words.len() * std::mem::size_of::<u32>()
+                + pair.prepared.packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = pair.cols.div_ceil(2) * std::mem::size_of::<u32>();
+        self.account_projection_report(
+            &pair.prepared.packed,
+            pair.cols,
+            pair.prepared.weight_upload_duration,
+            pair.prepared.gpu_cache_hit,
+            &pair.report,
+            0,
+        );
+        self.push_dispatch_trace(
+            &pair.tensor_name,
+            "pair_resident",
+            pair.first_rows + pair.second_rows,
+            pair.cols,
+            pair.prepared.pack_cache_hit,
+            pair.prepared.gpu_cache_hit,
+            pair.prepared.compile_duration,
+            pair.prepared.weight_upload_duration,
+            pair.report.upload_duration,
+            pair.report.gpu_duration,
+            pair.report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            0,
+        );
+
+        let (runner, compile_duration, gpu_cache_hit) = self.model.get_or_create_swiglu_combined_gpu()?;
+        let report = runner
+            .borrow_mut()
+            .run_resident_from_f32_buffer(
+                pair.prepared.runner.borrow().shared_context(),
+                pair.prepared.runner.borrow().output_buffer_handle(),
+                pair.first_rows + pair.second_rows,
+                pair.prepared.runner.borrow().output_buffer_size(),
+            )
+            .map_err(|error| {
+                ReferenceError::Decode(format!("gpu combined swiglu failed: {error}"))
+            })?;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.upload_duration += report.upload_duration;
+        self.metrics.gpu_duration += report.gpu_duration;
+        self.metrics.dispatch_count += 1;
+        self.metrics.activation_upload_bytes += (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes += (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+        self.dispatch_trace.push(PackedDispatchTrace {
+            index: self.dispatch_trace.len() + 1,
+            operation: "resident".to_string(),
+            path: "gpu_dense".to_string(),
+            stage: "mlp_swiglu_gpu".to_string(),
+            tensor_name: "swiglu_combined".to_string(),
+            rows: pair.first_rows,
+            cols: pair.first_rows + pair.second_rows,
+            pack_cache_hit: false,
+            gpu_cache_hit,
+            cpu_ms: (compile_duration + report.upload_duration).as_secs_f64() * 1_000.0,
+            compile_ms: compile_duration.as_secs_f64() * 1_000.0,
+            weight_upload_ms: 0.0,
+            activation_upload_ms: report.upload_duration.as_secs_f64() * 1_000.0,
+            gpu_ms: report.gpu_duration.as_secs_f64() * 1_000.0,
+            download_ms: 0.0,
+            weight_upload_bytes: 0,
+            activation_upload_bytes: (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>(),
+            download_bytes: 0,
+        });
+        Ok(ResidentGpuSwigluCombined {
             runner,
             report,
             compile_duration,
@@ -1447,7 +1539,8 @@ pub struct ReferenceModel {
     cached_projection_packed: RefCell<HashMap<String, Rc<PackedProjectionCache>>>,
     cached_projection_gpu: RefCell<HashMap<String, CachedProjectionGpuRunner>>,
     cached_final_norm_gpu: RefCell<Option<CachedWeightedRmsNormGpuRunner>>,
-    cached_pack_f16_pairs_gpu: RefCell<Option<CachedPackF16PairsGpuRunner>>,
+    cached_pack_f16_pairs_gpu: RefCell<HashMap<usize, CachedPackF16PairsGpuRunner>>,
+    cached_swiglu_combined_gpu: RefCell<Option<CachedSwigluCombinedGpuRunner>>,
     packed_gpu_context: RefCell<Option<Arc<SharedGpuPackedContext>>>,
 }
 
@@ -1588,7 +1681,8 @@ impl ReferenceModel {
             cached_projection_packed: RefCell::new(HashMap::new()),
             cached_projection_gpu: RefCell::new(HashMap::new()),
             cached_final_norm_gpu: RefCell::new(None),
-            cached_pack_f16_pairs_gpu: RefCell::new(None),
+            cached_pack_f16_pairs_gpu: RefCell::new(HashMap::new()),
+            cached_swiglu_combined_gpu: RefCell::new(None),
             packed_gpu_context: RefCell::new(None),
         })
     }
@@ -1750,7 +1844,7 @@ impl ReferenceModel {
         let _ = self.load_vector_f32_resolved("model.norm.weight")?;
         if Self::packed_use_gpu_final_norm() {
             let _ = self.get_or_create_final_norm_gpu()?;
-            let _ = self.get_or_create_pack_f16_pairs_gpu()?;
+            let _ = self.get_or_create_pack_f16_pairs_gpu(self.config.hidden_size)?;
         }
         let (logits_packed, _, _) = self.get_or_create_projection_cache(
             "model.embed_tokens.weight",
@@ -2476,18 +2570,39 @@ impl ReferenceModel {
 
     fn get_or_create_pack_f16_pairs_gpu(
         &self,
+        len: usize,
     ) -> Result<CachedPackF16PairsGpuCacheEntry, ReferenceError> {
-        if let Some(cached) = self.cached_pack_f16_pairs_gpu.borrow().as_ref().cloned() {
+        if let Some(cached) = self.cached_pack_f16_pairs_gpu.borrow().get(&len).cloned() {
             return Ok((cached, Duration::ZERO, true));
         }
         let context = self.get_or_create_packed_gpu_context()?;
-        let (runner, duration) =
-            CachedGpuPackF16PairsRunner::new_with_context(context, self.config.hidden_size)
-                .map_err(|error| {
-                    ReferenceError::Decode(format!("gpu pack f16 pairs init failed: {error}"))
-                })?;
+        let (runner, duration) = CachedGpuPackF16PairsRunner::new_with_context(context, len)
+            .map_err(|error| {
+                ReferenceError::Decode(format!("gpu pack f16 pairs init failed: {error}"))
+            })?;
         let runner = Rc::new(RefCell::new(runner));
-        *self.cached_pack_f16_pairs_gpu.borrow_mut() = Some(runner.clone());
+        self.cached_pack_f16_pairs_gpu
+            .borrow_mut()
+            .insert(len, runner.clone());
+        Ok((runner, duration, false))
+    }
+
+    fn get_or_create_swiglu_combined_gpu(
+        &self,
+    ) -> Result<CachedSwigluCombinedGpuCacheEntry, ReferenceError> {
+        if let Some(cached) = self.cached_swiglu_combined_gpu.borrow().as_ref().cloned() {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let context = self.get_or_create_packed_gpu_context()?;
+        let (runner, duration) = CachedGpuSwigluCombinedRunner::new_with_context(
+            context,
+            self.config.intermediate_size,
+        )
+        .map_err(|error| {
+            ReferenceError::Decode(format!("gpu combined swiglu init failed: {error}"))
+        })?;
+        let runner = Rc::new(RefCell::new(runner));
+        *self.cached_swiglu_combined_gpu.borrow_mut() = Some(runner.clone());
         Ok((runner, duration, false))
     }
 
