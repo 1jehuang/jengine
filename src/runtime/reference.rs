@@ -708,10 +708,20 @@ struct PackedGpuSessionMetrics {
 
 struct PreparedProjectionRunner {
     packed: Rc<PackedProjectionCache>,
+    runner: CachedProjectionGpuRunner,
     compile_duration: Duration,
     weight_upload_duration: Duration,
     pack_cache_hit: bool,
     gpu_cache_hit: bool,
+}
+
+struct ResidentPackedProjection {
+    tensor_name: String,
+    operation: String,
+    rows: usize,
+    cols: usize,
+    prepared: PreparedProjectionRunner,
+    report: crate::gpu::packed_matvec::GpuPackedMatvecReport,
 }
 
 struct PackedGpuSession<'a> {
@@ -736,42 +746,87 @@ impl<'a> PackedGpuSession<'a> {
         cols: usize,
         input: &[f32],
     ) -> Result<Vec<f32>, ReferenceError> {
-        let prepared = self.prepare_projection_runner(tensor_name, rows, cols)?;
+        let resident = self.run_projection_resident(tensor_name, rows, cols, input, "single")?;
+        self.download_projection_output(resident)
+    }
 
-        let (output, report) = self
-            .model
-            .cached_projection_gpu
-            .borrow()
-            .get(tensor_name)
-            .cloned()
-            .expect("prepared runner should exist")
+    fn run_projection_argmax(
+        &mut self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Result<usize, ReferenceError> {
+        let resident = self.run_projection_resident(tensor_name, rows, cols, input, "argmax")?;
+        self.argmax_projection_output(resident)
+    }
+
+    fn run_projection_resident(
+        &mut self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+        operation: &str,
+    ) -> Result<ResidentPackedProjection, ReferenceError> {
+        let prepared = self.prepare_projection_runner(tensor_name, rows, cols)?;
+        let report = prepared
+            .runner
             .borrow_mut()
-            .run_with_output(input, None)
+            .run_resident(input)
             .map_err(|error| {
                 ReferenceError::Decode(format!("gpu projection failed for {tensor_name}: {error}"))
             })?;
-        let weight_upload_bytes = usize::from(!prepared.gpu_cache_hit)
-            * (prepared.packed.code_words.len() * std::mem::size_of::<u32>()
-                + prepared.packed.scales.len() * std::mem::size_of::<f32>());
-        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
-        let download_bytes = rows * std::mem::size_of::<f32>();
-        self.account_projection_report(
-            &prepared.packed,
+        Ok(ResidentPackedProjection {
+            tensor_name: tensor_name.to_string(),
+            operation: operation.to_string(),
+            rows,
             cols,
-            prepared.weight_upload_duration,
-            prepared.gpu_cache_hit,
+            prepared,
+            report,
+        })
+    }
+
+    fn download_projection_output(
+        &mut self,
+        resident: ResidentPackedProjection,
+    ) -> Result<Vec<f32>, ReferenceError> {
+        let (output, download_duration) =
+            resident
+                .prepared
+                .runner
+                .borrow()
+                .read_output()
+                .map_err(|error| {
+                    ReferenceError::Decode(format!(
+                        "gpu projection output download failed for {}: {error}",
+                        resident.tensor_name
+                    ))
+                })?;
+        let mut report = resident.report;
+        report.download_duration = download_duration;
+        let weight_upload_bytes = usize::from(!resident.prepared.gpu_cache_hit)
+            * (resident.prepared.packed.code_words.len() * std::mem::size_of::<u32>()
+                + resident.prepared.packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = resident.cols.div_ceil(2) * std::mem::size_of::<u32>();
+        let download_bytes = resident.rows * std::mem::size_of::<f32>();
+        self.account_projection_report(
+            &resident.prepared.packed,
+            resident.cols,
+            resident.prepared.weight_upload_duration,
+            resident.prepared.gpu_cache_hit,
             &report,
             download_bytes,
         );
         self.push_dispatch_trace(
-            tensor_name,
-            "single",
-            rows,
-            cols,
-            prepared.pack_cache_hit,
-            prepared.gpu_cache_hit,
-            prepared.compile_duration,
-            prepared.weight_upload_duration,
+            &resident.tensor_name,
+            &resident.operation,
+            resident.rows,
+            resident.cols,
+            resident.prepared.pack_cache_hit,
+            resident.prepared.gpu_cache_hit,
+            resident.prepared.compile_duration,
+            resident.prepared.weight_upload_duration,
             report.upload_duration,
             report.gpu_duration,
             report.download_duration,
@@ -782,47 +837,44 @@ impl<'a> PackedGpuSession<'a> {
         Ok(output)
     }
 
-    fn run_projection_argmax(
+    fn argmax_projection_output(
         &mut self,
-        tensor_name: &str,
-        rows: usize,
-        cols: usize,
-        input: &[f32],
+        resident: ResidentPackedProjection,
     ) -> Result<usize, ReferenceError> {
-        let prepared = self.prepare_projection_runner(tensor_name, rows, cols)?;
-        let (argmax_index, report) = self
-            .model
-            .cached_projection_gpu
+        let (argmax_index, download_duration) = resident
+            .prepared
+            .runner
             .borrow()
-            .get(tensor_name)
-            .cloned()
-            .expect("prepared runner should exist")
-            .borrow_mut()
-            .run_with_argmax(input)
+            .argmax_output()
             .map_err(|error| {
-                ReferenceError::Decode(format!("gpu projection failed for {tensor_name}: {error}"))
-            })?;
-        let weight_upload_bytes = usize::from(!prepared.gpu_cache_hit)
-            * (prepared.packed.code_words.len() * std::mem::size_of::<u32>()
-                + prepared.packed.scales.len() * std::mem::size_of::<f32>());
-        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+            ReferenceError::Decode(format!(
+                "gpu projection argmax failed for {}: {error}",
+                resident.tensor_name
+            ))
+        })?;
+        let mut report = resident.report;
+        report.download_duration = download_duration;
+        let weight_upload_bytes = usize::from(!resident.prepared.gpu_cache_hit)
+            * (resident.prepared.packed.code_words.len() * std::mem::size_of::<u32>()
+                + resident.prepared.packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = resident.cols.div_ceil(2) * std::mem::size_of::<u32>();
         self.account_projection_report(
-            &prepared.packed,
-            cols,
-            prepared.weight_upload_duration,
-            prepared.gpu_cache_hit,
+            &resident.prepared.packed,
+            resident.cols,
+            resident.prepared.weight_upload_duration,
+            resident.prepared.gpu_cache_hit,
             &report,
             0,
         );
         self.push_dispatch_trace(
-            tensor_name,
-            "argmax",
-            rows,
-            cols,
-            prepared.pack_cache_hit,
-            prepared.gpu_cache_hit,
-            prepared.compile_duration,
-            prepared.weight_upload_duration,
+            &resident.tensor_name,
+            &resident.operation,
+            resident.rows,
+            resident.cols,
+            resident.prepared.pack_cache_hit,
+            resident.prepared.gpu_cache_hit,
+            resident.prepared.compile_duration,
+            resident.prepared.weight_upload_duration,
             report.upload_duration,
             report.gpu_duration,
             report.download_duration,
@@ -842,7 +894,7 @@ impl<'a> PackedGpuSession<'a> {
         let (packed, pack_duration, pack_cache_hit) =
             self.model
                 .get_or_create_projection_cache(tensor_name, rows, cols)?;
-        let (_runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
             .model
             .get_or_create_projection_gpu(tensor_name, &packed)?;
         self.metrics.pack_duration += pack_duration;
@@ -852,6 +904,7 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
         Ok(PreparedProjectionRunner {
             packed,
+            runner,
             compile_duration,
             weight_upload_duration,
             pack_cache_hit,

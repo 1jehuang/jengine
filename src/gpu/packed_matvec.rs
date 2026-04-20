@@ -447,54 +447,59 @@ impl CachedGpuPackedMatvecRunner {
         input: &[f32],
         reference: Option<&[f32]>,
     ) -> Result<(Vec<f32>, GpuPackedMatvecReport), GpuPackedMatvecError> {
-        let (upload_duration, gpu_duration) = self.run_without_download(input)?;
-        let download_started = Instant::now();
-        let gpu_output = read_f32_buffer(&self.output_buffer, self.rows)?;
-        let download_duration = download_started.elapsed();
+        let mut report = self.run_resident(input)?;
+        let (gpu_output, download_duration) = self.read_output()?;
+        report.download_duration = download_duration;
         let (max_abs_diff, mean_abs_diff) = match reference {
             Some(reference) => compare_outputs(reference, &gpu_output),
             None => (0.0, 0.0),
         };
+        report.max_abs_diff = max_abs_diff;
+        report.mean_abs_diff = mean_abs_diff;
 
-        Ok((
-            gpu_output,
-            GpuPackedMatvecReport {
-                rows: self.rows,
-                cols: self.cols,
-                compile_duration: Duration::ZERO,
-                upload_duration,
-                gpu_duration,
-                download_duration,
-                max_abs_diff,
-                mean_abs_diff,
-            },
-        ))
+        Ok((gpu_output, report))
     }
 
     pub fn run_with_argmax(
         &mut self,
         input: &[f32],
     ) -> Result<(usize, GpuPackedMatvecReport), GpuPackedMatvecError> {
-        let (upload_duration, gpu_duration) = self.run_without_download(input)?;
-        let download_started = Instant::now();
-        let argmax_index = argmax_f32_buffer(&self.output_buffer, self.rows)?;
-        let download_duration = download_started.elapsed();
-        Ok((
-            argmax_index,
-            GpuPackedMatvecReport {
-                rows: self.rows,
-                cols: self.cols,
-                compile_duration: Duration::ZERO,
-                upload_duration,
-                gpu_duration,
-                download_duration,
-                max_abs_diff: 0.0,
-                mean_abs_diff: 0.0,
-            },
-        ))
+        let mut report = self.run_resident(input)?;
+        let (argmax_index, download_duration) = self.argmax_output()?;
+        report.download_duration = download_duration;
+        Ok((argmax_index, report))
     }
 
-    fn run_without_download(
+    pub fn run_resident(
+        &mut self,
+        input: &[f32],
+    ) -> Result<GpuPackedMatvecReport, GpuPackedMatvecError> {
+        let (upload_duration, gpu_duration) = self.run_without_download(input)?;
+        Ok(GpuPackedMatvecReport {
+            rows: self.rows,
+            cols: self.cols,
+            compile_duration: Duration::ZERO,
+            upload_duration,
+            gpu_duration,
+            download_duration: Duration::ZERO,
+            max_abs_diff: 0.0,
+            mean_abs_diff: 0.0,
+        })
+    }
+
+    pub fn read_output(&self) -> Result<(Vec<f32>, Duration), GpuPackedMatvecError> {
+        let download_started = Instant::now();
+        let gpu_output = read_f32_buffer(&self.output_buffer, self.rows)?;
+        Ok((gpu_output, download_started.elapsed()))
+    }
+
+    pub fn argmax_output(&self) -> Result<(usize, Duration), GpuPackedMatvecError> {
+        let download_started = Instant::now();
+        let argmax_index = argmax_f32_buffer(&self.output_buffer, self.rows)?;
+        Ok((argmax_index, download_started.elapsed()))
+    }
+
+    pub fn run_without_download(
         &mut self,
         input: &[f32],
     ) -> Result<(Duration, Duration), GpuPackedMatvecError> {
