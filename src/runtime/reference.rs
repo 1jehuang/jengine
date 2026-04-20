@@ -391,6 +391,23 @@ impl PackedDecodeMetrics {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackedDecodeValidationReport {
+    pub enabled_projections: String,
+    pub prompt_tokens: usize,
+    pub max_abs_diff: f32,
+    pub mean_abs_diff: f32,
+}
+
+impl PackedDecodeValidationReport {
+    pub fn summarize(&self) -> String {
+        format!(
+            "enabled={} prompt_tokens={} max_abs_diff={:.6} mean_abs_diff={:.6}",
+            self.enabled_projections, self.prompt_tokens, self.max_abs_diff, self.mean_abs_diff,
+        )
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PackedGpuSessionMetrics {
     pack_duration: Duration,
@@ -1627,6 +1644,96 @@ impl ReferenceModel {
         })
     }
 
+    pub fn prefill_logits_for_variant(
+        &self,
+        prompt: &str,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+    ) -> Result<Vec<f32>, ReferenceError> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
+        let prompt_ids = self.encode_prompt_ids(tokenizer, prompt)?;
+        let mut metrics = DecodeMetrics {
+            prompt_tokens: prompt_ids.len(),
+            generated_tokens: 0,
+            total_duration: Duration::ZERO,
+            embedding_duration: Duration::ZERO,
+            norm_duration: Duration::ZERO,
+            qkv_duration: Duration::ZERO,
+            attention_duration: Duration::ZERO,
+            mlp_duration: Duration::ZERO,
+            logits_duration: Duration::ZERO,
+        };
+        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len());
+        let mut session = PackedGpuSession::new(self);
+        let mut last_logits = Vec::new();
+        for (position, &token_id) in prompt_ids.iter().enumerate() {
+            last_logits = self.forward_step_packed_decode(
+                token_id,
+                position,
+                &mut cache,
+                &mut metrics,
+                &mut session,
+                use_attention_qkv,
+                use_mlp_gu,
+            )?;
+        }
+        Ok(last_logits)
+    }
+
+    pub fn compare_prefill_logits_against(
+        &self,
+        dense_reference: &ReferenceModel,
+        prompt: &str,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+    ) -> Result<PackedDecodeValidationReport, ReferenceError> {
+        let dense_logits = dense_reference.prefill_logits_for_variant(prompt, false, false)?;
+        let packed_logits =
+            self.prefill_logits_for_variant(prompt, use_attention_qkv, use_mlp_gu)?;
+        if dense_logits.len() != packed_logits.len() {
+            return Err(ReferenceError::Decode(format!(
+                "logit length mismatch: dense {} vs packed {}",
+                dense_logits.len(),
+                packed_logits.len()
+            )));
+        }
+        let mut max_abs_diff = 0.0f32;
+        let mut sum_abs_diff = 0.0f32;
+        for (left, right) in dense_logits.iter().zip(packed_logits.iter()) {
+            let diff = (left - right).abs();
+            max_abs_diff = max_abs_diff.max(diff);
+            sum_abs_diff += diff;
+        }
+        let mean_abs_diff = if dense_logits.is_empty() {
+            0.0
+        } else {
+            sum_abs_diff / dense_logits.len() as f32
+        };
+        let prompt_tokens = dense_reference.prompt_analysis(prompt)?.token_count;
+        let mut enabled = String::new();
+        if use_attention_qkv {
+            enabled.push_str("qkv");
+        }
+        if use_mlp_gu {
+            if !enabled.is_empty() {
+                enabled.push('+');
+            }
+            enabled.push_str("gu");
+        }
+        if enabled.is_empty() {
+            enabled.push_str("dense");
+        }
+        Ok(PackedDecodeValidationReport {
+            enabled_projections: enabled,
+            prompt_tokens,
+            max_abs_diff,
+            mean_abs_diff,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_hybrid_qproj_decode(
         &self,
@@ -2759,6 +2866,33 @@ mod tests {
 
         assert_eq!(metrics.q_proj_pack_duration, Duration::ZERO);
         assert!(!metrics.q_proj_pack_cache_hit);
+    }
+
+    #[test]
+    fn compares_prefill_logits_between_dense_and_packed_variants_on_synthetic_model() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let dense = ReferenceModel::load_from_root(dir.path()).expect("dense model should load");
+        let packed =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed model should load");
+
+        let attention = packed
+            .compare_prefill_logits_against(&dense, "tok2", true, false)
+            .expect("attention validation should succeed");
+        let mlp = packed
+            .compare_prefill_logits_against(&dense, "tok2", false, true)
+            .expect("mlp validation should succeed");
+        let combined = packed
+            .compare_prefill_logits_against(&dense, "tok2", true, true)
+            .expect("combined validation should succeed");
+
+        assert_eq!(attention.max_abs_diff, 0.0);
+        assert_eq!(mlp.max_abs_diff, 0.0);
+        assert_eq!(combined.max_abs_diff, 0.0);
     }
 
     use std::time::Duration;

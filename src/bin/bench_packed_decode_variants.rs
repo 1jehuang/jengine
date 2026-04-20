@@ -51,7 +51,8 @@ fn main() {
         .nth(4)
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(1);
-    let out_path = std::env::args().nth(5);
+    let variant = std::env::args().nth(5).unwrap_or_else(|| "all".to_string());
+    let out_path = std::env::args().nth(6);
 
     let dense_model = run_stage("load_dense_model", || {
         ReferenceModel::load_from_root(&root).expect("dense model should load")
@@ -66,30 +67,37 @@ fn main() {
             .generate_greedy(&prompt, max_new_tokens)
             .expect("dense decode should succeed")
     });
-    let attention_only = run_stage("packed_attention_decode", || {
-        packed_model
-            .benchmark_packed_decode(&prompt, max_new_tokens, true, false)
-            .expect("packed attention decode should succeed")
-    });
-    let mlp_only = run_stage("packed_mlp_decode", || {
-        packed_model
-            .benchmark_packed_decode(&prompt, max_new_tokens, false, true)
-            .expect("packed mlp decode should succeed")
-    });
-    let combined = run_stage("packed_combined_decode", || {
-        packed_model
-            .benchmark_packed_decode(&prompt, max_new_tokens, true, true)
-            .expect("packed combined decode should succeed")
-    });
-
-    let summary = format!(
-        "dense={} output={}\n{}\n{}\n{}\n",
+    let mut lines = vec![format!(
+        "dense={} output={}",
         dense.metrics.summarize(),
         dense.output_text,
-        render("qkv", &attention_only),
-        render("gu", &mlp_only),
-        render("qkv+gu", &combined),
-    );
+    )];
+    if variant == "attention" || variant == "all" {
+        let attention_only = run_stage("packed_attention_decode", || {
+            packed_model
+                .benchmark_packed_decode(&prompt, max_new_tokens, true, false)
+                .expect("packed attention decode should succeed")
+        });
+        lines.push(render("qkv", &attention_only));
+    }
+    if variant == "mlp" || variant == "all" {
+        let mlp_only = run_stage("packed_mlp_decode", || {
+            packed_model
+                .benchmark_packed_decode(&prompt, max_new_tokens, false, true)
+                .expect("packed mlp decode should succeed")
+        });
+        lines.push(render("gu", &mlp_only));
+    }
+    if variant == "combined" || variant == "all" {
+        let combined = run_stage("packed_combined_decode", || {
+            packed_model
+                .benchmark_packed_decode(&prompt, max_new_tokens, true, true)
+                .expect("packed combined decode should succeed")
+        });
+        lines.push(render("qkv+gu", &combined));
+    }
+
+    let summary = format!("{}\n", lines.join("\n"));
     if let Some(out_path) = out_path {
         std::fs::write(&out_path, &summary).expect("packed decode summary should write");
     }
