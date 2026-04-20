@@ -169,6 +169,49 @@ Observed sample:
   - gpu compute: `15.424 ms`
   - gpu download: `0.238 ms`
 
+## Attention projection mix baselines
+
+### Real one-layer attention projection mix comparison
+
+Command shape:
+
+```bash
+TMPDIR=$PWD/.tmp cargo run --release --bin bench_attention_projection_mix -- \
+  /home/jeremy/models/bonsai-1.7b 0 42 .artifacts/attention_mix.txt
+```
+
+Observed sample:
+
+- `q` variant:
+  - total: `21.431 ms`
+  - pack: `69.883 ms`
+  - compile: `209.190 ms`
+  - upload: `0.024 ms`
+  - gpu: `1.296 ms`
+  - download: `0.067 ms`
+  - max abs diff: `0.000000`
+- `qkv` variant:
+  - total: `8.299 ms`
+  - pack: `63.558 ms`
+  - compile: `266.649 ms`
+  - upload: `0.060 ms`
+  - gpu: `3.402 ms`
+  - download: `0.087 ms`
+  - max abs diff: `0.001472`
+- `qkvo` variant:
+  - total: `216.190 ms`
+  - pack: `68.946 ms`
+  - compile: `131.283 ms`
+  - upload: `0.150 ms`
+  - gpu: `6.019 ms`
+  - download: `0.434 ms`
+  - max abs diff: `0.001204`
+
+Current interpretation:
+
+- `qkv` is currently the best attention-side projection mix among these three tested variants
+- `qkvo` is currently much slower, so `o_proj` offload needs more investigation before rolling it into a broader decode path
+
 ## Key current conclusion
 
 The model, repacker, and runtime integration are correct enough to measure real behavior.

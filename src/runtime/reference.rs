@@ -220,6 +220,45 @@ struct HybridQProjCache {
     scales: Vec<f32>,
 }
 
+#[derive(Debug, Clone)]
+struct PackedProjectionCache {
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    code_words: Vec<u32>,
+    scales: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttentionProjectionMixMetrics {
+    pub enabled_projections: String,
+    pub total_duration: Duration,
+    pub pack_duration: Duration,
+    pub compile_duration: Duration,
+    pub upload_duration: Duration,
+    pub gpu_duration: Duration,
+    pub download_duration: Duration,
+    pub max_abs_diff: f32,
+    pub mean_abs_diff: f32,
+}
+
+impl AttentionProjectionMixMetrics {
+    pub fn summarize(&self) -> String {
+        format!(
+            "enabled={} total_ms={:.3} pack_ms={:.3} compile_ms={:.3} upload_ms={:.3} gpu_ms={:.3} download_ms={:.3} max_abs_diff={:.6} mean_abs_diff={:.6}",
+            self.enabled_projections,
+            self.total_duration.as_secs_f64() * 1_000.0,
+            self.pack_duration.as_secs_f64() * 1_000.0,
+            self.compile_duration.as_secs_f64() * 1_000.0,
+            self.upload_duration.as_secs_f64() * 1_000.0,
+            self.gpu_duration.as_secs_f64() * 1_000.0,
+            self.download_duration.as_secs_f64() * 1_000.0,
+            self.max_abs_diff,
+            self.mean_abs_diff,
+        )
+    }
+}
+
 pub struct ReferenceModel {
     pub assets: BonsaiAssetPaths,
     pub config: BonsaiModelConfig,
@@ -229,6 +268,8 @@ pub struct ReferenceModel {
     rope: YarnRope,
     cached_hybrid_qproj: RefCell<HashMap<usize, Rc<HybridQProjCache>>>,
     cached_hybrid_qproj_gpu: RefCell<HashMap<usize, Rc<RefCell<CachedGpuPackedMatvecRunner>>>>,
+    cached_projection_packed: RefCell<HashMap<String, Rc<PackedProjectionCache>>>,
+    cached_projection_gpu: RefCell<HashMap<String, Rc<RefCell<CachedGpuPackedMatvecRunner>>>>,
 }
 
 impl ReferenceModel {
@@ -251,6 +292,8 @@ impl ReferenceModel {
             rope,
             cached_hybrid_qproj: RefCell::new(HashMap::new()),
             cached_hybrid_qproj_gpu: RefCell::new(HashMap::new()),
+            cached_projection_packed: RefCell::new(HashMap::new()),
+            cached_projection_gpu: RefCell::new(HashMap::new()),
         })
     }
 
@@ -604,6 +647,309 @@ impl ReferenceModel {
             .borrow_mut()
             .insert(layer_idx, runner.clone());
         Ok((runner, duration, false))
+    }
+
+    fn build_projection_cache(
+        &self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(PackedProjectionCache, Duration), ReferenceError> {
+        let values = self.weights.load_vector_f32(tensor_name)?;
+        let pack_started = Instant::now();
+        let (packed, _) = pack_ternary_g128(&values, vec![rows, cols], 1e-3).map_err(|error| {
+            ReferenceError::Decode(format!("pack failed for {tensor_name}: {error}"))
+        })?;
+        let pack_duration = pack_started.elapsed();
+        let code_words = packed
+            .packed_codes
+            .chunks(4)
+            .map(|chunk| {
+                let mut word = 0u32;
+                for (i, byte) in chunk.iter().enumerate() {
+                    word |= (*byte as u32) << (i * 8);
+                }
+                word
+            })
+            .collect::<Vec<_>>();
+        Ok((
+            PackedProjectionCache {
+                rows,
+                cols,
+                group_size: packed.group_size,
+                code_words,
+                scales: packed.scales,
+            },
+            pack_duration,
+        ))
+    }
+
+    fn get_or_create_projection_cache(
+        &self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Rc<PackedProjectionCache>, Duration, bool), ReferenceError> {
+        if let Some(cached) = self
+            .cached_projection_packed
+            .borrow()
+            .get(tensor_name)
+            .cloned()
+        {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let (packed, duration) = self.build_projection_cache(tensor_name, rows, cols)?;
+        let packed = Rc::new(packed);
+        self.cached_projection_packed
+            .borrow_mut()
+            .insert(tensor_name.to_string(), packed.clone());
+        Ok((packed, duration, false))
+    }
+
+    fn get_or_create_projection_gpu(
+        &self,
+        tensor_name: &str,
+        packed: &PackedProjectionCache,
+    ) -> Result<(Rc<RefCell<CachedGpuPackedMatvecRunner>>, Duration, bool), ReferenceError> {
+        if let Some(cached) = self
+            .cached_projection_gpu
+            .borrow()
+            .get(tensor_name)
+            .cloned()
+        {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let (runner, duration) = CachedGpuPackedMatvecRunner::new(
+            &packed.code_words,
+            &packed.scales,
+            packed.group_size,
+            packed.rows,
+            packed.cols,
+        )
+        .map_err(|error| {
+            ReferenceError::Decode(format!("gpu packed init failed for {tensor_name}: {error}"))
+        })?;
+        let runner = Rc::new(RefCell::new(runner));
+        self.cached_projection_gpu
+            .borrow_mut()
+            .insert(tensor_name.to_string(), runner.clone());
+        Ok((runner, duration, false))
+    }
+
+    pub fn benchmark_attention_projection_mix(
+        &self,
+        layer_idx: usize,
+        token_id: usize,
+        use_q: bool,
+        use_k: bool,
+        use_v: bool,
+        use_o: bool,
+    ) -> Result<AttentionProjectionMixMetrics, ReferenceError> {
+        let prefix = format!("model.layers.{layer_idx}");
+        let hidden_states = self.layer_input_hidden(token_id, layer_idx)?;
+        let q_rows = self.config.hidden_size;
+        let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
+        let cols = self.config.hidden_size;
+
+        let mut pack_duration = Duration::ZERO;
+        let mut compile_duration = Duration::ZERO;
+        let mut upload_duration = Duration::ZERO;
+        let mut gpu_duration = Duration::ZERO;
+        let mut download_duration = Duration::ZERO;
+
+        let q_name = format!("{prefix}.self_attn.q_proj.weight");
+        let k_name = format!("{prefix}.self_attn.k_proj.weight");
+        let v_name = format!("{prefix}.self_attn.v_proj.weight");
+        let o_name = format!("{prefix}.self_attn.o_proj.weight");
+
+        let q_gpu = if use_q {
+            let (packed, pack, _) = self.get_or_create_projection_cache(&q_name, q_rows, cols)?;
+            let (runner, compile, _) = self.get_or_create_projection_gpu(&q_name, &packed)?;
+            pack_duration += pack;
+            compile_duration += compile;
+            Some(runner)
+        } else {
+            None
+        };
+        let k_gpu = if use_k {
+            let (packed, pack, _) = self.get_or_create_projection_cache(&k_name, kv_rows, cols)?;
+            let (runner, compile, _) = self.get_or_create_projection_gpu(&k_name, &packed)?;
+            pack_duration += pack;
+            compile_duration += compile;
+            Some(runner)
+        } else {
+            None
+        };
+        let v_gpu = if use_v {
+            let (packed, pack, _) = self.get_or_create_projection_cache(&v_name, kv_rows, cols)?;
+            let (runner, compile, _) = self.get_or_create_projection_gpu(&v_name, &packed)?;
+            pack_duration += pack;
+            compile_duration += compile;
+            Some(runner)
+        } else {
+            None
+        };
+
+        let total_started = Instant::now();
+        let mut q = if let Some(runner) = &q_gpu {
+            let (out, report) = runner
+                .borrow_mut()
+                .run_with_output(&hidden_states, None)
+                .map_err(|error| ReferenceError::Decode(format!("gpu q_proj failed: {error}")))?;
+            upload_duration += report.upload_duration;
+            gpu_duration += report.gpu_duration;
+            download_duration += report.download_duration;
+            out
+        } else {
+            self.weights.matvec_f16(&q_name, &hidden_states)?
+        };
+        let mut k = if let Some(runner) = &k_gpu {
+            let (out, report) = runner
+                .borrow_mut()
+                .run_with_output(&hidden_states, None)
+                .map_err(|error| ReferenceError::Decode(format!("gpu k_proj failed: {error}")))?;
+            upload_duration += report.upload_duration;
+            gpu_duration += report.gpu_duration;
+            download_duration += report.download_duration;
+            out
+        } else {
+            self.weights.matvec_f16(&k_name, &hidden_states)?
+        };
+        let v = if let Some(runner) = &v_gpu {
+            let (out, report) = runner
+                .borrow_mut()
+                .run_with_output(&hidden_states, None)
+                .map_err(|error| ReferenceError::Decode(format!("gpu v_proj failed: {error}")))?;
+            upload_duration += report.upload_duration;
+            gpu_duration += report.gpu_duration;
+            download_duration += report.download_duration;
+            out
+        } else {
+            self.weights.matvec_f16(&v_name, &hidden_states)?
+        };
+
+        let q_norm_weight = self
+            .weights
+            .load_vector_f32(&format!("{prefix}.self_attn.q_norm.weight"))?;
+        let k_norm_weight = self
+            .weights
+            .load_vector_f32(&format!("{prefix}.self_attn.k_norm.weight"))?;
+        let (cos, sin) = rope_cos_sin(&self.rope, &[0]);
+        apply_head_rms_norm_weighted(
+            &mut q,
+            self.config.num_attention_heads,
+            self.config.head_dim,
+            &q_norm_weight,
+            self.config.rms_norm_eps as f32,
+        );
+        apply_head_rms_norm_weighted(
+            &mut k,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            &k_norm_weight,
+            self.config.rms_norm_eps as f32,
+        );
+        apply_rotary_single(
+            &mut q,
+            &mut k,
+            &cos,
+            &sin,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+        );
+
+        let attn = attention_single_query(
+            &q,
+            &k,
+            &v,
+            1,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+        );
+
+        let mixed_o = if use_o {
+            let (packed, pack, _) = self.get_or_create_projection_cache(&o_name, q_rows, q_rows)?;
+            let (runner, compile, _) = self.get_or_create_projection_gpu(&o_name, &packed)?;
+            pack_duration += pack;
+            compile_duration += compile;
+            let (out, report) = runner
+                .borrow_mut()
+                .run_with_output(&attn, None)
+                .map_err(|error| ReferenceError::Decode(format!("gpu o_proj failed: {error}")))?;
+            upload_duration += report.upload_duration;
+            gpu_duration += report.gpu_duration;
+            download_duration += report.download_duration;
+            out
+        } else {
+            self.weights.matvec_f16(&o_name, &attn)?
+        };
+        let total_duration = total_started.elapsed();
+
+        let dense_q = self.weights.matvec_f16(&q_name, &hidden_states)?;
+        let mut dense_k = self.weights.matvec_f16(&k_name, &hidden_states)?;
+        let dense_v = self.weights.matvec_f16(&v_name, &hidden_states)?;
+        let mut dense_q_normed = dense_q.clone();
+        apply_head_rms_norm_weighted(
+            &mut dense_q_normed,
+            self.config.num_attention_heads,
+            self.config.head_dim,
+            &q_norm_weight,
+            self.config.rms_norm_eps as f32,
+        );
+        apply_head_rms_norm_weighted(
+            &mut dense_k,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            &k_norm_weight,
+            self.config.rms_norm_eps as f32,
+        );
+        apply_rotary_single(
+            &mut dense_q_normed,
+            &mut dense_k,
+            &cos,
+            &sin,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+        );
+        let dense_attn = attention_single_query(
+            &dense_q_normed,
+            &dense_k,
+            &dense_v,
+            1,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+        );
+        let dense_o = self.weights.matvec_f16(&o_name, &dense_attn)?;
+        let mut max_abs_diff = 0.0f32;
+        let mut sum_abs_diff = 0.0f32;
+        for (left, right) in mixed_o.iter().zip(dense_o.iter()) {
+            let diff = (left - right).abs();
+            max_abs_diff = max_abs_diff.max(diff);
+            sum_abs_diff += diff;
+        }
+        let mean_abs_diff = sum_abs_diff / mixed_o.len() as f32;
+
+        let enabled_projections = [("q", use_q), ("k", use_k), ("v", use_v), ("o", use_o)]
+            .into_iter()
+            .filter_map(|(name, enabled)| enabled.then_some(name))
+            .collect::<Vec<_>>()
+            .join("");
+
+        Ok(AttentionProjectionMixMetrics {
+            enabled_projections,
+            total_duration,
+            pack_duration,
+            compile_duration,
+            upload_duration,
+            gpu_duration,
+            download_duration,
+            max_abs_diff,
+            mean_abs_diff,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
