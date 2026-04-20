@@ -449,6 +449,30 @@ Current interpretation:
 - on this real `q_proj` tensor it is about **`2.25x`** faster than the current default packed shader on median GPU time
 - that makes further subgroup-oriented kernel experimentation worth continuing, especially if the win can survive integration into the broader packed runtime
 
+### Carry-up into the chunked combined packed upper bound
+
+Using the same 7-layer chunk chaining workflow as the packed combined upper bound, but with `JENGINE_PACKED_SHADER_VARIANT=xe2_subgroup_row`, produced:
+
+- total: `11885.064 ms`
+- compile: `1364.736 ms`
+- upload: `20.824 ms`
+- gpu: `250.854 ms`
+- download: `30.269 ms`
+- non-offloaded dense: `9445.204 ms`
+- orchestration: `773.164 ms`
+- dispatches: `57`
+
+Compared with the default-shader chunked combined upper bound:
+
+- total improved from `12212.554 ms` to `11885.064 ms`
+- gpu time improved from `657.716 ms` to `250.854 ms`
+
+Current interpretation:
+
+- the subgroup-row win does survive into the broader packed path
+- but only as about a **`2.7%`** total upper-bound improvement in the current chunked combined capture
+- that gap between microbenchmark win and end-to-end win reinforces that dense-side work still dominates the current packed runtime
+
 ## Chunked packed capture workarounds
 
 ### Real combined and attention-only packed step upper bounds via 7-layer chunk chaining
