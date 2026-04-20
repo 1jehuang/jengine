@@ -212,6 +212,41 @@ Current interpretation:
 - `qkv` is currently the best attention-side projection mix among these three tested variants
 - `qkvo` is currently much slower, so `o_proj` offload needs more investigation before rolling it into a broader decode path
 
+## MLP projection mix baselines
+
+### Real one-layer MLP projection mix comparison
+
+Command shape:
+
+```bash
+TMPDIR=$PWD/.tmp cargo run --release --bin bench_mlp_projection_mix -- \
+  /home/jeremy/models/bonsai-1.7b 0 42 .artifacts/mlp_mix.txt
+```
+
+Observed sample:
+
+- `gu` variant:
+  - total: `31.034 ms`
+  - pack: `379.373 ms`
+  - compile: `301.464 ms`
+  - upload: `0.063 ms`
+  - gpu: `5.883 ms`
+  - download: `0.468 ms`
+  - max abs diff: `0.000280`
+- `gud` variant:
+  - total: `469.963 ms`
+  - pack: `211.331 ms`
+  - compile: `211.125 ms`
+  - upload: `0.219 ms`
+  - gpu: `10.374 ms`
+  - download: `0.321 ms`
+  - max abs diff: `0.000515`
+
+Current interpretation:
+
+- `gate_proj + up_proj` currently looks like the promising first MLP offload slice
+- adding `down_proj` in the current form is much slower and needs separate investigation before broader rollout
+
 ## Key current conclusion
 
 The model, repacker, and runtime integration are correct enough to measure real behavior.

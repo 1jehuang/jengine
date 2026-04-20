@@ -259,6 +259,36 @@ impl AttentionProjectionMixMetrics {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct MlpProjectionMixMetrics {
+    pub enabled_projections: String,
+    pub total_duration: Duration,
+    pub pack_duration: Duration,
+    pub compile_duration: Duration,
+    pub upload_duration: Duration,
+    pub gpu_duration: Duration,
+    pub download_duration: Duration,
+    pub max_abs_diff: f32,
+    pub mean_abs_diff: f32,
+}
+
+impl MlpProjectionMixMetrics {
+    pub fn summarize(&self) -> String {
+        format!(
+            "enabled={} total_ms={:.3} pack_ms={:.3} compile_ms={:.3} upload_ms={:.3} gpu_ms={:.3} download_ms={:.3} max_abs_diff={:.6} mean_abs_diff={:.6}",
+            self.enabled_projections,
+            self.total_duration.as_secs_f64() * 1_000.0,
+            self.pack_duration.as_secs_f64() * 1_000.0,
+            self.compile_duration.as_secs_f64() * 1_000.0,
+            self.upload_duration.as_secs_f64() * 1_000.0,
+            self.gpu_duration.as_secs_f64() * 1_000.0,
+            self.download_duration.as_secs_f64() * 1_000.0,
+            self.max_abs_diff,
+            self.mean_abs_diff,
+        )
+    }
+}
+
 pub struct ReferenceModel {
     pub assets: BonsaiAssetPaths,
     pub config: BonsaiModelConfig,
@@ -940,6 +970,201 @@ impl ReferenceModel {
             .join("");
 
         Ok(AttentionProjectionMixMetrics {
+            enabled_projections,
+            total_duration,
+            pack_duration,
+            compile_duration,
+            upload_duration,
+            gpu_duration,
+            download_duration,
+            max_abs_diff,
+            mean_abs_diff,
+        })
+    }
+
+    pub fn benchmark_mlp_projection_mix(
+        &self,
+        layer_idx: usize,
+        token_id: usize,
+        use_gate: bool,
+        use_up: bool,
+        use_down: bool,
+    ) -> Result<MlpProjectionMixMetrics, ReferenceError> {
+        let prefix = format!("model.layers.{layer_idx}");
+        let hidden = self
+            .weights
+            .embedding_lookup("model.embed_tokens.weight", token_id)?;
+        let input_norm_weight = self
+            .weights
+            .load_vector_f32(&format!("{prefix}.input_layernorm.weight"))?;
+        let mut hidden_states =
+            weighted_rms_norm(&hidden, &input_norm_weight, self.config.rms_norm_eps as f32);
+
+        let q_name = format!("{prefix}.self_attn.q_proj.weight");
+        let k_name = format!("{prefix}.self_attn.k_proj.weight");
+        let v_name = format!("{prefix}.self_attn.v_proj.weight");
+        let o_name = format!("{prefix}.self_attn.o_proj.weight");
+        let q_norm_weight = self
+            .weights
+            .load_vector_f32(&format!("{prefix}.self_attn.q_norm.weight"))?;
+        let k_norm_weight = self
+            .weights
+            .load_vector_f32(&format!("{prefix}.self_attn.k_norm.weight"))?;
+        let (cos, sin) = rope_cos_sin(&self.rope, &[0]);
+
+        let mut q = self.weights.matvec_f16(&q_name, &hidden_states)?;
+        let mut k = self.weights.matvec_f16(&k_name, &hidden_states)?;
+        let v = self.weights.matvec_f16(&v_name, &hidden_states)?;
+        apply_head_rms_norm_weighted(
+            &mut q,
+            self.config.num_attention_heads,
+            self.config.head_dim,
+            &q_norm_weight,
+            self.config.rms_norm_eps as f32,
+        );
+        apply_head_rms_norm_weighted(
+            &mut k,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            &k_norm_weight,
+            self.config.rms_norm_eps as f32,
+        );
+        apply_rotary_single(
+            &mut q,
+            &mut k,
+            &cos,
+            &sin,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+        );
+        let attn = attention_single_query(
+            &q,
+            &k,
+            &v,
+            1,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+        );
+        let attn_output = self.weights.matvec_f16(&o_name, &attn)?;
+        let hidden_after_attention = hidden
+            .iter()
+            .zip(attn_output.iter())
+            .map(|(left, right)| left + right)
+            .collect::<Vec<_>>();
+        let post_norm_weight = self
+            .weights
+            .load_vector_f32(&format!("{prefix}.post_attention_layernorm.weight"))?;
+        hidden_states = weighted_rms_norm(
+            &hidden_after_attention,
+            &post_norm_weight,
+            self.config.rms_norm_eps as f32,
+        );
+
+        let gate_name = format!("{prefix}.mlp.gate_proj.weight");
+        let up_name = format!("{prefix}.mlp.up_proj.weight");
+        let down_name = format!("{prefix}.mlp.down_proj.weight");
+        let hidden_rows = self.config.hidden_size;
+        let intermediate_rows = self.config.intermediate_size;
+
+        let mut pack_duration = Duration::ZERO;
+        let mut compile_duration = Duration::ZERO;
+        let mut upload_duration = Duration::ZERO;
+        let mut gpu_duration = Duration::ZERO;
+        let mut download_duration = Duration::ZERO;
+
+        let gate_gpu = if use_gate {
+            let (packed, pack, _) =
+                self.get_or_create_projection_cache(&gate_name, intermediate_rows, hidden_rows)?;
+            let (runner, compile, _) = self.get_or_create_projection_gpu(&gate_name, &packed)?;
+            pack_duration += pack;
+            compile_duration += compile;
+            Some(runner)
+        } else {
+            None
+        };
+        let up_gpu = if use_up {
+            let (packed, pack, _) =
+                self.get_or_create_projection_cache(&up_name, intermediate_rows, hidden_rows)?;
+            let (runner, compile, _) = self.get_or_create_projection_gpu(&up_name, &packed)?;
+            pack_duration += pack;
+            compile_duration += compile;
+            Some(runner)
+        } else {
+            None
+        };
+
+        let total_started = Instant::now();
+        let gate = if let Some(runner) = &gate_gpu {
+            let (out, report) = runner
+                .borrow_mut()
+                .run_with_output(&hidden_states, None)
+                .map_err(|error| {
+                    ReferenceError::Decode(format!("gpu gate_proj failed: {error}"))
+                })?;
+            upload_duration += report.upload_duration;
+            gpu_duration += report.gpu_duration;
+            download_duration += report.download_duration;
+            out
+        } else {
+            self.weights.matvec_f16(&gate_name, &hidden_states)?
+        };
+        let up = if let Some(runner) = &up_gpu {
+            let (out, report) = runner
+                .borrow_mut()
+                .run_with_output(&hidden_states, None)
+                .map_err(|error| ReferenceError::Decode(format!("gpu up_proj failed: {error}")))?;
+            upload_duration += report.upload_duration;
+            gpu_duration += report.gpu_duration;
+            download_duration += report.download_duration;
+            out
+        } else {
+            self.weights.matvec_f16(&up_name, &hidden_states)?
+        };
+        let mlp = swiglu(&gate, &up);
+
+        let mixed_down = if use_down {
+            let (packed, pack, _) =
+                self.get_or_create_projection_cache(&down_name, hidden_rows, intermediate_rows)?;
+            let (runner, compile, _) = self.get_or_create_projection_gpu(&down_name, &packed)?;
+            pack_duration += pack;
+            compile_duration += compile;
+            let (out, report) =
+                runner
+                    .borrow_mut()
+                    .run_with_output(&mlp, None)
+                    .map_err(|error| {
+                        ReferenceError::Decode(format!("gpu down_proj failed: {error}"))
+                    })?;
+            upload_duration += report.upload_duration;
+            gpu_duration += report.gpu_duration;
+            download_duration += report.download_duration;
+            out
+        } else {
+            self.weights.matvec_f16(&down_name, &mlp)?
+        };
+        let total_duration = total_started.elapsed();
+
+        let dense_gate = self.weights.matvec_f16(&gate_name, &hidden_states)?;
+        let dense_up = self.weights.matvec_f16(&up_name, &hidden_states)?;
+        let dense_mlp = swiglu(&dense_gate, &dense_up);
+        let dense_down = self.weights.matvec_f16(&down_name, &dense_mlp)?;
+        let mut max_abs_diff = 0.0f32;
+        let mut sum_abs_diff = 0.0f32;
+        for (left, right) in mixed_down.iter().zip(dense_down.iter()) {
+            let diff = (left - right).abs();
+            max_abs_diff = max_abs_diff.max(diff);
+            sum_abs_diff += diff;
+        }
+        let mean_abs_diff = sum_abs_diff / mixed_down.len() as f32;
+        let enabled_projections = [("g", use_gate), ("u", use_up), ("d", use_down)]
+            .into_iter()
+            .filter_map(|(name, enabled)| enabled.then_some(name))
+            .collect::<Vec<_>>()
+            .join("");
+
+        Ok(MlpProjectionMixMetrics {
             enabled_projections,
             total_duration,
             pack_duration,
