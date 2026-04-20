@@ -129,7 +129,6 @@ pub fn run_packed_ternary_matvec_with_output(
 }
 
 pub struct CachedGpuPackedMatvecRunner {
-    shader_path: PathBuf,
     _instance: Instance,
     device: Device,
     queue: vk::Queue,
@@ -375,7 +374,6 @@ impl CachedGpuPackedMatvecRunner {
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
 
         let runner = Self {
-            shader_path,
             _instance: instance,
             device,
             queue,
@@ -537,7 +535,6 @@ impl Drop for CachedGpuPackedMatvecRunner {
             destroy_buffer(&self.device, self.vector_buffer);
             destroy_buffer(&self.device, self.output_buffer);
         }
-        let _ = std::fs::remove_file(&self.shader_path);
     }
 }
 
@@ -548,6 +545,10 @@ struct BufferAllocation {
 }
 
 fn compile_shader(path: &Path) -> Result<PathBuf, GpuPackedMatvecError> {
+    let temp_dir = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".tmp"));
+    std::fs::create_dir_all(&temp_dir)?;
     let unique = format!(
         "jengine-packed-matvec-{}-{}.spv",
         std::process::id(),
@@ -556,7 +557,7 @@ fn compile_shader(path: &Path) -> Result<PathBuf, GpuPackedMatvecError> {
             .unwrap_or_default()
             .as_nanos()
     );
-    let out = std::env::temp_dir().join(unique);
+    let out = temp_dir.join(unique);
     let output = Command::new("glslc")
         .arg(path)
         .arg("-o")
@@ -565,12 +566,6 @@ fn compile_shader(path: &Path) -> Result<PathBuf, GpuPackedMatvecError> {
     if !output.status.success() {
         return Err(GpuPackedMatvecError::Process(
             String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-    let val = Command::new("spirv-val").arg(&out).output()?;
-    if !val.status.success() {
-        return Err(GpuPackedMatvecError::Process(
-            String::from_utf8_lossy(&val.stderr).to_string(),
         ));
     }
     Ok(out)

@@ -325,7 +325,11 @@ struct BufferAllocation {
 }
 
 fn compile_shader(path: &Path) -> Result<PathBuf, GpuMatvecError> {
-    let out = std::env::temp_dir().join("jengine-fp16-matvec.spv");
+    let temp_dir = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".tmp"));
+    std::fs::create_dir_all(&temp_dir)?;
+    let out = temp_dir.join("jengine-fp16-matvec.spv");
     let output = Command::new("glslc")
         .arg(path)
         .arg("-o")
