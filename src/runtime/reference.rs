@@ -2454,12 +2454,13 @@ impl ReferenceModel {
             non_offloaded_dense_duration += elapsed;
 
             let started_at = Instant::now();
-            let _ = self
-                .weights
-                .matvec_f16("model.embed_tokens.weight", &hidden)?;
-            let elapsed = started_at.elapsed();
-            metrics.logits_duration += elapsed;
-            non_offloaded_dense_duration += elapsed;
+            let _ = session.run_projection_argmax(
+                "model.embed_tokens.weight",
+                self.config.vocab_size,
+                self.config.hidden_size,
+                &hidden,
+            )?;
+            metrics.logits_duration += started_at.elapsed();
         }
 
         Ok((

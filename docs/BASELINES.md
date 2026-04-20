@@ -381,6 +381,36 @@ Current interpretation:
 - the result points directly at output-side handling and download avoidance as the strongest next dense-side lead
 - the next follow-up should determine whether this win survives in a fuller packed-first decode path and not just this one-layer hybrid slice
 
+## Chunked packed capture workarounds
+
+### Real combined packed step upper bound via 7-layer chunk chaining
+
+Command shape, run as four chained chunk invocations:
+
+```bash
+JENGINE_NO_HEARTBEAT=1 ./target/release/bench_packed_prefill_chunk \
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model \
+  42 <start_layer> <end_layer> combined <hidden_in> <hidden_out> <summary_out> <include_logits>
+```
+
+Observed reconstructed sample from chunks `[0,7)`, `[7,14)`, `[14,21)`, and `[21,28)` with logits only on the last chunk:
+
+- total: `12212.554 ms`
+- compile: `1712.426 ms`
+- upload: `22.052 ms`
+- gpu: `657.716 ms`
+- download: `35.070 ms`
+- non-offloaded dense: `8987.582 ms`
+- orchestration: `797.694 ms`
+- dispatches: `57`
+
+Current interpretation:
+
+- this is a usable kill-window-safe capture path for the latest combined packed structure
+- but it is an **upper bound**, because each chunk runs in a fresh process and loses warm in-process cache reuse
+- compile and weight-upload costs are therefore overstated relative to the intended one-process warm path
+- even so, it confirms that the latest combined packed path shape is now `57` dispatches when logits stay on the argmax-only path
+
 ## Packed layer sweep baselines
 
 ### Real all-layer packed projection sweep
