@@ -2531,7 +2531,6 @@ impl ReferenceModel {
             .take(self.config.num_hidden_layers)
         {
             let layer_tensors = &self.layer_tensors[layer_idx];
-            let residual = hidden.clone();
 
             let started_at = Instant::now();
             let input_norm_weight =
@@ -2539,6 +2538,7 @@ impl ReferenceModel {
             let mut hidden_states =
                 weighted_rms_norm(&hidden, &input_norm_weight, self.config.rms_norm_eps as f32);
             metrics.norm_duration += started_at.elapsed();
+            let residual = hidden;
 
             let started_at = Instant::now();
             let mut q = self.matvec_f16_resolved(&layer_tensors.q_proj_weight, &hidden_states)?;
@@ -2594,12 +2594,15 @@ impl ReferenceModel {
                 .collect();
             metrics.attention_duration += started_at.elapsed();
 
-            let residual = hidden.clone();
+            let residual = hidden;
             let started_at = Instant::now();
             let post_norm_weight =
                 self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
-            hidden_states =
-                weighted_rms_norm(&hidden, &post_norm_weight, self.config.rms_norm_eps as f32);
+            hidden_states = weighted_rms_norm(
+                &residual,
+                &post_norm_weight,
+                self.config.rms_norm_eps as f32,
+            );
             metrics.norm_duration += started_at.elapsed();
 
             let started_at = Instant::now();
@@ -2654,7 +2657,6 @@ impl ReferenceModel {
             .take(self.config.num_hidden_layers)
         {
             let prefix = format!("model.layers.{layer_idx}");
-            let residual = hidden.clone();
 
             let started_at = Instant::now();
             let input_norm_weight = self
@@ -2663,6 +2665,7 @@ impl ReferenceModel {
             let mut hidden_states =
                 weighted_rms_norm(&hidden, &input_norm_weight, self.config.rms_norm_eps as f32);
             metrics.norm_duration += started_at.elapsed();
+            let residual = hidden;
 
             let started_at = Instant::now();
             let mut q = if layer_idx == hybrid.layer_idx {
@@ -2759,13 +2762,16 @@ impl ReferenceModel {
                 .collect();
             metrics.attention_duration += started_at.elapsed();
 
-            let residual = hidden.clone();
+            let residual = hidden;
             let started_at = Instant::now();
             let post_norm_weight = self
                 .weights
                 .load_vector_f32(&format!("{prefix}.post_attention_layernorm.weight"))?;
-            hidden_states =
-                weighted_rms_norm(&hidden, &post_norm_weight, self.config.rms_norm_eps as f32);
+            hidden_states = weighted_rms_norm(
+                &residual,
+                &post_norm_weight,
+                self.config.rms_norm_eps as f32,
+            );
             metrics.norm_duration += started_at.elapsed();
 
             let started_at = Instant::now();
@@ -3014,7 +3020,6 @@ impl ReferenceModel {
             .take(self.config.num_hidden_layers)
         {
             let prefix = format!("model.layers.{layer_idx}");
-            let residual = hidden.clone();
 
             let started_at = Instant::now();
             let input_norm_weight = self
@@ -3023,6 +3028,7 @@ impl ReferenceModel {
             let mut hidden_states =
                 weighted_rms_norm(&hidden, &input_norm_weight, self.config.rms_norm_eps as f32);
             metrics.norm_duration += started_at.elapsed();
+            let residual = hidden;
 
             let started_at = Instant::now();
             let mut q = if layer_idx == hybrid_layer_idx {
@@ -3126,13 +3132,16 @@ impl ReferenceModel {
                 .collect();
             metrics.attention_duration += started_at.elapsed();
 
-            let residual = hidden.clone();
+            let residual = hidden;
             let started_at = Instant::now();
             let post_norm_weight = self
                 .weights
                 .load_vector_f32(&format!("{prefix}.post_attention_layernorm.weight"))?;
-            hidden_states =
-                weighted_rms_norm(&hidden, &post_norm_weight, self.config.rms_norm_eps as f32);
+            hidden_states = weighted_rms_norm(
+                &residual,
+                &post_norm_weight,
+                self.config.rms_norm_eps as f32,
+            );
             metrics.norm_duration += started_at.elapsed();
 
             let started_at = Instant::now();
