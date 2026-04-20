@@ -252,10 +252,10 @@ impl CachedGpuPackedMatvecRunner {
             output_bytes as u64,
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
-        write_u32_buffer(&device, code_buffer.memory, code_words)?;
-        write_f32_buffer(&device, scale_buffer.memory, scales)?;
-        zero_buffer(&device, vector_buffer.memory, packed_cols * 4)?;
-        zero_buffer(&device, output_buffer.memory, output_bytes)?;
+        write_u32_buffer(&code_buffer, code_words)?;
+        write_f32_buffer(&scale_buffer, scales)?;
+        zero_buffer(&vector_buffer, packed_cols * 4)?;
+        zero_buffer(&output_buffer, output_bytes)?;
 
         let descriptor_layout_bindings = [
             vk::DescriptorSetLayoutBinding::default()
@@ -433,8 +433,8 @@ impl CachedGpuPackedMatvecRunner {
             )));
         }
         let started = Instant::now();
-        write_u32_buffer(&self.device, self.code_buffer.memory, code_words)?;
-        write_f32_buffer(&self.device, self.scale_buffer.memory, scales)?;
+        write_u32_buffer(&self.code_buffer, code_words)?;
+        write_f32_buffer(&self.scale_buffer, scales)?;
         Ok(started.elapsed())
     }
 
@@ -460,7 +460,7 @@ impl CachedGpuPackedMatvecRunner {
         }
 
         let upload_started = Instant::now();
-        write_u32_buffer(&self.device, self.vector_buffer.memory, &vector_words)?;
+        write_u32_buffer(&self.vector_buffer, &vector_words)?;
         let upload_duration = upload_started.elapsed();
 
         let submit_info = [
@@ -478,7 +478,7 @@ impl CachedGpuPackedMatvecRunner {
         let gpu_duration = gpu_started.elapsed();
 
         let download_started = Instant::now();
-        let gpu_output = read_f32_buffer(&self.device, self.output_buffer.memory, self.rows)?;
+        let gpu_output = read_f32_buffer(&self.output_buffer, self.rows)?;
         let download_duration = download_started.elapsed();
         let (max_abs_diff, mean_abs_diff) = match reference {
             Some(reference) => compare_outputs(reference, &gpu_output),
@@ -576,6 +576,8 @@ impl Drop for CachedGpuPackedMatvecRunner {
 struct BufferAllocation {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+    mapped_ptr: *mut u8,
+    size: u64,
 }
 
 fn compile_shader(path: &Path) -> Result<PathBuf, GpuPackedMatvecError> {
@@ -672,7 +674,15 @@ fn create_host_visible_buffer(
         .memory_type_index(memory_type_index);
     let memory = unsafe { device.allocate_memory(&alloc, None)? };
     unsafe { device.bind_buffer_memory(buffer, memory, 0)? };
-    Ok(BufferAllocation { buffer, memory })
+    let mapped_ptr =
+        unsafe { device.map_memory(memory, 0, requirements.size, vk::MemoryMapFlags::empty())? }
+            as *mut u8;
+    Ok(BufferAllocation {
+        buffer,
+        memory,
+        mapped_ptr,
+        size: requirements.size,
+    })
 }
 
 fn find_memory_type(
@@ -692,74 +702,76 @@ fn find_memory_type(
     Err(GpuPackedMatvecError::MissingQueue)
 }
 
-fn write_u32_buffer(
-    device: &Device,
-    memory: vk::DeviceMemory,
-    data: &[u32],
-) -> Result<(), GpuPackedMatvecError> {
+fn write_u32_buffer(buffer: &BufferAllocation, data: &[u32]) -> Result<(), GpuPackedMatvecError> {
     let byte_len = std::mem::size_of_val(data) as u64;
-    let ptr = unsafe { device.map_memory(memory, 0, byte_len, vk::MemoryMapFlags::empty())? };
+    if byte_len > buffer.size {
+        return Err(GpuPackedMatvecError::Shape(format!(
+            "u32 write {} bytes exceeds mapped buffer size {}",
+            byte_len, buffer.size
+        )));
+    }
     unsafe {
         std::ptr::copy_nonoverlapping(
             data.as_ptr() as *const u8,
-            ptr as *mut u8,
+            buffer.mapped_ptr,
             byte_len as usize,
         );
-        device.unmap_memory(memory);
     }
     Ok(())
 }
 
-fn write_f32_buffer(
-    device: &Device,
-    memory: vk::DeviceMemory,
-    data: &[f32],
-) -> Result<(), GpuPackedMatvecError> {
+fn write_f32_buffer(buffer: &BufferAllocation, data: &[f32]) -> Result<(), GpuPackedMatvecError> {
     let byte_len = std::mem::size_of_val(data) as u64;
-    let ptr = unsafe { device.map_memory(memory, 0, byte_len, vk::MemoryMapFlags::empty())? };
+    if byte_len > buffer.size {
+        return Err(GpuPackedMatvecError::Shape(format!(
+            "f32 write {} bytes exceeds mapped buffer size {}",
+            byte_len, buffer.size
+        )));
+    }
     unsafe {
         std::ptr::copy_nonoverlapping(
             data.as_ptr() as *const u8,
-            ptr as *mut u8,
+            buffer.mapped_ptr,
             byte_len as usize,
         );
-        device.unmap_memory(memory);
     }
     Ok(())
 }
 
-fn zero_buffer(
-    device: &Device,
-    memory: vk::DeviceMemory,
-    byte_len: usize,
-) -> Result<(), GpuPackedMatvecError> {
-    let ptr =
-        unsafe { device.map_memory(memory, 0, byte_len as u64, vk::MemoryMapFlags::empty())? };
+fn zero_buffer(buffer: &BufferAllocation, byte_len: usize) -> Result<(), GpuPackedMatvecError> {
+    if byte_len as u64 > buffer.size {
+        return Err(GpuPackedMatvecError::Shape(format!(
+            "zero {} bytes exceeds mapped buffer size {}",
+            byte_len, buffer.size
+        )));
+    }
     unsafe {
-        std::ptr::write_bytes(ptr, 0, byte_len);
-        device.unmap_memory(memory);
+        std::ptr::write_bytes(buffer.mapped_ptr, 0, byte_len);
     }
     Ok(())
 }
 
 fn read_f32_buffer(
-    device: &Device,
-    memory: vk::DeviceMemory,
+    buffer: &BufferAllocation,
     len: usize,
 ) -> Result<Vec<f32>, GpuPackedMatvecError> {
     let byte_len = len * std::mem::size_of::<f32>();
-    let ptr =
-        unsafe { device.map_memory(memory, 0, byte_len as u64, vk::MemoryMapFlags::empty())? };
+    if byte_len as u64 > buffer.size {
+        return Err(GpuPackedMatvecError::Shape(format!(
+            "read {} bytes exceeds mapped buffer size {}",
+            byte_len, buffer.size
+        )));
+    }
     let mut out = vec![0.0f32; len];
     unsafe {
-        std::ptr::copy_nonoverlapping(ptr as *const f32, out.as_mut_ptr(), len);
-        device.unmap_memory(memory);
+        std::ptr::copy_nonoverlapping(buffer.mapped_ptr as *const f32, out.as_mut_ptr(), len);
     }
     Ok(out)
 }
 
 fn destroy_buffer(device: &Device, buffer: BufferAllocation) {
     unsafe {
+        device.unmap_memory(buffer.memory);
         device.destroy_buffer(buffer.buffer, None);
         device.free_memory(buffer.memory, None);
     }
