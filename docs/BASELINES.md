@@ -1,5 +1,21 @@
 # Jengine baseline measurements
 
+For reproducible release-mode capture, use:
+
+- `fixtures/release_benchmark.env`
+- `docs/RELEASE_BENCHMARK_WORKFLOW.md`
+- `scripts/capture_release_baselines.sh`
+
+## Latest verified release-style measurements
+
+These values are the latest verified measurements gathered on this machine from successful real-model runs and tensor microbenchmarks.
+
+- CPU one-token text prompt run: about **1513.965 ms** total, about **0.66 tok/s**
+- CPU short text benchmark: about **3418.009 ms** for 3 generated tokens, about **0.88 tok/s**
+- Vulkan dense q_proj matvec: about **2.519 ms** GPU execution
+- Vulkan packed q_proj matvec: about **1.711 ms** GPU execution
+- Hybrid q_proj decode: works correctly, but still slower end to end because pack and pipeline setup are not cached yet
+
 ## Real Bonsai 1.7B CPU runs
 
 ### One-token text prompt run
@@ -61,6 +77,8 @@ Observed samples:
 
 ## Repack baselines
 
+These tensor-level measurements use the pinned release tensor fixture from `fixtures/release_benchmark.env`.
+
 ### Real q_proj tensor pack
 
 Command shape:
@@ -82,6 +100,8 @@ Observed sample:
 - strict pack time: `68.949 ms`
 
 ## Packed matvec baselines
+
+These projection-level measurements use the pinned release tensor fixture from `fixtures/release_benchmark.env`.
 
 ### Real q_proj dense vs packed
 
@@ -122,3 +142,5 @@ Observed sample:
 The model, repacker, and runtime integration are correct enough to measure real behavior.
 
 Current highest CPU hotspot remains the MLP path, followed by QKV projections and logits. The current packed CPU kernel is correctness-first and not yet performance-competitive with dense FP16.
+
+For apples-to-apples future comparisons, prefer the release workflow in `docs/RELEASE_BENCHMARK_WORKFLOW.md` and capture reports with `scripts/capture_release_baselines.sh`.

@@ -1,17 +1,26 @@
 # Benchmark capture format
 
+For stable release comparisons, also use:
+
+- `fixtures/release_benchmark.env`
+- `docs/RELEASE_BENCHMARK_WORKFLOW.md`
+- `scripts/capture_release_baselines.sh`
+
 When recording benchmark results for Jengine, include the following fields whenever possible.
 
 ## Required fields
 
 - date/time
 - git commit hash
+- fixture file or explicit command parameters
 - command run
 - model name / tensor name
 - hardware summary
 - result metrics
 
 ## Recommended markdown template
+
+Use the capture script when possible. For custom captures, this template still applies.
 
 ```markdown
 ## Benchmark: <name>
@@ -50,3 +59,4 @@ Also include:
 - mlp time
 - logits time
 - memory usage if available
+- generated tok/s if a decode run generated tokens
