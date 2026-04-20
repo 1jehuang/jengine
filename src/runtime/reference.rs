@@ -169,28 +169,46 @@ pub struct MemoryReport {
     pub generated_tokens: usize,
     pub total_sequence_tokens: usize,
     pub estimated_model_fp16_bytes: usize,
+    pub source_weight_bytes: usize,
     pub kv_cache_bytes_per_token_fp16: usize,
     pub kv_cache_bytes_per_token_runtime_f32: usize,
     pub kv_cache_total_bytes_fp16: usize,
     pub kv_cache_total_bytes_runtime_f32: usize,
+    pub kv_cache_reserved_bytes_runtime_f32: usize,
+    pub packed_cache_bytes: usize,
+    pub gpu_cache_buffer_bytes: usize,
+    pub activation_working_bytes: usize,
+    pub staging_bytes: usize,
     pub estimated_runtime_working_set_bytes: usize,
 }
 
 impl MemoryReport {
     pub fn summarize(&self) -> String {
         format!(
-            "prompt_tokens={} generated_tokens={} total_sequence_tokens={} model_fp16_bytes={} ({}) kv_per_token_fp16={} ({}) kv_per_token_runtime_f32={} ({}) kv_total_runtime_f32={} ({}) working_set_bytes={} ({})",
+            "prompt_tokens={} generated_tokens={} total_sequence_tokens={} model_fp16_bytes={} ({}) source_weight_bytes={} ({}) kv_per_token_fp16={} ({}) kv_per_token_runtime_f32={} ({}) kv_total_runtime_f32={} ({}) kv_reserved_runtime_f32={} ({}) packed_cache_bytes={} ({}) gpu_cache_buffer_bytes={} ({}) activation_working_bytes={} ({}) staging_bytes={} ({}) working_set_bytes={} ({})",
             self.prompt_tokens,
             self.generated_tokens,
             self.total_sequence_tokens,
             self.estimated_model_fp16_bytes,
             human_bytes(self.estimated_model_fp16_bytes),
+            self.source_weight_bytes,
+            human_bytes(self.source_weight_bytes),
             self.kv_cache_bytes_per_token_fp16,
             human_bytes(self.kv_cache_bytes_per_token_fp16),
             self.kv_cache_bytes_per_token_runtime_f32,
             human_bytes(self.kv_cache_bytes_per_token_runtime_f32),
             self.kv_cache_total_bytes_runtime_f32,
             human_bytes(self.kv_cache_total_bytes_runtime_f32),
+            self.kv_cache_reserved_bytes_runtime_f32,
+            human_bytes(self.kv_cache_reserved_bytes_runtime_f32),
+            self.packed_cache_bytes,
+            human_bytes(self.packed_cache_bytes),
+            self.gpu_cache_buffer_bytes,
+            human_bytes(self.gpu_cache_buffer_bytes),
+            self.activation_working_bytes,
+            human_bytes(self.activation_working_bytes),
+            self.staging_bytes,
+            human_bytes(self.staging_bytes),
             self.estimated_runtime_working_set_bytes,
             human_bytes(self.estimated_runtime_working_set_bytes),
         )
@@ -208,6 +226,16 @@ pub struct DecodeResult {
 struct LayerCache {
     keys: Vec<f32>,
     values: Vec<f32>,
+}
+
+impl LayerCache {
+    fn with_capacity(tokens: usize, kv_width: usize) -> Self {
+        let capacity = tokens * kv_width;
+        Self {
+            keys: Vec::with_capacity(capacity),
+            values: Vec::with_capacity(capacity),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -378,23 +406,101 @@ impl ReferenceModel {
     pub fn memory_report(&self, prompt_tokens: usize, generated_tokens: usize) -> MemoryReport {
         let total_sequence_tokens = prompt_tokens + generated_tokens;
         let estimated_model_fp16_bytes = self.config.approx_fp16_bytes();
+        let source_weight_bytes = self
+            .assets
+            .safetensors_path
+            .metadata()
+            .map(|metadata| metadata.len() as usize)
+            .unwrap_or(0);
         let kv_cache_bytes_per_token_fp16 = self.config.kv_cache_bytes_per_token(1, 2);
         let kv_cache_bytes_per_token_runtime_f32 = self.config.kv_cache_bytes_per_token(1, 4);
         let kv_cache_total_bytes_fp16 = self.config.kv_cache_bytes(total_sequence_tokens, 1, 2);
         let kv_cache_total_bytes_runtime_f32 =
             self.config.kv_cache_bytes(total_sequence_tokens, 1, 4);
+        let packed_cache_bytes = self.packed_cache_bytes();
+        let gpu_cache_buffer_bytes = self.gpu_cache_buffer_bytes();
+        let activation_working_bytes = self.activation_working_bytes();
+        let staging_bytes = gpu_cache_buffer_bytes;
         MemoryReport {
             prompt_tokens,
             generated_tokens,
             total_sequence_tokens,
             estimated_model_fp16_bytes,
+            source_weight_bytes,
             kv_cache_bytes_per_token_fp16,
             kv_cache_bytes_per_token_runtime_f32,
             kv_cache_total_bytes_fp16,
             kv_cache_total_bytes_runtime_f32,
+            kv_cache_reserved_bytes_runtime_f32: kv_cache_total_bytes_runtime_f32,
+            packed_cache_bytes,
+            gpu_cache_buffer_bytes,
+            activation_working_bytes,
+            staging_bytes,
             estimated_runtime_working_set_bytes: estimated_model_fp16_bytes
-                + kv_cache_total_bytes_runtime_f32,
+                + kv_cache_total_bytes_runtime_f32
+                + packed_cache_bytes
+                + gpu_cache_buffer_bytes
+                + activation_working_bytes,
         }
+    }
+
+    fn packed_cache_bytes(&self) -> usize {
+        let mut total = 0usize;
+        let generic = self.cached_projection_packed.borrow();
+        for cache in generic.values() {
+            total += cache.code_words.len() * std::mem::size_of::<u32>();
+            total += cache.scales.len() * std::mem::size_of::<f32>();
+        }
+        let qproj = self.cached_hybrid_qproj.borrow();
+        for (layer_idx, cache) in qproj.iter() {
+            let q_name = format!("model.layers.{layer_idx}.self_attn.q_proj.weight");
+            if !generic.contains_key(&q_name) {
+                total += cache.code_words.len() * std::mem::size_of::<u32>();
+                total += cache.scales.len() * std::mem::size_of::<f32>();
+            }
+        }
+        total
+    }
+
+    fn gpu_cache_buffer_bytes(&self) -> usize {
+        let mut total = 0usize;
+        let generic = self.cached_projection_gpu.borrow();
+        for runner in generic.values() {
+            total += runner.borrow().buffer_bytes();
+        }
+        let qproj = self.cached_hybrid_qproj_gpu.borrow();
+        for (layer_idx, runner) in qproj.iter() {
+            let q_name = format!("model.layers.{layer_idx}.self_attn.q_proj.weight");
+            if !generic.contains_key(&q_name) {
+                total += runner.borrow().buffer_bytes();
+            }
+        }
+        total
+    }
+
+    fn activation_working_bytes(&self) -> usize {
+        let hidden = self.config.hidden_size * std::mem::size_of::<f32>();
+        let kv =
+            self.config.num_key_value_heads * self.config.head_dim * std::mem::size_of::<f32>();
+        let intermediate = self.config.intermediate_size * std::mem::size_of::<f32>();
+        let logits = self.config.vocab_size * std::mem::size_of::<f32>();
+        hidden
+            + hidden
+            + hidden
+            + kv
+            + kv
+            + hidden
+            + intermediate
+            + intermediate
+            + intermediate
+            + logits
+    }
+
+    fn allocate_layer_cache_vec(&self, expected_tokens: usize) -> Vec<LayerCache> {
+        let kv_width = self.config.num_key_value_heads * self.config.head_dim;
+        (0..self.config.num_hidden_layers)
+            .map(|_| LayerCache::with_capacity(expected_tokens, kv_width))
+            .collect()
     }
 
     pub fn generate_greedy(
@@ -442,12 +548,7 @@ impl ReferenceModel {
             mlp_duration: Duration::ZERO,
             logits_duration: Duration::ZERO,
         };
-        let mut cache = (0..self.config.num_hidden_layers)
-            .map(|_| LayerCache {
-                keys: Vec::new(),
-                values: Vec::new(),
-            })
-            .collect::<Vec<_>>();
+        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens);
 
         let mut last_logits = Vec::new();
         for (position, &token_id) in prompt_ids.iter().enumerate() {
@@ -1273,12 +1374,7 @@ impl ReferenceModel {
             mlp_duration: Duration::ZERO,
             logits_duration: Duration::ZERO,
         };
-        let mut cache = (0..self.config.num_hidden_layers)
-            .map(|_| LayerCache {
-                keys: Vec::new(),
-                values: Vec::new(),
-            })
-            .collect::<Vec<_>>();
+        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens);
         let mut upload = Duration::ZERO;
         let mut gpu = Duration::ZERO;
         let mut download = Duration::ZERO;
@@ -1366,12 +1462,7 @@ impl ReferenceModel {
             mlp_duration: Duration::ZERO,
             logits_duration: Duration::ZERO,
         };
-        let mut cache = (0..self.config.num_hidden_layers)
-            .map(|_| LayerCache {
-                keys: Vec::new(),
-                values: Vec::new(),
-            })
-            .collect::<Vec<_>>();
+        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens);
         let mut compile = q_proj_gpu_compile_duration;
         let mut upload = Duration::ZERO;
         let mut gpu = Duration::ZERO;

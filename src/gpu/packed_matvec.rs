@@ -153,6 +153,45 @@ pub struct CachedGpuPackedMatvecRunner {
 }
 
 impl CachedGpuPackedMatvecRunner {
+    pub fn buffer_bytes(&self) -> usize {
+        (self.code_buffer_bytes()
+            + self.scale_buffer_bytes()
+            + self.vector_buffer_bytes()
+            + self.output_buffer_bytes()) as usize
+    }
+
+    fn code_buffer_bytes(&self) -> u64 {
+        unsafe {
+            self.device
+                .get_buffer_memory_requirements(self.code_buffer.buffer)
+                .size
+        }
+    }
+
+    fn scale_buffer_bytes(&self) -> u64 {
+        unsafe {
+            self.device
+                .get_buffer_memory_requirements(self.scale_buffer.buffer)
+                .size
+        }
+    }
+
+    fn vector_buffer_bytes(&self) -> u64 {
+        unsafe {
+            self.device
+                .get_buffer_memory_requirements(self.vector_buffer.buffer)
+                .size
+        }
+    }
+
+    fn output_buffer_bytes(&self) -> u64 {
+        unsafe {
+            self.device
+                .get_buffer_memory_requirements(self.output_buffer.buffer)
+                .size
+        }
+    }
+
     pub fn new(
         code_words: &[u32],
         scales: &[f32],
