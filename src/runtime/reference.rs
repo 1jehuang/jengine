@@ -1963,7 +1963,6 @@ impl ReferenceModel {
 
         for layer_idx in start_layer..end_layer {
             let layer_tensors = &self.layer_tensors[layer_idx];
-            let residual = hidden.clone();
 
             let started_at = Instant::now();
             let input_norm_weight =
@@ -1973,6 +1972,7 @@ impl ReferenceModel {
             let elapsed = started_at.elapsed();
             metrics.norm_duration += elapsed;
             non_offloaded_dense_duration += elapsed;
+            let residual = hidden;
 
             let started_at = Instant::now();
             let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
@@ -2055,12 +2055,15 @@ impl ReferenceModel {
             metrics.attention_duration += elapsed;
             non_offloaded_dense_duration += elapsed;
 
-            let residual = hidden.clone();
+            let residual = hidden;
             let started_at = Instant::now();
             let post_norm_weight =
                 self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
-            hidden_states =
-                weighted_rms_norm(&hidden, &post_norm_weight, self.config.rms_norm_eps as f32);
+            hidden_states = weighted_rms_norm(
+                &residual,
+                &post_norm_weight,
+                self.config.rms_norm_eps as f32,
+            );
             let elapsed = started_at.elapsed();
             metrics.norm_duration += elapsed;
             non_offloaded_dense_duration += elapsed;
@@ -2695,7 +2698,6 @@ impl ReferenceModel {
             .take(self.config.num_hidden_layers)
         {
             let layer_tensors = &self.layer_tensors[layer_idx];
-            let residual = hidden.clone();
 
             let started_at = Instant::now();
             let input_norm_weight =
@@ -2705,6 +2707,7 @@ impl ReferenceModel {
             let elapsed = started_at.elapsed();
             metrics.norm_duration += elapsed;
             *non_offloaded_dense_duration += elapsed;
+            let residual = hidden;
 
             let started_at = Instant::now();
             let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
@@ -2789,12 +2792,15 @@ impl ReferenceModel {
             metrics.attention_duration += elapsed;
             *non_offloaded_dense_duration += elapsed;
 
-            let residual = hidden.clone();
+            let residual = hidden;
             let started_at = Instant::now();
             let post_norm_weight =
                 self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
-            hidden_states =
-                weighted_rms_norm(&hidden, &post_norm_weight, self.config.rms_norm_eps as f32);
+            hidden_states = weighted_rms_norm(
+                &residual,
+                &post_norm_weight,
+                self.config.rms_norm_eps as f32,
+            );
             let elapsed = started_at.elapsed();
             metrics.norm_duration += elapsed;
             *non_offloaded_dense_duration += elapsed;
