@@ -403,6 +403,16 @@ Observed samples:
     - dispatches: `84`
     - upload bytes: `264585216`
     - download bytes: `1835008`
+  - post-name-cache sample:
+    - total: `10077.689 ms`
+    - compile: `59.880 ms`
+    - upload: `42.627 ms`
+    - gpu: `350.575 ms`
+    - download: `12.680 ms`
+    - gpu cache hits: `82`
+    - dispatches: `84`
+    - upload bytes: `264585216`
+    - download bytes: `1835008`
 
 Current interpretation:
 

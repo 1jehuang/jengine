@@ -265,6 +265,21 @@ struct PackedProjectionCache {
     scales: Vec<f32>,
 }
 
+#[derive(Debug, Clone)]
+struct LayerTensorNames {
+    input_layernorm_weight: String,
+    post_attention_layernorm_weight: String,
+    q_norm_weight: String,
+    k_norm_weight: String,
+    q_proj_weight: String,
+    k_proj_weight: String,
+    v_proj_weight: String,
+    o_proj_weight: String,
+    gate_proj_weight: String,
+    up_proj_weight: String,
+    down_proj_weight: String,
+}
+
 type CachedProjectionGpuRunner = Rc<RefCell<CachedGpuPackedMatvecRunner>>;
 type CachedProjectionGpuCacheEntry = (CachedProjectionGpuRunner, Duration, Duration, bool);
 
@@ -595,6 +610,7 @@ pub struct ReferenceModel {
     pub weights: WeightStore,
     packed_model: Option<PackedModelStore>,
     rope: YarnRope,
+    layer_tensors: Vec<LayerTensorNames>,
     cached_hybrid_qproj: RefCell<HashMap<usize, Rc<HybridQProjCache>>>,
     cached_hybrid_qproj_gpu: RefCell<HashMap<usize, Rc<RefCell<CachedGpuPackedMatvecRunner>>>>,
     cached_projection_packed: RefCell<HashMap<String, Rc<PackedProjectionCache>>>,
@@ -668,6 +684,26 @@ impl ReferenceModel {
         )?;
         let weights = WeightStore::load_from_assets(&assets)?;
         let rope = build_yarn_rope(&config);
+        let layer_tensors = (0..config.num_hidden_layers)
+            .map(|layer_idx| {
+                let prefix = format!("model.layers.{layer_idx}");
+                LayerTensorNames {
+                    input_layernorm_weight: format!("{prefix}.input_layernorm.weight"),
+                    post_attention_layernorm_weight: format!(
+                        "{prefix}.post_attention_layernorm.weight"
+                    ),
+                    q_norm_weight: format!("{prefix}.self_attn.q_norm.weight"),
+                    k_norm_weight: format!("{prefix}.self_attn.k_norm.weight"),
+                    q_proj_weight: format!("{prefix}.self_attn.q_proj.weight"),
+                    k_proj_weight: format!("{prefix}.self_attn.k_proj.weight"),
+                    v_proj_weight: format!("{prefix}.self_attn.v_proj.weight"),
+                    o_proj_weight: format!("{prefix}.self_attn.o_proj.weight"),
+                    gate_proj_weight: format!("{prefix}.mlp.gate_proj.weight"),
+                    up_proj_weight: format!("{prefix}.mlp.up_proj.weight"),
+                    down_proj_weight: format!("{prefix}.mlp.down_proj.weight"),
+                }
+            })
+            .collect();
         Ok(Self {
             assets,
             config,
@@ -676,6 +712,7 @@ impl ReferenceModel {
             weights,
             packed_model: None,
             rope,
+            layer_tensors,
             cached_hybrid_qproj: RefCell::new(HashMap::new()),
             cached_hybrid_qproj_gpu: RefCell::new(HashMap::new()),
             cached_projection_packed: RefCell::new(HashMap::new()),
@@ -1925,12 +1962,12 @@ impl ReferenceModel {
         let (cos, sin) = rope_cos_sin(&self.rope, &[0]);
 
         for layer_idx in start_layer..end_layer {
-            let prefix = format!("model.layers.{layer_idx}");
+            let layer_tensors = &self.layer_tensors[layer_idx];
             let residual = hidden.clone();
 
             let started_at = Instant::now();
             let input_norm_weight =
-                self.load_vector_f32_resolved(&format!("{prefix}.input_layernorm.weight"))?;
+                self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
             let mut hidden_states =
                 weighted_rms_norm(&hidden, &input_norm_weight, self.config.rms_norm_eps as f32);
             let elapsed = started_at.elapsed();
@@ -1941,15 +1978,15 @@ impl ReferenceModel {
             let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
             let (mut q, mut k, v) = if use_attention_qkv {
                 let q = session.run_projection(
-                    &format!("{prefix}.self_attn.q_proj.weight"),
+                    &layer_tensors.q_proj_weight,
                     self.config.hidden_size,
                     self.config.hidden_size,
                     &hidden_states,
                 )?;
                 let (k, v) = session.run_projection_pair(
-                    &format!("{prefix}.self_attn.k_proj.weight"),
+                    &layer_tensors.k_proj_weight,
                     kv_rows,
-                    &format!("{prefix}.self_attn.v_proj.weight"),
+                    &layer_tensors.v_proj_weight,
                     kv_rows,
                     self.config.hidden_size,
                     &hidden_states,
@@ -1957,18 +1994,9 @@ impl ReferenceModel {
                 (q, k, v)
             } else {
                 (
-                    self.matvec_f16_resolved(
-                        &format!("{prefix}.self_attn.q_proj.weight"),
-                        &hidden_states,
-                    )?,
-                    self.matvec_f16_resolved(
-                        &format!("{prefix}.self_attn.k_proj.weight"),
-                        &hidden_states,
-                    )?,
-                    self.matvec_f16_resolved(
-                        &format!("{prefix}.self_attn.v_proj.weight"),
-                        &hidden_states,
-                    )?,
+                    self.matvec_f16_resolved(&layer_tensors.q_proj_weight, &hidden_states)?,
+                    self.matvec_f16_resolved(&layer_tensors.k_proj_weight, &hidden_states)?,
+                    self.matvec_f16_resolved(&layer_tensors.v_proj_weight, &hidden_states)?,
                 )
             };
             let elapsed = started_at.elapsed();
@@ -1978,10 +2006,8 @@ impl ReferenceModel {
             }
 
             let started_at = Instant::now();
-            let q_norm_weight =
-                self.load_vector_f32_resolved(&format!("{prefix}.self_attn.q_norm.weight"))?;
-            let k_norm_weight =
-                self.load_vector_f32_resolved(&format!("{prefix}.self_attn.k_norm.weight"))?;
+            let q_norm_weight = self.load_vector_f32_resolved(&layer_tensors.q_norm_weight)?;
+            let k_norm_weight = self.load_vector_f32_resolved(&layer_tensors.k_norm_weight)?;
             apply_head_rms_norm_weighted(
                 &mut q,
                 self.config.num_attention_heads,
@@ -2019,8 +2045,7 @@ impl ReferenceModel {
                 self.config.num_key_value_heads,
                 self.config.head_dim,
             );
-            let attn_output =
-                self.matvec_f16_resolved(&format!("{prefix}.self_attn.o_proj.weight"), &attn)?;
+            let attn_output = self.matvec_f16_resolved(&layer_tensors.o_proj_weight, &attn)?;
             hidden = residual
                 .iter()
                 .zip(attn_output.iter())
@@ -2032,8 +2057,8 @@ impl ReferenceModel {
 
             let residual = hidden.clone();
             let started_at = Instant::now();
-            let post_norm_weight = self
-                .load_vector_f32_resolved(&format!("{prefix}.post_attention_layernorm.weight"))?;
+            let post_norm_weight =
+                self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
             hidden_states =
                 weighted_rms_norm(&hidden, &post_norm_weight, self.config.rms_norm_eps as f32);
             let elapsed = started_at.elapsed();
@@ -2044,9 +2069,9 @@ impl ReferenceModel {
             let (gate, up, dense_tail_started_at) = if use_mlp_gu {
                 session
                     .run_projection_pair(
-                        &format!("{prefix}.mlp.gate_proj.weight"),
+                        &layer_tensors.gate_proj_weight,
                         self.config.intermediate_size,
-                        &format!("{prefix}.mlp.up_proj.weight"),
+                        &layer_tensors.up_proj_weight,
                         self.config.intermediate_size,
                         self.config.hidden_size,
                         &hidden_states,
@@ -2055,19 +2080,13 @@ impl ReferenceModel {
             } else {
                 let dense_started_at = Instant::now();
                 (
-                    self.matvec_f16_resolved(
-                        &format!("{prefix}.mlp.gate_proj.weight"),
-                        &hidden_states,
-                    )?,
-                    self.matvec_f16_resolved(
-                        &format!("{prefix}.mlp.up_proj.weight"),
-                        &hidden_states,
-                    )?,
+                    self.matvec_f16_resolved(&layer_tensors.gate_proj_weight, &hidden_states)?,
+                    self.matvec_f16_resolved(&layer_tensors.up_proj_weight, &hidden_states)?,
                     dense_started_at,
                 )
             };
             let mlp = swiglu(&gate, &up);
-            let down = self.matvec_f16_resolved(&format!("{prefix}.mlp.down_proj.weight"), &mlp)?;
+            let down = self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?;
             hidden = residual
                 .iter()
                 .zip(down.iter())
@@ -2379,36 +2398,25 @@ impl ReferenceModel {
             .enumerate()
             .take(self.config.num_hidden_layers)
         {
-            let prefix = format!("model.layers.{layer_idx}");
+            let layer_tensors = &self.layer_tensors[layer_idx];
             let residual = hidden.clone();
 
             let started_at = Instant::now();
             let input_norm_weight =
-                self.load_vector_f32_resolved(&format!("{prefix}.input_layernorm.weight"))?;
+                self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
             let mut hidden_states =
                 weighted_rms_norm(&hidden, &input_norm_weight, self.config.rms_norm_eps as f32);
             metrics.norm_duration += started_at.elapsed();
 
             let started_at = Instant::now();
-            let mut q = self.matvec_f16_resolved(
-                &format!("{prefix}.self_attn.q_proj.weight"),
-                &hidden_states,
-            )?;
-            let mut k = self.matvec_f16_resolved(
-                &format!("{prefix}.self_attn.k_proj.weight"),
-                &hidden_states,
-            )?;
-            let v = self.matvec_f16_resolved(
-                &format!("{prefix}.self_attn.v_proj.weight"),
-                &hidden_states,
-            )?;
+            let mut q = self.matvec_f16_resolved(&layer_tensors.q_proj_weight, &hidden_states)?;
+            let mut k = self.matvec_f16_resolved(&layer_tensors.k_proj_weight, &hidden_states)?;
+            let v = self.matvec_f16_resolved(&layer_tensors.v_proj_weight, &hidden_states)?;
             metrics.qkv_duration += started_at.elapsed();
 
             let started_at = Instant::now();
-            let q_norm_weight =
-                self.load_vector_f32_resolved(&format!("{prefix}.self_attn.q_norm.weight"))?;
-            let k_norm_weight =
-                self.load_vector_f32_resolved(&format!("{prefix}.self_attn.k_norm.weight"))?;
+            let q_norm_weight = self.load_vector_f32_resolved(&layer_tensors.q_norm_weight)?;
+            let k_norm_weight = self.load_vector_f32_resolved(&layer_tensors.k_norm_weight)?;
             apply_head_rms_norm_weighted(
                 &mut q,
                 self.config.num_attention_heads,
@@ -2446,8 +2454,7 @@ impl ReferenceModel {
                 self.config.num_key_value_heads,
                 self.config.head_dim,
             );
-            let attn_output =
-                self.matvec_f16_resolved(&format!("{prefix}.self_attn.o_proj.weight"), &attn)?;
+            let attn_output = self.matvec_f16_resolved(&layer_tensors.o_proj_weight, &attn)?;
             hidden = residual
                 .iter()
                 .zip(attn_output.iter())
@@ -2457,19 +2464,17 @@ impl ReferenceModel {
 
             let residual = hidden.clone();
             let started_at = Instant::now();
-            let post_norm_weight = self
-                .load_vector_f32_resolved(&format!("{prefix}.post_attention_layernorm.weight"))?;
+            let post_norm_weight =
+                self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
             hidden_states =
                 weighted_rms_norm(&hidden, &post_norm_weight, self.config.rms_norm_eps as f32);
             metrics.norm_duration += started_at.elapsed();
 
             let started_at = Instant::now();
-            let gate = self
-                .matvec_f16_resolved(&format!("{prefix}.mlp.gate_proj.weight"), &hidden_states)?;
-            let up =
-                self.matvec_f16_resolved(&format!("{prefix}.mlp.up_proj.weight"), &hidden_states)?;
+            let gate = self.matvec_f16_resolved(&layer_tensors.gate_proj_weight, &hidden_states)?;
+            let up = self.matvec_f16_resolved(&layer_tensors.up_proj_weight, &hidden_states)?;
             let mlp = swiglu(&gate, &up);
-            let down = self.matvec_f16_resolved(&format!("{prefix}.mlp.down_proj.weight"), &mlp)?;
+            let down = self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?;
             hidden = residual
                 .iter()
                 .zip(down.iter())
@@ -2689,12 +2694,12 @@ impl ReferenceModel {
             .enumerate()
             .take(self.config.num_hidden_layers)
         {
-            let prefix = format!("model.layers.{layer_idx}");
+            let layer_tensors = &self.layer_tensors[layer_idx];
             let residual = hidden.clone();
 
             let started_at = Instant::now();
             let input_norm_weight =
-                self.load_vector_f32_resolved(&format!("{prefix}.input_layernorm.weight"))?;
+                self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
             let mut hidden_states =
                 weighted_rms_norm(&hidden, &input_norm_weight, self.config.rms_norm_eps as f32);
             let elapsed = started_at.elapsed();
@@ -2705,15 +2710,15 @@ impl ReferenceModel {
             let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
             let (mut q, mut k, v) = if use_attention_qkv {
                 let q = session.run_projection(
-                    &format!("{prefix}.self_attn.q_proj.weight"),
+                    &layer_tensors.q_proj_weight,
                     self.config.hidden_size,
                     self.config.hidden_size,
                     &hidden_states,
                 )?;
                 let (k, v) = session.run_projection_pair(
-                    &format!("{prefix}.self_attn.k_proj.weight"),
+                    &layer_tensors.k_proj_weight,
                     kv_rows,
-                    &format!("{prefix}.self_attn.v_proj.weight"),
+                    &layer_tensors.v_proj_weight,
                     kv_rows,
                     self.config.hidden_size,
                     &hidden_states,
@@ -2721,18 +2726,9 @@ impl ReferenceModel {
                 (q, k, v)
             } else {
                 (
-                    self.matvec_f16_resolved(
-                        &format!("{prefix}.self_attn.q_proj.weight"),
-                        &hidden_states,
-                    )?,
-                    self.matvec_f16_resolved(
-                        &format!("{prefix}.self_attn.k_proj.weight"),
-                        &hidden_states,
-                    )?,
-                    self.matvec_f16_resolved(
-                        &format!("{prefix}.self_attn.v_proj.weight"),
-                        &hidden_states,
-                    )?,
+                    self.matvec_f16_resolved(&layer_tensors.q_proj_weight, &hidden_states)?,
+                    self.matvec_f16_resolved(&layer_tensors.k_proj_weight, &hidden_states)?,
+                    self.matvec_f16_resolved(&layer_tensors.v_proj_weight, &hidden_states)?,
                 )
             };
             let elapsed = started_at.elapsed();
@@ -2742,10 +2738,8 @@ impl ReferenceModel {
             }
 
             let started_at = Instant::now();
-            let q_norm_weight =
-                self.load_vector_f32_resolved(&format!("{prefix}.self_attn.q_norm.weight"))?;
-            let k_norm_weight =
-                self.load_vector_f32_resolved(&format!("{prefix}.self_attn.k_norm.weight"))?;
+            let q_norm_weight = self.load_vector_f32_resolved(&layer_tensors.q_norm_weight)?;
+            let k_norm_weight = self.load_vector_f32_resolved(&layer_tensors.k_norm_weight)?;
             apply_head_rms_norm_weighted(
                 &mut q,
                 self.config.num_attention_heads,
@@ -2785,8 +2779,7 @@ impl ReferenceModel {
                 self.config.num_key_value_heads,
                 self.config.head_dim,
             );
-            let attn_output =
-                self.matvec_f16_resolved(&format!("{prefix}.self_attn.o_proj.weight"), &attn)?;
+            let attn_output = self.matvec_f16_resolved(&layer_tensors.o_proj_weight, &attn)?;
             hidden = residual
                 .iter()
                 .zip(attn_output.iter())
@@ -2798,8 +2791,8 @@ impl ReferenceModel {
 
             let residual = hidden.clone();
             let started_at = Instant::now();
-            let post_norm_weight = self
-                .load_vector_f32_resolved(&format!("{prefix}.post_attention_layernorm.weight"))?;
+            let post_norm_weight =
+                self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
             hidden_states =
                 weighted_rms_norm(&hidden, &post_norm_weight, self.config.rms_norm_eps as f32);
             let elapsed = started_at.elapsed();
@@ -2810,9 +2803,9 @@ impl ReferenceModel {
             let (gate, up, dense_tail_started_at) = if use_mlp_gu {
                 session
                     .run_projection_pair(
-                        &format!("{prefix}.mlp.gate_proj.weight"),
+                        &layer_tensors.gate_proj_weight,
                         self.config.intermediate_size,
-                        &format!("{prefix}.mlp.up_proj.weight"),
+                        &layer_tensors.up_proj_weight,
                         self.config.intermediate_size,
                         self.config.hidden_size,
                         &hidden_states,
@@ -2821,19 +2814,13 @@ impl ReferenceModel {
             } else {
                 let dense_started_at = Instant::now();
                 (
-                    self.matvec_f16_resolved(
-                        &format!("{prefix}.mlp.gate_proj.weight"),
-                        &hidden_states,
-                    )?,
-                    self.matvec_f16_resolved(
-                        &format!("{prefix}.mlp.up_proj.weight"),
-                        &hidden_states,
-                    )?,
+                    self.matvec_f16_resolved(&layer_tensors.gate_proj_weight, &hidden_states)?,
+                    self.matvec_f16_resolved(&layer_tensors.up_proj_weight, &hidden_states)?,
                     dense_started_at,
                 )
             };
             let mlp = swiglu(&gate, &up);
-            let down = self.matvec_f16_resolved(&format!("{prefix}.mlp.down_proj.weight"), &mlp)?;
+            let down = self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?;
             hidden = residual
                 .iter()
                 .zip(down.iter())

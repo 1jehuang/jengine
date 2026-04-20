@@ -65,6 +65,7 @@ From the latest real packed-artifact release runs:
 - all-layer MLP `gu` sweep: `1827.961 ms`
 - all-layer combined `qkv + gu` sweep: `3866.305 ms`
 - one-token packed combined step, post-pairing: `10938.667 ms` with `84` dispatches
+- one-token packed combined step, post-name-cache: `10077.689 ms` with `84` dispatches
 - one-token packed combined full-span prefill, post-pairing: `9900.304 ms` with `84` dispatches
 - short-context packed `mlp`: `14441.214 ms`, about `0.069 tok/s`
 - short-context packed `combined`: `11873.378 ms`, about `0.084 tok/s`
@@ -84,7 +85,7 @@ From the latest real one-token run:
 ## Current bottlenecks
 
 1. The dominant cost in the first decode-wide attribution sample is still non-offloaded dense work, not GPU bandwidth saturation
-2. Host-side orchestration and per-dispatch overhead still matter, but they are smaller than the remaining dense-side work in the current combined path
+2. Host-side orchestration and per-dispatch overhead still matter, but they are now smaller after resident-runner reuse and a tensor-name caching pass that reduced the rebuilt combined one-token step from `10938.667 ms` to `10077.689 ms`
 3. Raw GPU upload, compute, and download time are still much smaller than total packed wall time, and measured decode-wide bandwidth is far below the hardware ceiling
 4. The next meaningful wins now come from reducing dense-side work and synchronization overhead, not from merely making runner reuse exist at all
 
