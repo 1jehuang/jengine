@@ -277,6 +277,55 @@ Current interpretation:
   - cached runner initialization footprint across more projections
   - transfer / execution overhead once more projections participate
 
+## Packed model artifact baselines
+
+### Real Bonsai packed artifact creation
+
+Command shape:
+
+```bash
+TMPDIR=$PWD/.tmp cargo run --release --bin pack_model_artifact -- \
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model
+```
+
+Observed sample:
+
+- entry count: `197`
+- packed total bytes: `483755614`
+- source file bytes: `3440091640`
+- reduction: `7.111x`
+
+### Real packed artifact validation
+
+Command shape:
+
+```bash
+TMPDIR=$PWD/.tmp cargo run --release --bin validate_packed_model_artifact -- \
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model
+```
+
+Observed sample:
+
+- checked entries: `197`
+- max abs diff: `0.000977`
+- mean abs diff: `0.000000`
+
+### Real packed artifact manifest load benchmark
+
+Command shape:
+
+```bash
+TMPDIR=$PWD/.tmp cargo run --release --bin bench_packed_model_artifact -- \
+  .artifacts/jengine-packed-model
+```
+
+Observed sample:
+
+- manifest load: `0.179 ms`
+- entry count: `197`
+- packed total bytes: `483755614`
+- reduction: `7.111x`
+
 ## Key current conclusion
 
 The model, repacker, and runtime integration are correct enough to measure real behavior.
@@ -288,3 +337,5 @@ For apples-to-apples future comparisons, prefer the release workflow in `docs/RE
 Recent important improvement: memory-mapped weight loading reduced real-model startup overhead enough for the cached hybrid q_proj benchmark path to become observable in this harness.
 
 Recent important caution: the first broader `qkv + gu` hybrid decode benchmark is slightly slower than dense, so the next optimization pass should focus on reducing aggregate multi-projection overhead before adding more decode-path complexity.
+
+Recent important artifact result: the real Bonsai packed artifact flow now achieves about **7.11x size reduction** against source safetensors while keeping aggregate validation error very low (`max_abs_diff` about `0.000977`).
