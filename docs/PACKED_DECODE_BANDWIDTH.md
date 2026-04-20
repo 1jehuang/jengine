@@ -70,7 +70,40 @@ That implies rough host-visible transfer rates of:
 
 These numbers are much smaller than system memory bandwidth and confirm that current per-dispatch host-visible transfer volume is not the main bottleneck for this microkernel.
 
+## First decode-wide packed attribution sample
+
+Using the new attribution benchmark on the real model:
+
+```bash
+./target/release/bench_packed_decode_attribution \
+  /home/jeremy/models/bonsai-1.7b .artifacts/jengine-packed-model hello 1 combined 137
+```
+
+Observed sample:
+
+- total: `12762.262 ms`
+- compile: `93.506 ms`
+- weight upload: `82.525 ms`
+- activation upload: `3.417 ms`
+- gpu: `714.748 ms`
+- download: `29.558 ms`
+- non-offloaded dense: `11309.553 ms`
+- orchestration: `528.955 ms`
+- dispatch count: `168`
+- streamed bytes: `532,840,448`
+- end-to-end effective bandwidth: `0.042 GB/s`
+- stream-window bandwidth: `0.642 GB/s`
+- percent of `137 GB/s` hardware ceiling, end-to-end: `0.030%`
+- percent of `137 GB/s` hardware ceiling, stream window only: `0.468%`
+
 ## Interpretation
+
+This decode-wide result makes the current situation much clearer:
+
+- the packed decode path is **nowhere near saturating hardware memory bandwidth**
+- even when only looking at upload + gpu + download time, the path reaches only about `0.642 GB/s`
+- the largest bucket in the measured combined sample is still **non-offloaded dense work** (`11309.553 ms`)
+- after that, the next visible problem is orchestration and dispatch structure, not raw hardware bandwidth
 
 Current takeaway:
 

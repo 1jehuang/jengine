@@ -43,6 +43,20 @@ Jengine can now:
 
 ## Latest measured highlights
 
+### Decode-wide packed attribution now exists
+From the latest real combined packed decode attribution run:
+
+- total: `12762.262 ms`
+- non-offloaded dense: `11309.553 ms`
+- orchestration: `528.955 ms`
+- weight upload: `82.525 ms`
+- activation upload: `3.417 ms`
+- gpu: `714.748 ms`
+- download: `29.558 ms`
+- end-to-end effective bandwidth: `0.042 GB/s`
+- stream-window effective bandwidth: `0.642 GB/s`
+- percent of `137 GB/s` hardware ceiling in stream-window terms: about `0.468%`
+
 ### Packed benchmark harnesses now capture cleanly
 From the latest real packed-artifact release runs:
 
@@ -68,10 +82,10 @@ From the latest real one-token run:
 
 ## Current bottlenecks
 
-1. Host-side orchestration and per-dispatch overhead still dominate the packed decode path, even after reducing the combined path from `140` to `84` dispatches
-2. MLP is still a major remaining cost center on the dense side
+1. The dominant cost in the first decode-wide attribution sample is still non-offloaded dense work, not GPU bandwidth saturation
+2. Host-side orchestration and per-dispatch overhead still matter, but they are smaller than the remaining dense-side work in the current combined path
 3. Compile cost is still large for first-pass all-layer sweeps, though paired dispatches help the combined path more than compile avoidance alone
-4. Raw GPU upload, compute, and download time are still much smaller than total packed wall time
+4. Raw GPU upload, compute, and download time are still much smaller than total packed wall time, and measured decode-wide bandwidth is far below the hardware ceiling
 
 ## Best next step
 
