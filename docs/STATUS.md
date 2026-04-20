@@ -216,6 +216,17 @@ With the latest packed-first runtime path, subgroup-row shader, and direct packe
 
 That is a major improvement over the older chunked combined upper bounds. The most important new conclusion is that the **MLP stage is now clearly the largest remaining stage-level bucket** in the combined packed path.
 
+### Naive full-MLP offload is not the right next fix
+
+An env-gated experiment (`JENGINE_PACKED_MLP_FULL=1`) that offloads `down_proj` inside the broader packed path regressed badly:
+
+- combined chunked upper bound: `10010.763 ms`
+- MLP-only chunked upper bound: `9835.970 ms`
+
+The stage breakdown in those runs still showed the MLP stage as the largest bucket, but the total regressions confirm that simply turning `down_proj` into another standalone packed projection is **not** the right next solution.
+
+That means the next MLP-side win likely needs a more structural approach than naive full offload, such as better packed-first staging around the MLP tail or a more fused design.
+
 ### Packed-first generation is now the default control path for packed-artifact models
 
 The packed-artifact `generate_greedy` / `generate_from_token_ids` path no longer falls back through the dense-style reference loop. It now routes into the packed decode path automatically when a packed model artifact is loaded.
@@ -270,7 +281,8 @@ From the latest real one-token run:
 11. Carrying that subgroup-row shader into the chunked combined packed path reduced the reconstructed upper bound from `12212.554 ms` to `11885.064 ms`, only about `2.7%` total, which confirms that dense-side work is still the main limiter
 12. Packed-artifact `generate_greedy` now routes into the packed decode path automatically, so the packed-first runtime is no longer just benchmark-only infrastructure
 13. With the rebuilt release chunked capture path, the latest combined upper bound is now `4521.801 ms`, and the stage breakdown shows `mlp_ms=2732.602` as the largest remaining stage-level bucket
-14. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the MLP tail while still reducing remaining dense-side work and synchronization overhead
+14. A naive full-MLP packed experiment (`JENGINE_PACKED_MLP_FULL=1`) regressed badly, so the next MLP-side fix is not simply turning `down_proj` into another standalone packed projection
+15. That means the next meaningful wins now come from carrying the packed-first and kernel-level improvements further into the MLP tail with a more structural redesign while still reducing remaining dense-side work and synchronization overhead
 
 ## Best next step
 

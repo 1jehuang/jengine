@@ -525,6 +525,18 @@ Current interpretation:
 - even in the `mlp`-only variant, the MLP stage remains the single biggest stage bucket
 - that reinforces that the next dense-side redesign work should target the MLP tail and broader packed-first execution
 
+### Naive full-MLP packed experiment
+
+With `JENGINE_PACKED_MLP_FULL=1`, the env-gated experiment that also offloads `down_proj` produced much worse upper bounds:
+
+- combined upper bound: `10010.763 ms`
+- mlp-only upper bound: `9835.970 ms`
+
+Current interpretation:
+
+- simply turning `down_proj` into another standalone packed projection is not the right next fix in the broader packed path
+- the MLP tail still needs work, but it likely needs a more structural redesign than naive full offload
+
 ## Chunked packed capture workarounds
 
 ### Real combined and attention-only packed step upper bounds via 7-layer chunk chaining

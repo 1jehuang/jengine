@@ -791,6 +791,10 @@ impl ReferenceModel {
         enabled
     }
 
+    fn packed_use_mlp_full() -> bool {
+        std::env::var_os("JENGINE_PACKED_MLP_FULL").is_some()
+    }
+
     fn finish_packed_decode_metrics(
         enabled_projections: String,
         total_duration: Duration,
@@ -2459,17 +2463,35 @@ impl ReferenceModel {
                     dense_started_at,
                 )
             };
+            let use_mlp_full = use_mlp_gu && Self::packed_use_mlp_full();
+            let swiglu_started_at = Instant::now();
             let mlp = swiglu(&gate, &up);
-            let down = self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?;
+            let swiglu_elapsed = swiglu_started_at.elapsed();
+            let down = if use_mlp_full {
+                session.run_projection(
+                    &layer_tensors.down_proj_weight,
+                    self.config.hidden_size,
+                    self.config.intermediate_size,
+                    &mlp,
+                )?
+            } else {
+                self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?
+            };
+            let residual_started_at = Instant::now();
             hidden = residual
                 .iter()
                 .zip(down.iter())
                 .map(|(left, right)| left + right)
                 .collect();
+            let residual_elapsed = residual_started_at.elapsed();
             let elapsed = started_at.elapsed();
             metrics.mlp_duration += elapsed;
             if use_mlp_gu {
-                non_offloaded_dense_duration += dense_tail_started_at.elapsed();
+                if use_mlp_full {
+                    non_offloaded_dense_duration += swiglu_elapsed + residual_elapsed;
+                } else {
+                    non_offloaded_dense_duration += dense_tail_started_at.elapsed();
+                }
             } else {
                 non_offloaded_dense_duration += elapsed;
             }
@@ -3263,17 +3285,35 @@ impl ReferenceModel {
                     dense_started_at,
                 )
             };
+            let use_mlp_full = use_mlp_gu && Self::packed_use_mlp_full();
+            let swiglu_started_at = Instant::now();
             let mlp = swiglu(&gate, &up);
-            let down = self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?;
+            let swiglu_elapsed = swiglu_started_at.elapsed();
+            let down = if use_mlp_full {
+                session.run_projection(
+                    &layer_tensors.down_proj_weight,
+                    self.config.hidden_size,
+                    self.config.intermediate_size,
+                    &mlp,
+                )?
+            } else {
+                self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?
+            };
+            let residual_started_at = Instant::now();
             hidden = residual
                 .iter()
                 .zip(down.iter())
                 .map(|(left, right)| left + right)
                 .collect();
+            let residual_elapsed = residual_started_at.elapsed();
             let elapsed = started_at.elapsed();
             metrics.mlp_duration += elapsed;
             if use_mlp_gu {
-                *non_offloaded_dense_duration += dense_tail_started_at.elapsed();
+                if use_mlp_full {
+                    *non_offloaded_dense_duration += swiglu_elapsed + residual_elapsed;
+                } else {
+                    *non_offloaded_dense_duration += dense_tail_started_at.elapsed();
+                }
             } else {
                 *non_offloaded_dense_duration += elapsed;
             }
