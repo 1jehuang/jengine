@@ -708,13 +708,15 @@ impl CachedGpuPackedMatvecRunner {
                 "resident chaining requires runners to share the same Vulkan context".to_string(),
             ));
         }
-        let upload_duration = self.copy_input_from_buffer(
+        let upload_started = Instant::now();
+        self.copy_input_from_buffer(
             source.shared_context(),
             source.output_buffer.buffer,
             source.rows,
             source.output_buffer.size,
         )?;
-        let gpu_duration = self.submit_and_wait()?;
+        let upload_duration = upload_started.elapsed();
+        let gpu_duration = self.submit_copy_and_compute_and_wait()?;
         Ok(GpuPackedMatvecReport {
             rows: self.rows,
             cols: self.cols,
@@ -734,13 +736,10 @@ impl CachedGpuPackedMatvecRunner {
         source_len: usize,
         source_buffer_size: u64,
     ) -> Result<GpuPackedMatvecReport, GpuPackedMatvecError> {
-        let upload_duration = self.copy_input_from_buffer(
-            source_context,
-            source_buffer,
-            source_len,
-            source_buffer_size,
-        )?;
-        let gpu_duration = self.submit_and_wait()?;
+        let upload_started = Instant::now();
+        self.copy_input_from_buffer(source_context, source_buffer, source_len, source_buffer_size)?;
+        let upload_duration = upload_started.elapsed();
+        let gpu_duration = self.submit_copy_and_compute_and_wait()?;
         Ok(GpuPackedMatvecReport {
             rows: self.rows,
             cols: self.cols,
@@ -760,13 +759,15 @@ impl CachedGpuPackedMatvecRunner {
         source_packed_len: usize,
         source_buffer_size: u64,
     ) -> Result<GpuPackedMatvecReport, GpuPackedMatvecError> {
-        let upload_duration = self.copy_packed_input_from_buffer(
+        let upload_started = Instant::now();
+        self.copy_packed_input_from_buffer(
             source_context,
             source_buffer,
             source_packed_len,
             source_buffer_size,
         )?;
-        let gpu_duration = self.submit_and_wait()?;
+        let upload_duration = upload_started.elapsed();
+        let gpu_duration = self.submit_copy_and_compute_and_wait()?;
         Ok(GpuPackedMatvecReport {
             rows: self.rows,
             cols: self.cols,
@@ -884,13 +885,28 @@ impl CachedGpuPackedMatvecRunner {
         Ok(gpu_started.elapsed())
     }
 
+    fn submit_copy_and_compute_and_wait(&self) -> Result<Duration, GpuPackedMatvecError> {
+        let command_buffers = [self.copy_command_buffer, self.command_buffer];
+        let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+        unsafe {
+            self.device.reset_fences(&[self.fence])?;
+        }
+        let gpu_started = Instant::now();
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        Ok(gpu_started.elapsed())
+    }
+
     fn copy_input_from_buffer(
         &self,
         source_context: &Arc<SharedGpuPackedContext>,
         source_buffer: vk::Buffer,
         source_len: usize,
         source_buffer_size: u64,
-    ) -> Result<Duration, GpuPackedMatvecError> {
+    ) -> Result<(), GpuPackedMatvecError> {
         if self.input_mode != PackedRunnerInputMode::RawF32 {
             return Err(GpuPackedMatvecError::Shape(
                 "resident chaining requires a raw-f32 input runner".to_string(),
@@ -927,18 +943,26 @@ impl CachedGpuPackedMatvecRunner {
                 self.vector_buffer.buffer,
                 &region,
             );
+            let barrier = [vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.vector_buffer.buffer)
+                .offset(0)
+                .size(byte_len as u64)];
+            self.device.cmd_pipeline_barrier(
+                copy_command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barrier,
+                &[],
+            );
             self.device.end_command_buffer(copy_command)?;
-            self.device.reset_fences(&[self.fence])?;
         }
-        let submit_info =
-            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
-        let started = Instant::now();
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &submit_info, self.fence)?;
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
-        Ok(started.elapsed())
+        Ok(())
     }
 
     fn copy_packed_input_from_buffer(
@@ -947,7 +971,7 @@ impl CachedGpuPackedMatvecRunner {
         source_buffer: vk::Buffer,
         source_packed_len: usize,
         source_buffer_size: u64,
-    ) -> Result<Duration, GpuPackedMatvecError> {
+    ) -> Result<(), GpuPackedMatvecError> {
         if self.input_mode != PackedRunnerInputMode::PackedHalfPairs {
             return Err(GpuPackedMatvecError::Shape(
                 "packed resident chaining requires a packed-half-pairs input runner".to_string(),
@@ -984,18 +1008,26 @@ impl CachedGpuPackedMatvecRunner {
                 self.vector_buffer.buffer,
                 &region,
             );
+            let barrier = [vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.vector_buffer.buffer)
+                .offset(0)
+                .size(byte_len as u64)];
+            self.device.cmd_pipeline_barrier(
+                copy_command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barrier,
+                &[],
+            );
             self.device.end_command_buffer(copy_command)?;
-            self.device.reset_fences(&[self.fence])?;
         }
-        let submit_info =
-            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
-        let started = Instant::now();
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &submit_info, self.fence)?;
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
-        Ok(started.elapsed())
+        Ok(())
     }
 
     fn record_command_buffer(&self) -> Result<(), GpuPackedMatvecError> {
