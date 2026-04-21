@@ -24,6 +24,7 @@ use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRun
 use crate::runtime::assets::BonsaiAssetPaths;
 use crate::runtime::decode_plan::PackedDecodePlan;
 use crate::runtime::decode_report::{MemoryReport, build_memory_report};
+use crate::runtime::gpu_decode_engine::PackedGpuSession;
 use crate::runtime::gpu_decode_env::{
     packed_enabled_label, packed_use_attention_full, packed_use_gpu_attention_block,
     packed_use_gpu_embedding, packed_use_gpu_final_norm, packed_use_gpu_first_session,
@@ -1716,13 +1717,6 @@ impl<'a> GpuFirstRunnerCache<'a> {
             compile_duration,
         ))
     }
-}
-
-pub(crate) struct PackedGpuSession<'a> {
-    model: &'a ReferenceModel,
-    pub(crate) metrics: PackedGpuSessionMetrics,
-    pub(crate) dispatch_trace: Vec<PackedDispatchTrace>,
-    scratch: PackedDecodeScratch,
 }
 
 struct PackedDecodeStageSelection {

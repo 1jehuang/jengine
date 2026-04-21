@@ -2,15 +2,17 @@ use crate::runtime::decode_plan::PackedDecodePlan;
 use crate::runtime::gpu_decode_env::{gpu_first_use_attention_full, gpu_first_use_mlp_full};
 use crate::runtime::gpu_decode_metrics::{
     DecodeMetrics, PackedAttentionStageMetrics, PackedDecodeMetrics,
+    PackedGpuSessionMetrics,
     PackedDecodeValidationReport, PackedMlpStageMetrics,
 };
-use crate::runtime::gpu_decode_output::PackedDecodeResult;
+use crate::runtime::gpu_decode_output::{PackedDecodeResult, PackedDispatchTrace};
+use crate::runtime::gpu_decode_scratch::PackedDecodeScratch;
 use crate::runtime::gpu_decode_session_state::{
     LayerCache, PackedDecodeStepResult, allocate_layer_cache_vec,
 };
 use crate::runtime::gpu_decode_state::PackedResidentDecodeState;
 use crate::model::tokenizer::TokenizerRuntime;
-use crate::runtime::reference::{GpuFirstRunnerCache, PackedGpuSession, ReferenceModel};
+use crate::runtime::reference::{GpuFirstRunnerCache, ReferenceModel};
 use crate::runtime::reference_error::ReferenceError;
 use std::time::Instant;
 
@@ -70,6 +72,13 @@ pub struct PersistentPackedDecodeSession<'a> {
 
 pub struct GpuFirstPackedDecodeSession<'a> {
     pub(crate) inner: PersistentPackedDecodeSession<'a>,
+}
+
+pub(crate) struct PackedGpuSession<'a> {
+    pub(crate) model: &'a ReferenceModel,
+    pub(crate) metrics: PackedGpuSessionMetrics,
+    pub(crate) dispatch_trace: Vec<PackedDispatchTrace>,
+    pub(crate) scratch: PackedDecodeScratch,
 }
 
 impl<'a> PersistentPackedDecodeSession<'a> {
