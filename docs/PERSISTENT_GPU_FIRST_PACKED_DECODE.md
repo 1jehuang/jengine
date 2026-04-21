@@ -49,20 +49,23 @@ Using the same strong packed settings, the latest sequential explicit one-token 
 
 #### Warmed `JENGINE_GPU_FULL_LAST_LAYER=1`
 
-- total: `579.275 ms`
-- throughput: about `1.73 tok/s`
-- `gpu_ms=250.561`
-- `download_ms=68.479`
-- `non_offloaded_dense_ms=67.258`
-- `compile_ms=343.751`
-- `orchestration_ms=0.0`
+Latest measured checkpoint after reusing model-owned tail/full-last-layer runners, unifying the GPU-first session onto the model shared context, and prewarming the activation-format kernels actually used by the path:
+
+- total: `410.998 ms`
+- throughput: about `2.43 tok/s`
+- `gpu_ms=206.062`
+- `download_ms=60.196`
+- `non_offloaded_dense_ms=85.295`
+- `compile_ms=14.374`
+- `orchestration_ms=39.941`
 - `dispatch_count=238`
 
 Interpretation:
 
-- the dormant GPU-first full-last-layer path is real and prewarming is wired in
-- but this path is still materially worse than the current strong packed baseline
-- so the next redesign step still needs to focus on reducing CPU-visible glue, compile/setup overhead, and dispatch count rather than merely enabling the path
+- the huge hot-path compile/setup cost in this path was real and is now mostly removed
+- the remaining gap is no longer dominated by lazy shader/kernel creation
+- this makes the next blockers much clearer: CPU-visible dense glue, downloads, and dispatch count still dominate total token time
+- the path is now much closer to the current strong packed baseline, but it still needs further architectural reduction in downloads and non-offloaded dense work to become clearly better
 
 
 ## Current architecture

@@ -4008,6 +4008,27 @@ impl ReferenceModel {
             }
         }
         let _ = self.load_vector_f32_resolved("model.norm.weight")?;
+        if use_mlp_gu {
+            if Self::packed_use_gpu_mlp_entry() || Self::packed_use_gpu_full_last_layer() {
+                let pair_key = format!(
+                    "concat::{}||{}",
+                    self.layer_tensors[0].gate_proj_weight, self.layer_tensors[0].up_proj_weight
+                );
+                let (packed, _, _) = self.get_or_create_projection_pair_cache(
+                    &pair_key,
+                    &self.layer_tensors[0].gate_proj_weight,
+                    self.config.intermediate_size,
+                    &self.layer_tensors[0].up_proj_weight,
+                    self.config.intermediate_size,
+                    self.config.hidden_size,
+                )?;
+                let _ = self.get_or_create_projection_gpu_raw_f32(&pair_key, &packed)?;
+            }
+            if Self::packed_use_gpu_swiglu_block() || Self::packed_use_gpu_full_last_layer() {
+                let _ = self.get_or_create_swiglu_pack_f16_pairs_gpu()?;
+                let _ = self.get_or_create_pack_f16_pairs_gpu(self.config.intermediate_size)?;
+            }
+        }
         if Self::packed_use_gpu_final_norm() || Self::packed_use_gpu_full_last_layer() {
             let _ = self.get_or_create_final_norm_gpu()?;
             let _ = self.get_or_create_pack_f16_pairs_gpu(self.config.hidden_size)?;
