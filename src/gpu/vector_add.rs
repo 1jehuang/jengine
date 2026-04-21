@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::gpu::packed_matvec::SharedGpuPackedContext;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct GpuSwigluCombinedReport {
+pub struct GpuVectorAddReport {
     pub len: usize,
     pub compile_duration: Duration,
     pub upload_duration: Duration,
@@ -21,7 +21,7 @@ pub struct GpuSwigluCombinedReport {
 }
 
 #[derive(Debug)]
-pub enum GpuSwigluCombinedError {
+pub enum GpuVectorAddError {
     Io(std::io::Error),
     Vk(vk::Result),
     Load(ash::LoadingError),
@@ -31,7 +31,7 @@ pub enum GpuSwigluCombinedError {
     Shape(String),
 }
 
-impl std::fmt::Display for GpuSwigluCombinedError {
+impl std::fmt::Display for GpuVectorAddError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(f, "I/O error: {error}"),
@@ -45,47 +45,47 @@ impl std::fmt::Display for GpuSwigluCombinedError {
     }
 }
 
-impl std::error::Error for GpuSwigluCombinedError {}
-impl From<std::io::Error> for GpuSwigluCombinedError {
+impl std::error::Error for GpuVectorAddError {}
+impl From<std::io::Error> for GpuVectorAddError {
     fn from(v: std::io::Error) -> Self {
         Self::Io(v)
     }
 }
-impl From<vk::Result> for GpuSwigluCombinedError {
+impl From<vk::Result> for GpuVectorAddError {
     fn from(v: vk::Result) -> Self {
         Self::Vk(v)
     }
 }
-impl From<ash::LoadingError> for GpuSwigluCombinedError {
+impl From<ash::LoadingError> for GpuVectorAddError {
     fn from(v: ash::LoadingError) -> Self {
         Self::Load(v)
     }
 }
-impl From<std::str::Utf8Error> for GpuSwigluCombinedError {
+impl From<std::str::Utf8Error> for GpuVectorAddError {
     fn from(v: std::str::Utf8Error) -> Self {
         Self::Utf8(v)
     }
 }
-impl From<std::ffi::NulError> for GpuSwigluCombinedError {
+impl From<std::ffi::NulError> for GpuVectorAddError {
     fn from(v: std::ffi::NulError) -> Self {
         Self::CString(v)
     }
 }
 
-pub fn run_swiglu_combined_with_output(
-    combined: &[f32],
+pub fn run_vector_add_with_output(
+    left: &[f32],
+    right: &[f32],
     reference: Option<&[f32]>,
-) -> Result<(Vec<f32>, GpuSwigluCombinedReport), GpuSwigluCombinedError> {
-    let len = combined.len() / 2;
+) -> Result<(Vec<f32>, GpuVectorAddReport), GpuVectorAddError> {
+    let len = left.len();
     let context = SharedGpuPackedContext::new().map_err(map_context_error)?;
-    let (mut runner, compile_duration) =
-        CachedGpuSwigluCombinedRunner::new_with_context(context, len)?;
-    let (output, mut report) = runner.run_with_output(combined, reference)?;
+    let (mut runner, compile_duration) = CachedGpuVectorAddRunner::new_with_context(context, len)?;
+    let (output, mut report) = runner.run_with_output(left, right, reference)?;
     report.compile_duration = compile_duration;
     Ok((output, report))
 }
 
-pub struct CachedGpuSwigluCombinedRunner {
+pub struct CachedGpuVectorAddRunner {
     _shared_context: Arc<SharedGpuPackedContext>,
     device: Device,
     queue: vk::Queue,
@@ -99,28 +99,36 @@ pub struct CachedGpuSwigluCombinedRunner {
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
-    input_buffer: BufferAllocation,
+    left_buffer: BufferAllocation,
+    right_buffer: BufferAllocation,
     output_buffer: BufferAllocation,
 }
 
-impl CachedGpuSwigluCombinedRunner {
+impl CachedGpuVectorAddRunner {
     pub fn new_with_context(
         context: Arc<SharedGpuPackedContext>,
         len: usize,
-    ) -> Result<(Self, Duration), GpuSwigluCombinedError> {
+    ) -> Result<(Self, Duration), GpuVectorAddError> {
         let compile_started = Instant::now();
         let instance = context.instance.clone();
         let device = context.device.clone();
         let queue = context.queue;
         let physical_device = context.physical_device;
         let queue_family_index = context.queue_family_index;
-        let shader_path = compile_shader(Path::new("shaders/swiglu_combined_input.comp"))?;
+        let shader_path = compile_shader(Path::new("shaders/vector_add.comp"))?;
 
-        let input_buffer = create_host_visible_buffer(
+        let left_buffer = create_host_visible_buffer(
             &instance,
             &device,
             physical_device,
-            (len * 2 * 4) as u64,
+            (len * 4) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+        let right_buffer = create_host_visible_buffer(
+            &instance,
+            &device,
+            physical_device,
+            (len * 4) as u64,
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
         let output_buffer = create_host_visible_buffer(
@@ -130,7 +138,8 @@ impl CachedGpuSwigluCombinedRunner {
             (len * 4) as u64,
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
-        zero_buffer(&input_buffer, len * 2 * 4)?;
+        zero_buffer(&left_buffer, len * 4)?;
+        zero_buffer(&right_buffer, len * 4)?;
         zero_buffer(&output_buffer, len * 4)?;
 
         let descriptor_layout_bindings = [
@@ -141,6 +150,11 @@ impl CachedGpuSwigluCombinedRunner {
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
                 .descriptor_count(1)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
@@ -170,11 +184,11 @@ impl CachedGpuSwigluCombinedRunner {
         let pipeline = unsafe {
             device
                 .create_compute_pipelines(vk::PipelineCache::null(), &compute_ci, None)
-                .map_err(|(_, err)| GpuSwigluCombinedError::Vk(err))?[0]
+                .map_err(|(_, err)| GpuVectorAddError::Vk(err))?[0]
         };
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(2)];
+            .descriptor_count(3)];
         let descriptor_pool_ci = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
             .max_sets(1);
@@ -183,8 +197,12 @@ impl CachedGpuSwigluCombinedRunner {
             .descriptor_pool(descriptor_pool)
             .set_layouts(&set_layouts);
         let descriptor_set = unsafe { device.allocate_descriptor_sets(&alloc_info)?[0] };
-        let input_info = [vk::DescriptorBufferInfo::default()
-            .buffer(input_buffer.buffer)
+        let left_info = [vk::DescriptorBufferInfo::default()
+            .buffer(left_buffer.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let right_info = [vk::DescriptorBufferInfo::default()
+            .buffer(right_buffer.buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
         let output_info = [vk::DescriptorBufferInfo::default()
@@ -196,10 +214,15 @@ impl CachedGpuSwigluCombinedRunner {
                 .dst_set(descriptor_set)
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&input_info),
+                .buffer_info(&left_info),
             vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
                 .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&right_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(&output_info),
         ];
@@ -252,7 +275,8 @@ impl CachedGpuSwigluCombinedRunner {
                 command_pool,
                 command_buffer,
                 fence,
-                input_buffer,
+                left_buffer,
+                right_buffer,
                 output_buffer,
             },
             compile_started.elapsed(),
@@ -261,18 +285,21 @@ impl CachedGpuSwigluCombinedRunner {
 
     pub fn run_with_output(
         &mut self,
-        combined: &[f32],
+        left: &[f32],
+        right: &[f32],
         reference: Option<&[f32]>,
-    ) -> Result<(Vec<f32>, GpuSwigluCombinedReport), GpuSwigluCombinedError> {
-        if combined.len() != self.len * 2 {
-            return Err(GpuSwigluCombinedError::Shape(format!(
-                "combined len {} must match {}",
-                combined.len(),
-                self.len * 2
+    ) -> Result<(Vec<f32>, GpuVectorAddReport), GpuVectorAddError> {
+        if left.len() != self.len || right.len() != self.len {
+            return Err(GpuVectorAddError::Shape(format!(
+                "left len {} and right len {} must both match {}",
+                left.len(),
+                right.len(),
+                self.len
             )));
         }
         let upload_started = Instant::now();
-        write_f32_buffer(&self.input_buffer, combined)?;
+        write_f32_buffer(&self.left_buffer, left)?;
+        write_f32_buffer(&self.right_buffer, right)?;
         let upload_duration = upload_started.elapsed();
         unsafe { self.device.reset_fences(&[self.fence])? };
         let submit_info = [
@@ -294,7 +321,7 @@ impl CachedGpuSwigluCombinedRunner {
         };
         Ok((
             output,
-            GpuSwigluCombinedReport {
+            GpuVectorAddReport {
                 len: self.len,
                 compile_duration: Duration::ZERO,
                 upload_duration,
@@ -304,31 +331,6 @@ impl CachedGpuSwigluCombinedRunner {
                 mean_abs_diff,
             },
         ))
-    }
-
-    pub fn run_resident_from_f32_buffer(
-        &mut self,
-        source_context: &Arc<SharedGpuPackedContext>,
-        source_buffer: vk::Buffer,
-        source_len: usize,
-        source_buffer_size: u64,
-    ) -> Result<GpuSwigluCombinedReport, GpuSwigluCombinedError> {
-        let upload_duration = self.copy_input_from_buffer(
-            source_context,
-            source_buffer,
-            source_len,
-            source_buffer_size,
-        )?;
-        let gpu_duration = self.submit_and_wait()?;
-        Ok(GpuSwigluCombinedReport {
-            len: self.len,
-            compile_duration: Duration::ZERO,
-            upload_duration,
-            gpu_duration,
-            download_duration: Duration::ZERO,
-            max_abs_diff: 0.0,
-            mean_abs_diff: 0.0,
-        })
     }
 
     pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> {
@@ -346,82 +348,9 @@ impl CachedGpuSwigluCombinedRunner {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
-
-    fn submit_and_wait(&self) -> Result<Duration, GpuSwigluCombinedError> {
-        let submit_info = [
-            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer))
-        ];
-        unsafe {
-            self.device.reset_fences(&[self.fence])?;
-        }
-        let gpu_started = Instant::now();
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &submit_info, self.fence)?;
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
-        Ok(gpu_started.elapsed())
-    }
-
-    fn copy_input_from_buffer(
-        &self,
-        source_context: &Arc<SharedGpuPackedContext>,
-        source_buffer: vk::Buffer,
-        source_len: usize,
-        source_buffer_size: u64,
-    ) -> Result<Duration, GpuSwigluCombinedError> {
-        if source_len != self.len * 2 {
-            return Err(GpuSwigluCombinedError::Shape(format!(
-                "source len {} does not match destination len {}",
-                source_len,
-                self.len * 2
-            )));
-        }
-        if !Arc::ptr_eq(&self._shared_context, source_context) {
-            return Err(GpuSwigluCombinedError::Shape(
-                "resident chaining requires runners to share the same Vulkan context".to_string(),
-            ));
-        }
-        let byte_len = self.len * 2 * std::mem::size_of::<f32>();
-        if byte_len as u64 > source_buffer_size || byte_len as u64 > self.input_buffer.size {
-            return Err(GpuSwigluCombinedError::Shape(format!(
-                "copy {} bytes exceeds source {} or destination {} buffer size",
-                byte_len, source_buffer_size, self.input_buffer.size
-            )));
-        }
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let copy_command = unsafe { self.device.allocate_command_buffers(&alloc)?[0] };
-        unsafe {
-            self.device
-                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
-            let region = [vk::BufferCopy::default().size(byte_len as u64)];
-            self.device.cmd_copy_buffer(
-                copy_command,
-                source_buffer,
-                self.input_buffer.buffer,
-                &region,
-            );
-            self.device.end_command_buffer(copy_command)?;
-            self.device.reset_fences(&[self.fence])?;
-        }
-        let submit_info =
-            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
-        let started = Instant::now();
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &submit_info, self.fence)?;
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-            self.device
-                .free_command_buffers(self.command_pool, &[copy_command]);
-        }
-        Ok(started.elapsed())
-    }
 }
 
-impl Drop for CachedGpuSwigluCombinedRunner {
+impl Drop for CachedGpuVectorAddRunner {
     fn drop(&mut self) {
         unsafe {
             self.device.destroy_fence(self.fence, None);
@@ -434,7 +363,8 @@ impl Drop for CachedGpuSwigluCombinedRunner {
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
-            destroy_buffer(&self.device, self.input_buffer);
+            destroy_buffer(&self.device, self.left_buffer);
+            destroy_buffer(&self.device, self.right_buffer);
             destroy_buffer(&self.device, self.output_buffer);
         }
     }
@@ -448,7 +378,7 @@ struct BufferAllocation {
     size: u64,
 }
 
-fn compile_shader(path: &Path) -> Result<PathBuf, GpuSwigluCombinedError> {
+fn compile_shader(path: &Path) -> Result<PathBuf, GpuVectorAddError> {
     let temp_dir = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".tmp"));
@@ -456,7 +386,7 @@ fn compile_shader(path: &Path) -> Result<PathBuf, GpuSwigluCombinedError> {
     let shader_stem = path
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .unwrap_or("swiglu-combined");
+        .unwrap_or("vector-add");
     let out = temp_dir.join(format!("{shader_stem}.spv"));
     let tmp = temp_dir.join(format!(
         "{shader_stem}-{}-{}.tmp.spv",
@@ -473,7 +403,7 @@ fn compile_shader(path: &Path) -> Result<PathBuf, GpuSwigluCombinedError> {
         .arg(&tmp)
         .output()?;
     if !output.status.success() {
-        return Err(GpuSwigluCombinedError::Process(
+        return Err(GpuVectorAddError::Process(
             String::from_utf8_lossy(&output.stderr).to_string(),
         ));
     }
@@ -484,7 +414,7 @@ fn compile_shader(path: &Path) -> Result<PathBuf, GpuSwigluCombinedError> {
 fn create_shader_module(
     device: &Device,
     path: &Path,
-) -> Result<vk::ShaderModule, GpuSwigluCombinedError> {
+) -> Result<vk::ShaderModule, GpuVectorAddError> {
     let mut cursor = Cursor::new(std::fs::read(path)?);
     let code = read_spv(&mut cursor)?;
     let ci = vk::ShaderModuleCreateInfo::default().code(&code);
@@ -497,7 +427,7 @@ fn create_host_visible_buffer(
     physical_device: vk::PhysicalDevice,
     size: u64,
     usage: vk::BufferUsageFlags,
-) -> Result<BufferAllocation, GpuSwigluCombinedError> {
+) -> Result<BufferAllocation, GpuVectorAddError> {
     let ci = vk::BufferCreateInfo::default()
         .size(size)
         .usage(usage)
@@ -530,7 +460,7 @@ fn find_memory_type(
     props: &vk::PhysicalDeviceMemoryProperties,
     filter: u32,
     flags: vk::MemoryPropertyFlags,
-) -> Result<u32, GpuSwigluCombinedError> {
+) -> Result<u32, GpuVectorAddError> {
     for i in 0..props.memory_type_count {
         let matches_type = (filter & (1 << i)) != 0;
         let has_flags = props.memory_types[i as usize]
@@ -540,15 +470,15 @@ fn find_memory_type(
             return Ok(i);
         }
     }
-    Err(GpuSwigluCombinedError::Shape(
+    Err(GpuVectorAddError::Shape(
         "no matching Vulkan memory type found".to_string(),
     ))
 }
 
-fn write_f32_buffer(buffer: &BufferAllocation, data: &[f32]) -> Result<(), GpuSwigluCombinedError> {
+fn write_f32_buffer(buffer: &BufferAllocation, data: &[f32]) -> Result<(), GpuVectorAddError> {
     let byte_len = std::mem::size_of_val(data) as u64;
     if byte_len > buffer.size {
-        return Err(GpuSwigluCombinedError::Shape(format!(
+        return Err(GpuVectorAddError::Shape(format!(
             "f32 write {} bytes exceeds mapped buffer size {}",
             byte_len, buffer.size
         )));
@@ -563,9 +493,9 @@ fn write_f32_buffer(buffer: &BufferAllocation, data: &[f32]) -> Result<(), GpuSw
     Ok(())
 }
 
-fn zero_buffer(buffer: &BufferAllocation, byte_len: usize) -> Result<(), GpuSwigluCombinedError> {
+fn zero_buffer(buffer: &BufferAllocation, byte_len: usize) -> Result<(), GpuVectorAddError> {
     if byte_len as u64 > buffer.size {
-        return Err(GpuSwigluCombinedError::Shape(format!(
+        return Err(GpuVectorAddError::Shape(format!(
             "zero {} bytes exceeds mapped buffer size {}",
             byte_len, buffer.size
         )));
@@ -576,10 +506,7 @@ fn zero_buffer(buffer: &BufferAllocation, byte_len: usize) -> Result<(), GpuSwig
     Ok(())
 }
 
-fn read_f32_buffer(
-    buffer: &BufferAllocation,
-    len: usize,
-) -> Result<Vec<f32>, GpuSwigluCombinedError> {
+fn read_f32_buffer(buffer: &BufferAllocation, len: usize) -> Result<Vec<f32>, GpuVectorAddError> {
     let mut out = vec![0.0f32; len];
     unsafe {
         std::ptr::copy_nonoverlapping(buffer.mapped_ptr as *const f32, out.as_mut_ptr(), len);
@@ -598,40 +525,38 @@ fn compare_outputs(reference: &[f32], output: &[f32]) -> (f32, f32) {
     (max_abs_diff, sum_abs_diff / reference.len().max(1) as f32)
 }
 
-fn destroy_buffer(device: &Device, buffer: BufferAllocation) {
+fn destroy_buffer(device: &Device, alloc: BufferAllocation) {
     unsafe {
-        device.unmap_memory(buffer.memory);
-        device.destroy_buffer(buffer.buffer, None);
-        device.free_memory(buffer.memory, None);
+        device.unmap_memory(alloc.memory);
+        device.destroy_buffer(alloc.buffer, None);
+        device.free_memory(alloc.memory, None);
     }
 }
 
-fn map_context_error(
-    error: crate::gpu::packed_matvec::GpuPackedMatvecError,
-) -> GpuSwigluCombinedError {
+fn map_context_error(error: crate::gpu::packed_matvec::GpuPackedMatvecError) -> GpuVectorAddError {
     match error {
-        crate::gpu::packed_matvec::GpuPackedMatvecError::Io(err) => GpuSwigluCombinedError::Io(err),
-        crate::gpu::packed_matvec::GpuPackedMatvecError::Vk(err) => GpuSwigluCombinedError::Vk(err),
-        crate::gpu::packed_matvec::GpuPackedMatvecError::Load(err) => {
-            GpuSwigluCombinedError::Load(err)
+        crate::gpu::packed_matvec::GpuPackedMatvecError::Io(error) => GpuVectorAddError::Io(error),
+        crate::gpu::packed_matvec::GpuPackedMatvecError::Vk(error) => GpuVectorAddError::Vk(error),
+        crate::gpu::packed_matvec::GpuPackedMatvecError::Load(error) => {
+            GpuVectorAddError::Load(error)
         }
-        crate::gpu::packed_matvec::GpuPackedMatvecError::Utf8(err) => {
-            GpuSwigluCombinedError::Utf8(err)
+        crate::gpu::packed_matvec::GpuPackedMatvecError::Utf8(error) => {
+            GpuVectorAddError::Utf8(error)
         }
-        crate::gpu::packed_matvec::GpuPackedMatvecError::Process(err) => {
-            GpuSwigluCombinedError::Process(err)
+        crate::gpu::packed_matvec::GpuPackedMatvecError::Process(error) => {
+            GpuVectorAddError::Process(error)
         }
-        crate::gpu::packed_matvec::GpuPackedMatvecError::CString(err) => {
-            GpuSwigluCombinedError::CString(err)
+        crate::gpu::packed_matvec::GpuPackedMatvecError::CString(error) => {
+            GpuVectorAddError::CString(error)
+        }
+        crate::gpu::packed_matvec::GpuPackedMatvecError::Shape(message) => {
+            GpuVectorAddError::Shape(message)
         }
         crate::gpu::packed_matvec::GpuPackedMatvecError::MissingDevice => {
-            GpuSwigluCombinedError::Shape("no suitable Vulkan device found".to_string())
+            GpuVectorAddError::Shape("missing Vulkan device".to_string())
         }
         crate::gpu::packed_matvec::GpuPackedMatvecError::MissingQueue => {
-            GpuSwigluCombinedError::Shape("no suitable compute queue family found".to_string())
-        }
-        crate::gpu::packed_matvec::GpuPackedMatvecError::Shape(msg) => {
-            GpuSwigluCombinedError::Shape(msg)
+            GpuVectorAddError::Shape("missing Vulkan queue".to_string())
         }
     }
 }

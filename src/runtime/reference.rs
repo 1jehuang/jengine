@@ -1,4 +1,3 @@
-use ash::vk;
 use crate::cpu::block::{YarnRope, build_yarn_rope, rope_cos_sin};
 use crate::cpu::primitives::{argmax, swiglu};
 use crate::gpu::pack_f16_pairs::CachedGpuPackF16PairsRunner;
@@ -14,6 +13,7 @@ use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::packed_model::{PackedModelError, PackedModelStore};
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
 use crate::runtime::weights::{WeightError, WeightStore};
+use ash::vk;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -1086,8 +1086,9 @@ impl<'a> PackedGpuSession<'a> {
         &mut self,
         final_norm: ResidentGpuFinalNorm,
     ) -> Result<ResidentGpuPackedActivation, ReferenceError> {
-        let (runner, compile_duration, gpu_cache_hit) =
-            self.model.get_or_create_pack_f16_pairs_gpu(final_norm.runner.borrow().len())?;
+        let (runner, compile_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_pack_f16_pairs_gpu(final_norm.runner.borrow().len())?;
         let report = runner
             .borrow_mut()
             .run_resident_from_f32_buffer(
@@ -1180,7 +1181,8 @@ impl<'a> PackedGpuSession<'a> {
             0,
         );
 
-        let (runner, compile_duration, gpu_cache_hit) = self.model.get_or_create_swiglu_combined_gpu()?;
+        let (runner, compile_duration, gpu_cache_hit) =
+            self.model.get_or_create_swiglu_combined_gpu()?;
         let report = runner
             .borrow_mut()
             .run_resident_from_f32_buffer(
@@ -1196,8 +1198,10 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.upload_duration += report.upload_duration;
         self.metrics.gpu_duration += report.gpu_duration;
         self.metrics.dispatch_count += 1;
-        self.metrics.activation_upload_bytes += (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
-        self.metrics.upload_bytes += (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
+        self.metrics.activation_upload_bytes +=
+            (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes +=
+            (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
         self.dispatch_trace.push(PackedDispatchTrace {
             index: self.dispatch_trace.len() + 1,
@@ -1216,7 +1220,8 @@ impl<'a> PackedGpuSession<'a> {
             gpu_ms: report.gpu_duration.as_secs_f64() * 1_000.0,
             download_ms: 0.0,
             weight_upload_bytes: 0,
-            activation_upload_bytes: (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>(),
+            activation_upload_bytes: (pair.first_rows + pair.second_rows)
+                * std::mem::size_of::<f32>(),
             download_bytes: 0,
         });
         Ok(ResidentGpuSwigluCombined {
@@ -1260,7 +1265,8 @@ impl<'a> PackedGpuSession<'a> {
             0,
         );
 
-        let (runner, compile_duration, gpu_cache_hit) = self.model.get_or_create_swiglu_pack_f16_pairs_gpu()?;
+        let (runner, compile_duration, gpu_cache_hit) =
+            self.model.get_or_create_swiglu_pack_f16_pairs_gpu()?;
         let report = runner
             .borrow_mut()
             .run_with_output_from_buffer(
@@ -1276,8 +1282,10 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.upload_duration += report.upload_duration;
         self.metrics.gpu_duration += report.gpu_duration;
         self.metrics.dispatch_count += 1;
-        self.metrics.activation_upload_bytes += (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
-        self.metrics.upload_bytes += (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
+        self.metrics.activation_upload_bytes +=
+            (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes +=
+            (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
         self.dispatch_trace.push(PackedDispatchTrace {
             index: self.dispatch_trace.len() + 1,
@@ -1296,7 +1304,8 @@ impl<'a> PackedGpuSession<'a> {
             gpu_ms: report.gpu_duration.as_secs_f64() * 1_000.0,
             download_ms: 0.0,
             weight_upload_bytes: 0,
-            activation_upload_bytes: (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>(),
+            activation_upload_bytes: (pair.first_rows + pair.second_rows)
+                * std::mem::size_of::<f32>(),
             download_bytes: 0,
         });
         Ok(ResidentGpuPackedActivation {
@@ -1336,7 +1345,8 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.upload_duration += report.upload_duration;
         self.metrics.gpu_duration += report.gpu_duration;
         self.metrics.dispatch_count += 1;
-        self.metrics.activation_upload_bytes += swiglu.runner.borrow().len() * std::mem::size_of::<f32>();
+        self.metrics.activation_upload_bytes +=
+            swiglu.runner.borrow().len() * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += swiglu.runner.borrow().len() * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
         self.dispatch_trace.push(PackedDispatchTrace {
@@ -1395,11 +1405,12 @@ impl<'a> PackedGpuSession<'a> {
                     "gpu packed projection chaining failed for {tensor_name}: {error}"
                 ))
             })?;
-        let (output, download_duration) = prepared.runner.borrow().read_output().map_err(|error| {
-            ReferenceError::Decode(format!(
-                "gpu projection output download failed for {tensor_name}: {error}"
-            ))
-        })?;
+        let (output, download_duration) =
+            prepared.runner.borrow().read_output().map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection output download failed for {tensor_name}: {error}"
+                ))
+            })?;
         report.download_duration = download_duration;
         let weight_upload_bytes = usize::from(!prepared.gpu_cache_hit)
             * (prepared.packed.code_words.len() * std::mem::size_of::<u32>()
@@ -1631,14 +1642,15 @@ impl<'a> PackedGpuSession<'a> {
         input: &[f32],
     ) -> Result<ResidentPackedPairProjection, ReferenceError> {
         let pair_key = format!("concat::{first_name}||{second_name}");
-        let (packed, pack_duration, pack_cache_hit) = self.model.get_or_create_projection_pair_cache(
-            &pair_key,
-            first_name,
-            first_rows,
-            second_name,
-            second_rows,
-            cols,
-        )?;
+        let (packed, pack_duration, pack_cache_hit) =
+            self.model.get_or_create_projection_pair_cache(
+                &pair_key,
+                first_name,
+                first_rows,
+                second_name,
+                second_rows,
+                cols,
+            )?;
         let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
             .model
             .get_or_create_projection_gpu(&pair_key, &packed)?;
@@ -2833,13 +2845,11 @@ impl ReferenceModel {
             return Ok((cached, Duration::ZERO, true));
         }
         let context = self.get_or_create_packed_gpu_context()?;
-        let (runner, duration) = CachedGpuSwigluCombinedRunner::new_with_context(
-            context,
-            self.config.intermediate_size,
-        )
-        .map_err(|error| {
-            ReferenceError::Decode(format!("gpu combined swiglu init failed: {error}"))
-        })?;
+        let (runner, duration) =
+            CachedGpuSwigluCombinedRunner::new_with_context(context, self.config.intermediate_size)
+                .map_err(|error| {
+                    ReferenceError::Decode(format!("gpu combined swiglu init failed: {error}"))
+                })?;
         let runner = Rc::new(RefCell::new(runner));
         *self.cached_swiglu_combined_gpu.borrow_mut() = Some(runner.clone());
         Ok((runner, duration, false))
@@ -2848,7 +2858,12 @@ impl ReferenceModel {
     fn get_or_create_swiglu_pack_f16_pairs_gpu(
         &self,
     ) -> Result<CachedSwigluPackF16PairsGpuCacheEntry, ReferenceError> {
-        if let Some(cached) = self.cached_swiglu_pack_f16_pairs_gpu.borrow().as_ref().cloned() {
+        if let Some(cached) = self
+            .cached_swiglu_pack_f16_pairs_gpu
+            .borrow()
+            .as_ref()
+            .cloned()
+        {
             return Ok((cached, Duration::ZERO, true));
         }
         let context = self.get_or_create_packed_gpu_context()?;
@@ -4551,67 +4566,74 @@ impl ReferenceModel {
             let started_at = Instant::now();
             let use_gpu_swiglu_block =
                 use_mlp_gu && use_mlp_full && Self::packed_use_gpu_swiglu_block();
-            let (down, swiglu_elapsed, down_elapsed, dense_tail_started_at) = if use_gpu_swiglu_block {
-                let pair = session.run_projection_pair_resident(
-                    &layer_tensors.gate_proj_weight,
-                    self.config.intermediate_size,
-                    &layer_tensors.up_proj_weight,
-                    self.config.intermediate_size,
-                    self.config.hidden_size,
-                    &hidden_states,
-                )?;
-                let swiglu_started_at = Instant::now();
-                let packed_activation = session.run_swiglu_pack_f16_pairs_resident(pair)?;
-                let swiglu_elapsed = swiglu_started_at.elapsed();
-                mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
-                let down_started_at = Instant::now();
-                let down = session.run_projection_from_packed_activation(
-                    &layer_tensors.down_proj_weight,
-                    self.config.hidden_size,
-                    self.config.intermediate_size,
-                    packed_activation,
-                )?;
-                let down_elapsed = down_started_at.elapsed();
-                (down, swiglu_elapsed, down_elapsed, Instant::now())
-            } else {
-                let (gate, up, dense_tail_started_at) = if use_mlp_gu {
-                    session
-                        .run_projection_pair(
-                            &layer_tensors.gate_proj_weight,
-                            self.config.intermediate_size,
-                            &layer_tensors.up_proj_weight,
-                            self.config.intermediate_size,
-                            self.config.hidden_size,
-                            &hidden_states,
-                        )
-                        .map(|(gate, up)| (gate, up, Instant::now()))?
-                } else {
-                    let dense_started_at = Instant::now();
-                    (
-                        self.matvec_f16_resolved(&layer_tensors.gate_proj_weight, &hidden_states)?,
-                        self.matvec_f16_resolved(&layer_tensors.up_proj_weight, &hidden_states)?,
-                        dense_started_at,
-                    )
-                };
-                let swiglu_started_at = Instant::now();
-                let mlp = swiglu(&gate, &up);
-                let swiglu_elapsed = swiglu_started_at.elapsed();
-                mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
-                session.push_dense_stage_trace("mlp_swiglu", "swiglu", swiglu_elapsed);
-                let down_started_at = Instant::now();
-                let down = if use_mlp_full {
-                    session.run_projection(
+            let (down, swiglu_elapsed, down_elapsed, dense_tail_started_at) =
+                if use_gpu_swiglu_block {
+                    let pair = session.run_projection_pair_resident(
+                        &layer_tensors.gate_proj_weight,
+                        self.config.intermediate_size,
+                        &layer_tensors.up_proj_weight,
+                        self.config.intermediate_size,
+                        self.config.hidden_size,
+                        &hidden_states,
+                    )?;
+                    let swiglu_started_at = Instant::now();
+                    let packed_activation = session.run_swiglu_pack_f16_pairs_resident(pair)?;
+                    let swiglu_elapsed = swiglu_started_at.elapsed();
+                    mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
+                    let down_started_at = Instant::now();
+                    let down = session.run_projection_from_packed_activation(
                         &layer_tensors.down_proj_weight,
                         self.config.hidden_size,
                         self.config.intermediate_size,
-                        &mlp,
-                    )?
+                        packed_activation,
+                    )?;
+                    let down_elapsed = down_started_at.elapsed();
+                    (down, swiglu_elapsed, down_elapsed, Instant::now())
                 } else {
-                    self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?
+                    let (gate, up, dense_tail_started_at) = if use_mlp_gu {
+                        session
+                            .run_projection_pair(
+                                &layer_tensors.gate_proj_weight,
+                                self.config.intermediate_size,
+                                &layer_tensors.up_proj_weight,
+                                self.config.intermediate_size,
+                                self.config.hidden_size,
+                                &hidden_states,
+                            )
+                            .map(|(gate, up)| (gate, up, Instant::now()))?
+                    } else {
+                        let dense_started_at = Instant::now();
+                        (
+                            self.matvec_f16_resolved(
+                                &layer_tensors.gate_proj_weight,
+                                &hidden_states,
+                            )?,
+                            self.matvec_f16_resolved(
+                                &layer_tensors.up_proj_weight,
+                                &hidden_states,
+                            )?,
+                            dense_started_at,
+                        )
+                    };
+                    let swiglu_started_at = Instant::now();
+                    let mlp = swiglu(&gate, &up);
+                    let swiglu_elapsed = swiglu_started_at.elapsed();
+                    mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
+                    session.push_dense_stage_trace("mlp_swiglu", "swiglu", swiglu_elapsed);
+                    let down_started_at = Instant::now();
+                    let down = if use_mlp_full {
+                        session.run_projection(
+                            &layer_tensors.down_proj_weight,
+                            self.config.hidden_size,
+                            self.config.intermediate_size,
+                            &mlp,
+                        )?
+                    } else {
+                        self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?
+                    };
+                    let down_elapsed = down_started_at.elapsed();
+                    (down, swiglu_elapsed, down_elapsed, dense_tail_started_at)
                 };
-                let down_elapsed = down_started_at.elapsed();
-                (down, swiglu_elapsed, down_elapsed, dense_tail_started_at)
-            };
             mlp_stage_metrics.down_duration += down_elapsed;
             let residual_started_at = Instant::now();
             hidden = residual

@@ -13,8 +13,8 @@ fn main() {
         .map(|i| (i % 19) as f32 * 0.037 - 0.3)
         .collect::<Vec<_>>();
     let reference = swiglu(&gate, &up);
-    let (_output, report) = run_swiglu_with_output(&gate, &up, Some(&reference))
-        .expect("gpu swiglu should succeed");
+    let (_output, report) =
+        run_swiglu_with_output(&gate, &up, Some(&reference)).expect("gpu swiglu should succeed");
     println!(
         "len={} compile_ms={:.3} upload_ms={:.3} gpu_ms={:.3} download_ms={:.3} max_abs_diff={:.6} mean_abs_diff={:.6}",
         report.len,

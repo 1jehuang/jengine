@@ -47,7 +47,8 @@ fn main() {
     let cols = 2048usize;
     let rows = gate_values.len() / cols;
 
-    let (gate_packed, _) = pack_ternary_g128(&gate_values, vec![rows, cols], 1e-3).expect("pack gate");
+    let (gate_packed, _) =
+        pack_ternary_g128(&gate_values, vec![rows, cols], 1e-3).expect("pack gate");
     let (up_packed, _) = pack_ternary_g128(&up_values, vec![rows, cols], 1e-3).expect("pack up");
     let mut code_words = packed_codes_to_words(&gate_packed.packed_codes);
     code_words.extend_from_slice(&packed_codes_to_words(&up_packed.packed_codes));

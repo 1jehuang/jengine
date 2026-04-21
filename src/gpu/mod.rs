@@ -5,5 +5,6 @@ pub mod packed_pair_swiglu_pack;
 pub mod swiglu;
 pub mod swiglu_combined;
 pub mod swiglu_pack_f16_pairs;
+pub mod vector_add;
 pub mod vulkan;
 pub mod weighted_rms_norm;
