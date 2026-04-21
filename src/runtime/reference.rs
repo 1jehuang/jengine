@@ -3599,23 +3599,18 @@ impl ReferenceModel {
         )
     }
 
-    pub(crate) fn prewarm_packed_decode_caches_internal(
+    fn prewarm_layer_projection_caches(
         &self,
-        expected_tokens: usize,
+        plan: &PackedDecodePlan,
         use_attention_qkv: bool,
         use_mlp_gu: bool,
         use_attention_full: bool,
         use_mlp_full: bool,
+        kv_rows: usize,
     ) -> Result<(), ReferenceError> {
-        if self.packed_model.is_none() {
-            return Ok(());
-        }
-        let plan = PackedDecodePlan::from_env(use_attention_qkv, use_mlp_gu, false);
-        let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
         for layer_tensors in &self.layer_tensors {
             let _ = self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
-            let _ =
-                self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
+            let _ = self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
             let _ = self.load_vector_f32_resolved(&layer_tensors.q_norm_weight)?;
             let _ = self.load_vector_f32_resolved(&layer_tensors.k_norm_weight)?;
             if use_attention_qkv {
@@ -3642,8 +3637,7 @@ impl ReferenceModel {
                         self.config.hidden_size,
                         self.config.hidden_size,
                     )?;
-                    let _ =
-                        self.get_or_create_projection_gpu(&layer_tensors.o_proj_weight, &packed)?;
+                    let _ = self.get_or_create_projection_gpu(&layer_tensors.o_proj_weight, &packed)?;
                 }
             }
             if use_mlp_gu {
@@ -3669,14 +3663,21 @@ impl ReferenceModel {
                         self.config.hidden_size,
                         self.config.intermediate_size,
                     )?;
-                    let _ = self
-                        .get_or_create_projection_gpu(&layer_tensors.down_proj_weight, &packed)?;
+                    let _ = self.get_or_create_projection_gpu(&layer_tensors.down_proj_weight, &packed)?;
                     if plan.gpu_swiglu_block {
                         let _ = self.get_or_create_swiglu_pack_f16_pairs_gpu()?;
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    fn prewarm_tail_support_caches(
+        &self,
+        plan: &PackedDecodePlan,
+        use_mlp_gu: bool,
+    ) -> Result<(), ReferenceError> {
         let _ = self.load_vector_f32_resolved("model.norm.weight")?;
         if use_mlp_gu {
             if plan.gpu_mlp_entry || plan.gpu_full_last_layer {
@@ -3711,6 +3712,31 @@ impl ReferenceModel {
             self.config.vocab_size,
             self.config.hidden_size,
         )?;
+        Ok(())
+    }
+
+    pub(crate) fn prewarm_packed_decode_caches_internal(
+        &self,
+        expected_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        use_attention_full: bool,
+        use_mlp_full: bool,
+    ) -> Result<(), ReferenceError> {
+        if self.packed_model.is_none() {
+            return Ok(());
+        }
+        let plan = PackedDecodePlan::from_env(use_attention_qkv, use_mlp_gu, false);
+        let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
+        self.prewarm_layer_projection_caches(
+            &plan,
+            use_attention_qkv,
+            use_mlp_gu,
+            use_attention_full,
+            use_mlp_full,
+            kv_rows,
+        )?;
+        self.prewarm_tail_support_caches(&plan, use_mlp_gu)?;
         if plan.gpu_first_session {
             let mut gpu_first_cache = GpuFirstRunnerCache::new(self, expected_tokens.max(1));
             gpu_first_cache.prewarm_decode_path(use_attention_qkv, use_mlp_gu)?;
