@@ -49,7 +49,8 @@ use crate::runtime::gpu_decode_session_state::{
     LayerCache, PackedDecodeStepResult, allocate_layer_cache_vec,
 };
 use crate::runtime::gpu_decode_state::{
-    GpuKvBinding, GpuTailResult, GpuTailStepReport, ResidentHiddenState,
+    GpuKvBinding, GpuTailResult, GpuTailStepReport, PackedResidentDecodeState,
+    ResidentHiddenState,
 };
 use crate::runtime::packed_model::PackedModelStore;
 use crate::runtime::reference_error::ReferenceError;
@@ -5120,19 +5121,18 @@ impl ReferenceModel {
         gpu_hidden_after_mlp: Option<ResidentGpuVectorAdd>,
         residual: &[f32],
         hidden: &mut Vec<f32>,
-        final_hidden_gpu: &mut Option<ResidentGpuVectorAdd>,
-        resident_hidden_state: &mut Option<ResidentHiddenState>,
+        resident_decode_state: &mut PackedResidentDecodeState,
         use_mlp_full: bool,
         use_gpu_swiglu_block: bool,
         gpu_residual_elapsed: Duration,
     ) -> Duration {
         if let Some(hidden_gpu) = gpu_hidden_after_mlp {
             *hidden = residual.to_vec();
-            *final_hidden_gpu = Some(hidden_gpu);
-            *resident_hidden_state = None;
+            resident_decode_state.final_hidden_gpu = Some(hidden_gpu);
+            resident_decode_state.resident_hidden_state = None;
             return gpu_residual_elapsed;
         }
-        *resident_hidden_state = None;
+        resident_decode_state.resident_hidden_state = None;
         if use_mlp_full && !use_gpu_swiglu_block {
             *hidden = down.expect("down must exist for cpu residual path");
             return Duration::ZERO;
@@ -7711,8 +7711,7 @@ impl ReferenceModel {
         residual: &[f32],
         hidden_states: &mut Vec<f32>,
         hidden: &mut Vec<f32>,
-        final_hidden_gpu: &mut Option<ResidentGpuVectorAdd>,
-        resident_hidden_state: &mut Option<ResidentHiddenState>,
+        resident_decode_state: &mut PackedResidentDecodeState,
         stage_selection: &PackedDecodeStageSelection,
         use_mlp_gu: bool,
         use_mlp_full: bool,
@@ -7851,8 +7850,7 @@ impl ReferenceModel {
             gpu_hidden_after_mlp,
             residual,
             hidden,
-            final_hidden_gpu,
-            resident_hidden_state,
+            resident_decode_state,
             use_mlp_full,
             stage_selection.use_gpu_swiglu_block,
             gpu_residual_elapsed,
@@ -7899,8 +7897,7 @@ impl ReferenceModel {
         use_mlp_full: bool,
         argmax_only: bool,
         hidden: &mut Vec<f32>,
-        final_hidden_gpu: &mut Option<ResidentGpuVectorAdd>,
-        resident_hidden_state: &mut Option<ResidentHiddenState>,
+        resident_decode_state: &mut PackedResidentDecodeState,
     ) -> Result<PackedDecodeLayerStepOutcome, ReferenceError> {
         let layer_tensors = &self.layer_tensors[layer_idx];
         let stage_selection = self.select_packed_decode_stages(
@@ -7916,7 +7913,7 @@ impl ReferenceModel {
             self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
         let resident_hidden_tensor_qkv = self.try_resident_hidden_tensor_qkv_entry(
             gpu_first_session,
-            *resident_hidden_state,
+            resident_decode_state.resident_hidden_state,
             layer_idx,
             use_attention_qkv,
             stage_selection.use_gpu_attention_block,
@@ -7925,7 +7922,7 @@ impl ReferenceModel {
         )?;
         let resident_hidden_entry_qkv = self.try_resident_hidden_entry_qkv(
             gpu_first_session,
-            *resident_hidden_state,
+            resident_decode_state.resident_hidden_state,
             layer_idx,
             use_attention_qkv,
             stage_selection.use_gpu_attention_block,
@@ -7966,7 +7963,9 @@ impl ReferenceModel {
                 hidden,
                 metrics,
                 session,
-                (*resident_hidden_state).expect("resident hidden state should exist"),
+                resident_decode_state
+                    .resident_hidden_state
+                    .expect("resident hidden state should exist"),
                 gpu_first_session,
             )?
         } else if layer_idx == 0 && packed_use_gpu_embedding() && packed_use_gpu_first_session() {
@@ -8086,7 +8085,8 @@ impl ReferenceModel {
                 return Ok(PackedDecodeLayerStepOutcome::NextToken(next_token));
             }
             PackedAttentionStageOutcome::ResidentMlp => {
-                *resident_hidden_state = Some(ResidentHiddenState::Mlp { layer_idx });
+                resident_decode_state.resident_hidden_state =
+                    Some(ResidentHiddenState::Mlp { layer_idx });
                 if reusable_qkv_scratch {
                     session.restore_qkv_scratch(q, k, v);
                 }
@@ -8109,8 +8109,7 @@ impl ReferenceModel {
             &residual,
             &mut hidden_states,
             hidden,
-            final_hidden_gpu,
-            resident_hidden_state,
+            resident_decode_state,
             &stage_selection,
             use_mlp_gu,
             use_mlp_full,
@@ -8123,7 +8122,8 @@ impl ReferenceModel {
                 return Ok(PackedDecodeLayerStepOutcome::NextToken(next_token));
             }
             PackedMlpStageOutcome::ResidentMlp => {
-                *resident_hidden_state = Some(ResidentHiddenState::Mlp { layer_idx });
+                resident_decode_state.resident_hidden_state =
+                    Some(ResidentHiddenState::Mlp { layer_idx });
             }
             PackedMlpStageOutcome::Continue => {}
         }
@@ -8162,8 +8162,7 @@ impl ReferenceModel {
         }
 
         let (cos, sin) = rope_cos_sin(&self.rope, &[position]);
-        let mut final_hidden_gpu: Option<ResidentGpuVectorAdd> = None;
-        let mut resident_hidden_state: Option<ResidentHiddenState> = None;
+        let mut resident_decode_state = PackedResidentDecodeState::default();
 
         for (layer_idx, layer_cache) in cache
             .iter_mut()
@@ -8189,8 +8188,7 @@ impl ReferenceModel {
                 use_mlp_full,
                 argmax_only,
                 &mut hidden,
-                &mut final_hidden_gpu,
-                &mut resident_hidden_state,
+                &mut resident_decode_state,
             )? {
                 PackedDecodeLayerStepOutcome::Continue => {}
                 PackedDecodeLayerStepOutcome::NextToken(next_token) => {
@@ -8204,7 +8202,7 @@ impl ReferenceModel {
             gpu_first_session,
             session,
             &hidden,
-            final_hidden_gpu.as_ref(),
+            resident_decode_state.final_hidden_gpu.as_ref(),
             metrics,
             non_offloaded_dense_duration,
         )

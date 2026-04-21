@@ -1,9 +1,16 @@
+use crate::runtime::gpu_decode_projection_state::ResidentGpuVectorAdd;
 use ash::vk;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResidentHiddenState {
     Mlp { layer_idx: usize },
+}
+
+#[derive(Default)]
+pub(crate) struct PackedResidentDecodeState {
+    pub resident_hidden_state: Option<ResidentHiddenState>,
+    pub final_hidden_gpu: Option<ResidentGpuVectorAdd>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
