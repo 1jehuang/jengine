@@ -147,6 +147,10 @@ impl CachedGpuAttentionBlockRunner {
         self.add_runner.shared_context()
     }
 
+    pub fn read_output(&self) -> Result<(Vec<f32>, Duration), GpuAttentionBlockError> {
+        self.add_runner.read_output().map_err(map_vector_add_error)
+    }
+
     pub fn output_buffer_handle(&self) -> ash::vk::Buffer {
         self.add_runner.output_buffer_handle()
     }
