@@ -464,6 +464,39 @@ impl CachedGpuVectorAddRunner {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_resident_from_buffers(
+        &mut self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        left_buffer: vk::Buffer,
+        left_len: usize,
+        left_buffer_size: u64,
+        right_buffer: vk::Buffer,
+        right_len: usize,
+        right_buffer_size: u64,
+    ) -> Result<(), GpuVectorAddError> {
+        if left_len != self.len || right_len != self.len {
+            return Err(GpuVectorAddError::Shape(format!(
+                "source lens {}/{} do not match destination len {}",
+                left_len, right_len, self.len
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuVectorAddError::Shape(
+                "resident chaining requires runners to share the same Vulkan context".to_string(),
+            ));
+        }
+        let byte_len = self.len * std::mem::size_of::<f32>();
+        if byte_len as u64 > left_buffer_size || byte_len as u64 > right_buffer_size {
+            return Err(GpuVectorAddError::Shape(format!(
+                "paired source {} bytes exceeds one or more source buffer sizes",
+                byte_len
+            )));
+        }
+        self.bind_buffers(left_buffer, right_buffer);
+        Ok(())
+    }
+
     fn submit_and_wait(&self) -> Result<Duration, GpuVectorAddError> {
         unsafe { self.device.reset_fences(&[self.fence])? };
         let submit_info = [
@@ -545,6 +578,10 @@ impl CachedGpuVectorAddRunner {
     }
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub fn command_buffer_handle(&self) -> vk::CommandBuffer {
+        self.command_buffer
     }
 }
 

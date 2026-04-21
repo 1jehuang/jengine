@@ -535,6 +535,40 @@ impl CachedGpuAttentionSingleQueryRunner {
         })
     }
 
+    pub fn prepare_resident_from_query_and_kv_tensors(
+        &mut self,
+        query: &GpuResidentBuffer,
+        key: &GpuResidentBuffer,
+        value: &GpuResidentBuffer,
+    ) -> Result<(), GpuAttentionSingleQueryError> {
+        if query.len != self.query_len || key.len != self.kv_len || value.len != self.kv_len {
+            return Err(GpuAttentionSingleQueryError::Shape(format!(
+                "query len {}, key len {}, value len {} must match {}, {}, {}",
+                query.len, key.len, value.len, self.query_len, self.kv_len, self.kv_len
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, &query.shared_context)
+            || !Arc::ptr_eq(&self._shared_context, &key.shared_context)
+            || !Arc::ptr_eq(&self._shared_context, &value.shared_context)
+        {
+            return Err(GpuAttentionSingleQueryError::Shape(
+                "resident query/KV chaining requires matching Vulkan context".to_string(),
+            ));
+        }
+        let query_byte_len = self.query_len * std::mem::size_of::<f32>();
+        let kv_byte_len = self.kv_len * std::mem::size_of::<f32>();
+        if query.buffer_size < query_byte_len as u64
+            || key.buffer_size < kv_byte_len as u64
+            || value.buffer_size < kv_byte_len as u64
+        {
+            return Err(GpuAttentionSingleQueryError::Shape(
+                "resident query/KV buffers are smaller than required".to_string(),
+            ));
+        }
+        self.bind_descriptor_buffers(query.buffer, key.buffer, value.buffer);
+        Ok(())
+    }
+
     pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> {
         &self._shared_context
     }
@@ -545,6 +579,10 @@ impl CachedGpuAttentionSingleQueryRunner {
 
     pub fn output_buffer_size(&self) -> u64 {
         self.output_buffer.size
+    }
+
+    pub fn command_buffer_handle(&self) -> vk::CommandBuffer {
+        self.command_buffer
     }
 }
 

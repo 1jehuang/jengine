@@ -845,6 +845,78 @@ impl CachedGpuPackedMatvecRunner {
         self.output_buffer.size
     }
 
+    pub fn prepare_resident_from_f32_buffer(
+        &mut self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: vk::Buffer,
+        source_len: usize,
+        source_buffer_size: u64,
+    ) -> Result<(), GpuPackedMatvecError> {
+        if self.input_mode != PackedRunnerInputMode::RawF32 {
+            return Err(GpuPackedMatvecError::Shape(
+                "resident chaining requires a raw-f32 input runner".to_string(),
+            ));
+        }
+        if source_len != self.cols {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "source len {} does not match destination cols {}",
+                source_len, self.cols
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuPackedMatvecError::Shape(
+                "resident chaining requires runners to share the same Vulkan context".to_string(),
+            ));
+        }
+        let byte_len = self.cols * std::mem::size_of::<f32>();
+        if byte_len as u64 > source_buffer_size {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "source {} bytes exceeds provided buffer size {}",
+                byte_len, source_buffer_size
+            )));
+        }
+        self.bind_input_buffer(source_buffer);
+        Ok(())
+    }
+
+    pub fn prepare_resident_from_packed_buffer(
+        &mut self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: vk::Buffer,
+        source_packed_len: usize,
+        source_buffer_size: u64,
+    ) -> Result<(), GpuPackedMatvecError> {
+        if self.input_mode != PackedRunnerInputMode::PackedHalfPairs {
+            return Err(GpuPackedMatvecError::Shape(
+                "packed resident chaining requires a packed-half-pairs input runner".to_string(),
+            ));
+        }
+        if source_packed_len != self.packed_cols {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "source packed len {} does not match destination packed cols {}",
+                source_packed_len, self.packed_cols
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuPackedMatvecError::Shape(
+                "resident chaining requires runners to share the same Vulkan context".to_string(),
+            ));
+        }
+        let byte_len = self.packed_cols * std::mem::size_of::<u32>();
+        if byte_len as u64 > source_buffer_size {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "source {} bytes exceeds provided buffer size {}",
+                byte_len, source_buffer_size
+            )));
+        }
+        self.bind_input_buffer(source_buffer);
+        Ok(())
+    }
+
+    pub fn command_buffer_handle(&self) -> vk::CommandBuffer {
+        self.command_buffer
+    }
+
     pub fn rows(&self) -> usize {
         self.rows
     }
