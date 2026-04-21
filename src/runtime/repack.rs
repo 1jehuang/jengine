@@ -22,6 +22,17 @@ pub struct RowGroupPairSidecar {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct RowGroupBitplaneSidecar {
+    pub rows: usize,
+    pub cols: usize,
+    pub group_size: usize,
+    pub groups_per_row: usize,
+    pub positive_masks: Vec<u32>,
+    pub negative_masks: Vec<u32>,
+    pub scales: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct PackReport {
     pub elements: usize,
     pub groups: usize,
@@ -398,6 +409,131 @@ pub fn matvec_row_group_pair_sidecar(
     Ok(output)
 }
 
+pub fn build_row_group_bitplane_sidecar(
+    packed: &PackedTernaryTensor,
+) -> Result<RowGroupBitplaneSidecar, RepackError> {
+    if packed.shape.len() != 2 {
+        return Err(RepackError::Shape(
+            "row-group bitplane sidecar requires a rank-2 tensor".to_string(),
+        ));
+    }
+    let rows = packed.shape[0];
+    let cols = packed.shape[1];
+    if cols % packed.group_size != 0 {
+        return Err(RepackError::Shape(format!(
+            "row-group bitplane sidecar requires cols {cols} to be divisible by group_size {}",
+            packed.group_size
+        )));
+    }
+    if packed.group_size % 32 != 0 {
+        return Err(RepackError::Shape(format!(
+            "row-group bitplane sidecar requires group_size multiple of 32, got {}",
+            packed.group_size
+        )));
+    }
+    let groups_per_row = cols / packed.group_size;
+    let expected_groups = rows * groups_per_row;
+    if packed.scales.len() != expected_groups {
+        return Err(RepackError::Shape(format!(
+            "packed tensor stores {} scales but row-group bitplane sidecar expects {expected_groups}",
+            packed.scales.len()
+        )));
+    }
+    if packed.original_len != rows * cols {
+        return Err(RepackError::Shape(format!(
+            "packed tensor stores {} elements but row-group bitplane sidecar expects {}",
+            packed.original_len,
+            rows * cols
+        )));
+    }
+
+    let words_per_group = packed.group_size / 32;
+    let mut positive_masks = Vec::with_capacity(expected_groups * words_per_group);
+    let mut negative_masks = Vec::with_capacity(expected_groups * words_per_group);
+    for row in 0..rows {
+        let row_start = row * cols;
+        for group in 0..groups_per_row {
+            let group_start = row_start + group * packed.group_size;
+            for word_idx in 0..words_per_group {
+                let mut positive_word = 0u32;
+                let mut negative_word = 0u32;
+                for bit in 0..32 {
+                    let element_index = group_start + word_idx * 32 + bit;
+                    match get_code(&packed.packed_codes, element_index) {
+                        1 => positive_word |= 1u32 << bit,
+                        2 => negative_word |= 1u32 << bit,
+                        _ => {}
+                    }
+                }
+                positive_masks.push(positive_word);
+                negative_masks.push(negative_word);
+            }
+        }
+    }
+
+    Ok(RowGroupBitplaneSidecar {
+        rows,
+        cols,
+        group_size: packed.group_size,
+        groups_per_row,
+        positive_masks,
+        negative_masks,
+        scales: packed.scales.clone(),
+    })
+}
+
+pub fn matvec_row_group_bitplane_sidecar(
+    sidecar: &RowGroupBitplaneSidecar,
+    input: &[f32],
+) -> Result<Vec<f32>, RepackError> {
+    if input.len() != sidecar.cols {
+        return Err(RepackError::Shape(format!(
+            "input length {} does not match bitplane sidecar columns {}",
+            input.len(),
+            sidecar.cols
+        )));
+    }
+    let expected_groups = sidecar.rows * sidecar.groups_per_row;
+    if sidecar.scales.len() != expected_groups {
+        return Err(RepackError::Shape(format!(
+            "bitplane sidecar stores {} scales but expects {expected_groups}",
+            sidecar.scales.len()
+        )));
+    }
+    let words_per_group = sidecar.group_size / 32;
+    if sidecar.positive_masks.len() != expected_groups * words_per_group
+        || sidecar.negative_masks.len() != expected_groups * words_per_group
+    {
+        return Err(RepackError::Shape(format!(
+            "bitplane sidecar mask lengths do not match expected group geometry"
+        )));
+    }
+
+    let mut output = vec![0.0f32; sidecar.rows];
+    for (row, out) in output.iter_mut().enumerate() {
+        let mut row_sum = 0.0f32;
+        let row_group_base = row * sidecar.groups_per_row;
+        let row_word_base = row_group_base * words_per_group;
+        for group in 0..sidecar.groups_per_row {
+            let scale = sidecar.scales[row_group_base + group];
+            if scale == 0.0 {
+                continue;
+            }
+            let input_group_start = group * sidecar.group_size;
+            let word_group_start = row_word_base + group * words_per_group;
+            let word_group_end = word_group_start + words_per_group;
+            let signed_input_sum = accumulate_bitplane_signed_sum(
+                &sidecar.positive_masks[word_group_start..word_group_end],
+                &sidecar.negative_masks[word_group_start..word_group_end],
+                &input[input_group_start..input_group_start + sidecar.group_size],
+            );
+            row_sum += scale * signed_input_sum;
+        }
+        *out = row_sum;
+    }
+    Ok(output)
+}
+
 fn matvec_packed_ternary_grouped_aligned(
     packed: &PackedTernaryTensor,
     input: &[f32],
@@ -469,6 +605,30 @@ fn accumulate_pair_signed_sum(pair_codes: &[u8], input: &[f32]) -> f32 {
     sum
 }
 
+fn accumulate_bitplane_signed_sum(
+    positive_masks: &[u32],
+    negative_masks: &[u32],
+    input: &[f32],
+) -> f32 {
+    debug_assert_eq!(positive_masks.len(), negative_masks.len());
+    debug_assert_eq!(positive_masks.len() * 32, input.len());
+    let mut sum = 0.0f32;
+    for word_idx in 0..positive_masks.len() {
+        let positive_word = positive_masks[word_idx];
+        let negative_word = negative_masks[word_idx];
+        let base = word_idx * 32;
+        for bit in 0..32 {
+            let value = input[base + bit];
+            if ((positive_word >> bit) & 1) != 0 {
+                sum += value;
+            } else if ((negative_word >> bit) & 1) != 0 {
+                sum -= value;
+            }
+        }
+    }
+    sum
+}
+
 #[inline]
 fn code_input_contribution(code: u8, input: f32) -> f32 {
     match code {
@@ -532,8 +692,9 @@ fn get_code(bytes: &[u8], element_index: usize) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        TERNARY_G128_GROUP_SIZE, analyze_ternary_packability, build_row_group_pair_sidecar,
-        embedding_lookup_packed_ternary, matvec_packed_ternary, matvec_packed_ternary_reference,
+        TERNARY_G128_GROUP_SIZE, analyze_ternary_packability, build_row_group_bitplane_sidecar,
+        build_row_group_pair_sidecar, embedding_lookup_packed_ternary, matvec_packed_ternary,
+        matvec_packed_ternary_reference, matvec_row_group_bitplane_sidecar,
         matvec_row_group_pair_sidecar, pack_ternary_g128, unpack_ternary_g128,
     };
 
@@ -660,6 +821,57 @@ mod tests {
 
         let reference = matvec_packed_ternary_reference(&packed, &input).unwrap();
         let sidecar_output = matvec_row_group_pair_sidecar(&sidecar, &input).unwrap();
+
+        for (sidecar_value, reference_value) in sidecar_output.iter().zip(reference.iter()) {
+            assert!((sidecar_value - reference_value).abs() <= 1e-6);
+        }
+    }
+
+    #[test]
+    fn builds_row_group_bitplane_sidecar_for_aligned_rank2_tensor() {
+        let rows = 2;
+        let cols = TERNARY_G128_GROUP_SIZE;
+        let values = (0..(rows * cols))
+            .map(|index| match index % 3 {
+                0 => 0.0,
+                1 => 1.5,
+                _ => -1.5,
+            })
+            .collect::<Vec<_>>();
+        let (packed, _) = pack_ternary_g128(&values, vec![rows, cols], 1e-6).unwrap();
+
+        let sidecar = build_row_group_bitplane_sidecar(&packed).unwrap();
+
+        assert_eq!(sidecar.rows, rows);
+        assert_eq!(sidecar.cols, cols);
+        assert_eq!(sidecar.group_size, TERNARY_G128_GROUP_SIZE);
+        assert_eq!(sidecar.groups_per_row, 1);
+        assert_eq!(sidecar.scales, packed.scales);
+        assert_eq!(sidecar.positive_masks.len(), rows * (TERNARY_G128_GROUP_SIZE / 32));
+        assert_eq!(sidecar.negative_masks.len(), rows * (TERNARY_G128_GROUP_SIZE / 32));
+    }
+
+    #[test]
+    fn row_group_bitplane_sidecar_matches_reference_on_aligned_groups() {
+        let rows = 3;
+        let cols = TERNARY_G128_GROUP_SIZE * 2;
+        let values = (0..(rows * cols))
+            .map(|index| match index % 5 {
+                0 => 0.0,
+                1 => 1.25,
+                2 => -1.25,
+                3 => 1.25,
+                _ => -1.25,
+            })
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index % 11) as f32 * 0.07 - 0.3)
+            .collect::<Vec<_>>();
+        let (packed, _) = pack_ternary_g128(&values, vec![rows, cols], 1e-6).unwrap();
+        let sidecar = build_row_group_bitplane_sidecar(&packed).unwrap();
+
+        let reference = matvec_packed_ternary_reference(&packed, &input).unwrap();
+        let sidecar_output = matvec_row_group_bitplane_sidecar(&sidecar, &input).unwrap();
 
         for (sidecar_value, reference_value) in sidecar_output.iter().zip(reference.iter()) {
             assert!((sidecar_value - reference_value).abs() <= 1e-6);

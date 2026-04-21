@@ -1,6 +1,6 @@
 use jengine::runtime::repack::{
-    build_row_group_pair_sidecar, matvec_packed_ternary, matvec_row_group_pair_sidecar,
-    pack_ternary_g128,
+    build_row_group_bitplane_sidecar, build_row_group_pair_sidecar, matvec_packed_ternary,
+    matvec_row_group_bitplane_sidecar, matvec_row_group_pair_sidecar, pack_ternary_g128,
 };
 use jengine::runtime::weights::WeightStore;
 use std::time::Instant;
@@ -56,47 +56,78 @@ fn main() {
         pack_ternary_g128(&values, vec![rows, cols], 1e-3).expect("tensor should pack");
     let pack_elapsed = pack_started.elapsed();
 
-    let sidecar_started = Instant::now();
-    let sidecar = build_row_group_pair_sidecar(&packed).expect("sidecar should build");
-    let sidecar_build_elapsed = sidecar_started.elapsed();
+    let pair_sidecar_started = Instant::now();
+    let pair_sidecar = build_row_group_pair_sidecar(&packed).expect("pair sidecar should build");
+    let pair_sidecar_build_elapsed = pair_sidecar_started.elapsed();
+
+    let bitplane_sidecar_started = Instant::now();
+    let bitplane_sidecar =
+        build_row_group_bitplane_sidecar(&packed).expect("bitplane sidecar should build");
+    let bitplane_sidecar_build_elapsed = bitplane_sidecar_started.elapsed();
 
     let (packed_output, packed_best) =
         time_best_of(iters, || matvec_packed_ternary(&packed, &input).expect("packed matvec"));
-    let (sidecar_output, sidecar_best) = time_best_of(iters, || {
-        matvec_row_group_pair_sidecar(&sidecar, &input).expect("sidecar matvec")
+    let (pair_sidecar_output, pair_sidecar_best) = time_best_of(iters, || {
+        matvec_row_group_pair_sidecar(&pair_sidecar, &input).expect("pair sidecar matvec")
+    });
+    let (bitplane_sidecar_output, bitplane_sidecar_best) = time_best_of(iters, || {
+        matvec_row_group_bitplane_sidecar(&bitplane_sidecar, &input)
+            .expect("bitplane sidecar matvec")
     });
 
-    let max_abs_diff = packed_output
+    let pair_max_abs_diff = packed_output
         .iter()
-        .zip(sidecar_output.iter())
+        .zip(pair_sidecar_output.iter())
         .map(|(left, right)| (left - right).abs())
         .fold(0.0f32, f32::max);
-    let mean_abs_diff = if packed_output.is_empty() {
+    let pair_mean_abs_diff = if packed_output.is_empty() {
         0.0
     } else {
         packed_output
             .iter()
-            .zip(sidecar_output.iter())
+            .zip(pair_sidecar_output.iter())
+            .map(|(left, right)| (left - right).abs())
+            .sum::<f32>()
+            / packed_output.len() as f32
+    };
+    let bitplane_max_abs_diff = packed_output
+        .iter()
+        .zip(bitplane_sidecar_output.iter())
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0f32, f32::max);
+    let bitplane_mean_abs_diff = if packed_output.is_empty() {
+        0.0
+    } else {
+        packed_output
+            .iter()
+            .zip(bitplane_sidecar_output.iter())
             .map(|(left, right)| (left - right).abs())
             .sum::<f32>()
             / packed_output.len() as f32
     };
 
     println!(
-        "tensor={} rows={} cols={} pack_ms={:.3} sidecar_build_ms={:.3} packed_best_ms={:.3} sidecar_best_ms={:.3} speedup_x={:.3} max_abs_diff={:.6} mean_abs_diff={:.6} pair_code_bytes={} packed_code_bytes={} scale_count={} reduction_x={:.3}",
+        "tensor={} rows={} cols={} pack_ms={:.3} pair_sidecar_build_ms={:.3} bitplane_sidecar_build_ms={:.3} packed_best_ms={:.3} pair_sidecar_best_ms={:.3} bitplane_sidecar_best_ms={:.3} pair_speedup_x={:.3} bitplane_speedup_x={:.3} pair_max_abs_diff={:.6} pair_mean_abs_diff={:.6} bitplane_max_abs_diff={:.6} bitplane_mean_abs_diff={:.6} pair_code_bytes={} bitplane_mask_bytes={} packed_code_bytes={} scale_count={} reduction_x={:.3}",
         tensor_name,
         rows,
         cols,
         pack_elapsed.as_secs_f64() * 1_000.0,
-        sidecar_build_elapsed.as_secs_f64() * 1_000.0,
+        pair_sidecar_build_elapsed.as_secs_f64() * 1_000.0,
+        bitplane_sidecar_build_elapsed.as_secs_f64() * 1_000.0,
         packed_best.as_secs_f64() * 1_000.0,
-        sidecar_best.as_secs_f64() * 1_000.0,
-        packed_best.as_secs_f64() / sidecar_best.as_secs_f64(),
-        max_abs_diff,
-        mean_abs_diff,
-        sidecar.pair_codes.len(),
+        pair_sidecar_best.as_secs_f64() * 1_000.0,
+        bitplane_sidecar_best.as_secs_f64() * 1_000.0,
+        packed_best.as_secs_f64() / pair_sidecar_best.as_secs_f64(),
+        packed_best.as_secs_f64() / bitplane_sidecar_best.as_secs_f64(),
+        pair_max_abs_diff,
+        pair_mean_abs_diff,
+        bitplane_max_abs_diff,
+        bitplane_mean_abs_diff,
+        pair_sidecar.pair_codes.len(),
+        (bitplane_sidecar.positive_masks.len() + bitplane_sidecar.negative_masks.len())
+            * std::mem::size_of::<u32>(),
         packed.packed_codes.len(),
-        sidecar.scales.len(),
+        pair_sidecar.scales.len(),
         pack_report.reduction_ratio_vs_fp16,
     );
 }
