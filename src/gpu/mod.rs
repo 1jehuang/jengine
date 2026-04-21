@@ -2,6 +2,7 @@ pub mod attention_block;
 pub mod attention_single_query;
 pub mod fp16_matvec;
 pub mod full_last_layer_block;
+pub mod mlp_block;
 pub mod pack_f16_pairs;
 pub mod packed_matvec;
 pub mod packed_pair_swiglu_pack;
