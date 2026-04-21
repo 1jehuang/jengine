@@ -80,6 +80,7 @@ pub struct CachedGpuQkRopeRunner {
     _descriptor_set: vk::DescriptorSet,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
+    copy_command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     q_buffer: BufferAllocation,
     k_buffer: BufferAllocation,
@@ -250,8 +251,10 @@ impl CachedGpuQkRopeRunner {
         let command_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let command_buffer = unsafe { device.allocate_command_buffers(&command_alloc)?[0] };
+            .command_buffer_count(2);
+        let command_buffers = unsafe { device.allocate_command_buffers(&command_alloc)? };
+        let command_buffer = command_buffers[0];
+        let copy_command_buffer = command_buffers[1];
         unsafe {
             device.begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())?;
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
@@ -301,6 +304,7 @@ impl CachedGpuQkRopeRunner {
                 _descriptor_set: descriptor_set,
                 command_pool,
                 command_buffer,
+                copy_command_buffer,
                 fence,
                 q_buffer,
                 k_buffer,
@@ -473,12 +477,10 @@ impl CachedGpuQkRopeRunner {
                 k_byte_len, k.buffer_size, self.k_buffer.size
             )));
         }
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let copy_command = unsafe { self.device.allocate_command_buffers(&alloc)?[0] };
+        let copy_command = self.copy_command_buffer;
         unsafe {
+            self.device
+                .reset_command_buffer(copy_command, vk::CommandBufferResetFlags::empty())?;
             self.device
                 .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
             let q_region = [vk::BufferCopy::default().size(q_byte_len as u64)];
@@ -497,8 +499,6 @@ impl CachedGpuQkRopeRunner {
             self.device
                 .queue_submit(self.queue, &submit_info, self.fence)?;
             self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-            self.device
-                .free_command_buffers(self.command_pool, &[copy_command]);
         }
         Ok(started.elapsed())
     }

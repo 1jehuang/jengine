@@ -35,6 +35,7 @@ pub struct GpuKvCache {
     device: Device,
     queue: vk::Queue,
     command_pool: vk::CommandPool,
+    copy_command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     tokens_capacity: usize,
     kv_width: usize,
@@ -80,12 +81,18 @@ impl GpuKvCache {
             .queue_family_index(queue_family_index)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let command_pool = unsafe { device.create_command_pool(&command_pool_ci, None)? };
+        let command_alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let copy_command_buffer = unsafe { device.allocate_command_buffers(&command_alloc)?[0] };
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
         Ok(Self {
             _shared_context: context,
             device,
             queue,
             command_pool,
+            copy_command_buffer,
             fence,
             tokens_capacity,
             kv_width,
@@ -224,12 +231,10 @@ impl GpuKvCache {
                 offset_bytes, end, source_buffer_size, self.key_buffer.size
             )));
         }
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let copy_command = unsafe { self.device.allocate_command_buffers(&alloc)?[0] };
+        let copy_command = self.copy_command_buffer;
         unsafe {
+            self.device
+                .reset_command_buffer(copy_command, vk::CommandBufferResetFlags::empty())?;
             self.device
                 .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
             let region = [vk::BufferCopy::default()
@@ -251,8 +256,6 @@ impl GpuKvCache {
             self.device
                 .queue_submit(self.queue, &submit_info, self.fence)?;
             self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-            self.device
-                .free_command_buffers(self.command_pool, &[copy_command]);
         }
         Ok(())
     }
@@ -277,12 +280,10 @@ impl GpuKvCache {
                 offset_bytes, end, value.buffer_size, self.value_buffer.size
             )));
         }
-        let alloc = vk::CommandBufferAllocateInfo::default()
-            .command_pool(self.command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let copy_command = unsafe { self.device.allocate_command_buffers(&alloc)?[0] };
+        let copy_command = self.copy_command_buffer;
         unsafe {
+            self.device
+                .reset_command_buffer(copy_command, vk::CommandBufferResetFlags::empty())?;
             self.device
                 .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
             let key_region = [vk::BufferCopy::default()
@@ -314,8 +315,6 @@ impl GpuKvCache {
             self.device
                 .queue_submit(self.queue, &submit_info, self.fence)?;
             self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-            self.device
-                .free_command_buffers(self.command_pool, &[copy_command]);
         }
         Ok(())
     }
