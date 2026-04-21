@@ -206,6 +206,59 @@ impl CachedGpuAttentionBlockRunner {
         })
     }
 
+    pub fn run_with_resident_query_and_kv(
+        &mut self,
+        query: &GpuResidentBuffer,
+        key: &GpuResidentBuffer,
+        value: &GpuResidentBuffer,
+        residual: &[f32],
+    ) -> Result<GpuAttentionBlockReport, GpuAttentionBlockError> {
+        if residual.len() != self.hidden {
+            return Err(GpuAttentionBlockError(format!(
+                "residual len {} must match hidden {}",
+                residual.len(),
+                self.hidden
+            )));
+        }
+        let zeros = vec![0.0f32; self.hidden];
+        let attention_report = self
+            .attention_runner
+            .run_resident_from_query_and_kv_tensors(query, key, value)
+            .map_err(map_attention_error)?;
+        let oproj_report = self
+            .o_proj_runner
+            .run_resident_from_f32_buffer(
+                self.attention_runner.shared_context(),
+                self.attention_runner.output_buffer_handle(),
+                self.hidden,
+                self.attention_runner.output_buffer_size(),
+            )
+            .map_err(map_packed_matvec_error)?;
+        let _ = self
+            .residual_seed_runner
+            .run_resident(residual, &zeros)
+            .map_err(map_vector_add_error)?;
+        let add_report = self
+            .add_runner
+            .run_resident_from_buffers(
+                self.o_proj_runner.shared_context(),
+                self.o_proj_runner.output_buffer_handle(),
+                self.hidden,
+                self.o_proj_runner.output_buffer_size(),
+                self.residual_seed_runner.output_buffer_handle(),
+                self.hidden,
+                self.residual_seed_runner.output_buffer_size(),
+            )
+            .map_err(map_vector_add_error)?;
+        Ok(GpuAttentionBlockReport {
+            hidden: self.hidden,
+            compile_duration: self.compile_duration,
+            attention_gpu_duration: attention_report.gpu_duration,
+            oproj_gpu_duration: oproj_report.gpu_duration,
+            residual_add_gpu_duration: add_report.gpu_duration,
+        })
+    }
+
     pub fn compile_duration(&self) -> Duration {
         self.compile_duration
     }
