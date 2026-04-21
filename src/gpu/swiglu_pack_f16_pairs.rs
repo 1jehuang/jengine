@@ -95,10 +95,9 @@ pub struct CachedGpuSwigluPackF16PairsRunner {
     shader_module: vk::ShaderModule,
     pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
-    _descriptor_set: vk::DescriptorSet,
+    descriptor_set: vk::DescriptorSet,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
-    copy_command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     input_buffer: BufferAllocation,
     output_buffer: BufferAllocation,
@@ -213,10 +212,8 @@ impl CachedGpuSwigluPackF16PairsRunner {
         let command_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(2);
-        let command_buffers = unsafe { device.allocate_command_buffers(&command_alloc)? };
-        let command_buffer = command_buffers[0];
-        let copy_command_buffer = command_buffers[1];
+            .command_buffer_count(1);
+        let command_buffer = unsafe { device.allocate_command_buffers(&command_alloc)?[0] };
         unsafe {
             device.begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())?;
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
@@ -253,10 +250,9 @@ impl CachedGpuSwigluPackF16PairsRunner {
                 shader_module,
                 pipeline,
                 descriptor_pool,
-                _descriptor_set: descriptor_set,
+                descriptor_set,
                 command_pool,
                 command_buffer,
-                copy_command_buffer,
                 fence,
                 input_buffer,
                 output_buffer,
@@ -278,6 +274,7 @@ impl CachedGpuSwigluPackF16PairsRunner {
             )));
         }
         let upload_started = Instant::now();
+        self.bind_input_buffer(self.input_buffer.buffer);
         write_f32_buffer(&self.input_buffer, combined)?;
         let upload_duration = upload_started.elapsed();
         unsafe { self.device.reset_fences(&[self.fence])? };
@@ -317,15 +314,28 @@ impl CachedGpuSwigluPackF16PairsRunner {
         source_len: usize,
         source_buffer_size: u64,
     ) -> Result<GpuSwigluPackF16PairsReport, GpuSwigluPackF16PairsError> {
-        let upload_started = Instant::now();
-        self.copy_input_from_buffer(
-            source_context,
-            source_buffer,
-            source_len,
-            source_buffer_size,
-        )?;
-        let upload_duration = upload_started.elapsed();
-        let gpu_duration = self.submit_copy_and_compute_and_wait()?;
+        if source_len != self.len * 2 {
+            return Err(GpuSwigluPackF16PairsError::Shape(format!(
+                "source len {} does not match destination len {}",
+                source_len,
+                self.len * 2
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuSwigluPackF16PairsError::Shape(
+                "resident chaining requires runners to share the same Vulkan context".to_string(),
+            ));
+        }
+        let byte_len = self.len * 2 * std::mem::size_of::<f32>();
+        if byte_len as u64 > source_buffer_size {
+            return Err(GpuSwigluPackF16PairsError::Shape(format!(
+                "source {} bytes exceeds provided buffer size {}",
+                byte_len, source_buffer_size
+            )));
+        }
+        self.bind_input_buffer(source_buffer);
+        let upload_duration = Duration::ZERO;
+        let gpu_duration = self.submit_and_wait()?;
         Ok(GpuSwigluPackF16PairsReport {
             len: self.len,
             compile_duration: Duration::ZERO,
@@ -360,10 +370,13 @@ impl CachedGpuSwigluPackF16PairsRunner {
         self.len == 0
     }
 
-    fn submit_copy_and_compute_and_wait(&self) -> Result<Duration, GpuSwigluPackF16PairsError> {
-        unsafe { self.device.reset_fences(&[self.fence])? };
-        let command_buffers = [self.copy_command_buffer, self.command_buffer];
-        let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+    fn submit_and_wait(&self) -> Result<Duration, GpuSwigluPackF16PairsError> {
+        let submit_info = [
+            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer))
+        ];
+        unsafe {
+            self.device.reset_fences(&[self.fence])?;
+        }
         let gpu_started = Instant::now();
         unsafe {
             self.device
@@ -373,65 +386,28 @@ impl CachedGpuSwigluPackF16PairsRunner {
         Ok(gpu_started.elapsed())
     }
 
-    fn copy_input_from_buffer(
-        &self,
-        source_context: &Arc<SharedGpuPackedContext>,
-        source_buffer: vk::Buffer,
-        source_len: usize,
-        source_buffer_size: u64,
-    ) -> Result<(), GpuSwigluPackF16PairsError> {
-        if source_len != self.len * 2 {
-            return Err(GpuSwigluPackF16PairsError::Shape(format!(
-                "source len {} does not match destination len {}",
-                source_len,
-                self.len * 2
-            )));
-        }
-        if !Arc::ptr_eq(&self._shared_context, source_context) {
-            return Err(GpuSwigluPackF16PairsError::Shape(
-                "resident chaining requires runners to share the same Vulkan context".to_string(),
-            ));
-        }
-        let byte_len = self.len * 2 * std::mem::size_of::<f32>();
-        if byte_len as u64 > source_buffer_size || byte_len as u64 > self.input_buffer.size {
-            return Err(GpuSwigluPackF16PairsError::Shape(format!(
-                "copy {} bytes exceeds source {} or destination {} buffer size",
-                byte_len, source_buffer_size, self.input_buffer.size
-            )));
-        }
-        let copy_command = self.copy_command_buffer;
-        unsafe {
-            self.device
-                .reset_command_buffer(copy_command, vk::CommandBufferResetFlags::empty())?;
-            self.device
-                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
-            let region = [vk::BufferCopy::default().size(byte_len as u64)];
-            self.device.cmd_copy_buffer(
-                copy_command,
-                source_buffer,
-                self.input_buffer.buffer,
-                &region,
-            );
-            let barrier = [vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(self.input_buffer.buffer)
-                .offset(0)
-                .size(byte_len as u64)];
-            self.device.cmd_pipeline_barrier(
-                copy_command,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &barrier,
-                &[],
-            );
-            self.device.end_command_buffer(copy_command)?;
-        }
-        Ok(())
+    fn bind_input_buffer(&self, input_buffer: vk::Buffer) {
+        let input_info = [vk::DescriptorBufferInfo::default()
+            .buffer(input_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let output_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.output_buffer.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&input_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&output_info),
+        ];
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
     }
 }
 
