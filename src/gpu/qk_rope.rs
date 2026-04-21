@@ -77,10 +77,9 @@ pub struct CachedGpuQkRopeRunner {
     shader_module: vk::ShaderModule,
     pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
-    _descriptor_set: vk::DescriptorSet,
+    descriptor_set: vk::DescriptorSet,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
-    copy_command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     q_buffer: BufferAllocation,
     k_buffer: BufferAllocation,
@@ -251,10 +250,8 @@ impl CachedGpuQkRopeRunner {
         let command_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(2);
-        let command_buffers = unsafe { device.allocate_command_buffers(&command_alloc)? };
-        let command_buffer = command_buffers[0];
-        let copy_command_buffer = command_buffers[1];
+            .command_buffer_count(1);
+        let command_buffer = unsafe { device.allocate_command_buffers(&command_alloc)?[0] };
         unsafe {
             device.begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())?;
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
@@ -301,10 +298,9 @@ impl CachedGpuQkRopeRunner {
                 shader_module,
                 pipeline,
                 descriptor_pool,
-                _descriptor_set: descriptor_set,
+                descriptor_set,
                 command_pool,
                 command_buffer,
-                copy_command_buffer,
                 fence,
                 q_buffer,
                 k_buffer,
@@ -340,6 +336,7 @@ impl CachedGpuQkRopeRunner {
             ));
         }
         let upload_started = Instant::now();
+        self.bind_input_buffers(self.q_buffer.buffer, self.k_buffer.buffer);
         write_f32_buffer(&self.q_buffer, q)?;
         write_f32_buffer(&self.k_buffer, k)?;
         write_f32_buffer(&self.q_weight_buffer, q_weight)?;
@@ -379,13 +376,27 @@ impl CachedGpuQkRopeRunner {
             ));
         }
         let upload_started = Instant::now();
-        self.copy_inputs_from_buffers(q, k)?;
+        if !Arc::ptr_eq(&self._shared_context, &q.shared_context)
+            || !Arc::ptr_eq(&self._shared_context, &k.shared_context)
+        {
+            return Err(GpuQkRopeError::Shape(
+                "resident qk-rope chaining requires matching Vulkan context".to_string(),
+            ));
+        }
+        let q_byte_len = self.query_len * std::mem::size_of::<f32>();
+        let k_byte_len = self.key_len * std::mem::size_of::<f32>();
+        if q.buffer_size < q_byte_len as u64 || k.buffer_size < k_byte_len as u64 {
+            return Err(GpuQkRopeError::Shape(
+                "resident qk-rope source buffers are smaller than required".to_string(),
+            ));
+        }
+        self.bind_input_buffers(q.buffer, k.buffer);
         write_f32_buffer(&self.q_weight_buffer, q_weight)?;
         write_f32_buffer(&self.k_weight_buffer, k_weight)?;
         write_f32_buffer(&self.cos_buffer, cos)?;
         write_f32_buffer(&self.sin_buffer, sin)?;
         let upload_duration = upload_started.elapsed();
-        let gpu_duration = self.submit_copy_and_compute_and_wait()?;
+        let gpu_duration = self.submit_and_wait()?;
         Ok(GpuQkRopeReport {
             query_len: self.query_len,
             key_len: self.key_len,
@@ -451,87 +462,29 @@ impl CachedGpuQkRopeRunner {
         Ok(gpu_started.elapsed())
     }
 
-    fn submit_copy_and_compute_and_wait(&self) -> Result<Duration, GpuQkRopeError> {
-        unsafe { self.device.reset_fences(&[self.fence])? };
-        let command_buffers = [self.copy_command_buffer, self.command_buffer];
-        let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
-        let gpu_started = Instant::now();
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &submit_info, self.fence)?;
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
-        Ok(gpu_started.elapsed())
-    }
-
-    fn copy_inputs_from_buffers(
-        &self,
-        q: &GpuResidentBuffer,
-        k: &GpuResidentBuffer,
-    ) -> Result<(), GpuQkRopeError> {
-        if !Arc::ptr_eq(&self._shared_context, &q.shared_context)
-            || !Arc::ptr_eq(&self._shared_context, &k.shared_context)
-        {
-            return Err(GpuQkRopeError::Shape(
-                "resident qk-rope chaining requires matching Vulkan context".to_string(),
-            ));
-        }
-        let q_byte_len = self.query_len * std::mem::size_of::<f32>();
-        let k_byte_len = self.key_len * std::mem::size_of::<f32>();
-        if q_byte_len as u64 > q.buffer_size || q_byte_len as u64 > self.q_buffer.size {
-            return Err(GpuQkRopeError::Shape(format!(
-                "copy {} bytes exceeds query source {} or destination {} buffer size",
-                q_byte_len, q.buffer_size, self.q_buffer.size
-            )));
-        }
-        if k_byte_len as u64 > k.buffer_size || k_byte_len as u64 > self.k_buffer.size {
-            return Err(GpuQkRopeError::Shape(format!(
-                "copy {} bytes exceeds key source {} or destination {} buffer size",
-                k_byte_len, k.buffer_size, self.k_buffer.size
-            )));
-        }
-        let copy_command = self.copy_command_buffer;
-        unsafe {
-            self.device
-                .reset_command_buffer(copy_command, vk::CommandBufferResetFlags::empty())?;
-            self.device
-                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
-            let q_region = [vk::BufferCopy::default().size(q_byte_len as u64)];
-            self.device
-                .cmd_copy_buffer(copy_command, q.buffer, self.q_buffer.buffer, &q_region);
-            let k_region = [vk::BufferCopy::default().size(k_byte_len as u64)];
-            self.device
-                .cmd_copy_buffer(copy_command, k.buffer, self.k_buffer.buffer, &k_region);
-            let barriers = [
-                vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(self.q_buffer.buffer)
-                    .offset(0)
-                    .size(q_byte_len as u64),
-                vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(self.k_buffer.buffer)
-                    .offset(0)
-                    .size(k_byte_len as u64),
-            ];
-            self.device.cmd_pipeline_barrier(
-                copy_command,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &barriers,
-                &[],
-            );
-            self.device.end_command_buffer(copy_command)?;
-        }
-        Ok(())
+    fn bind_input_buffers(&self, q_buffer: vk::Buffer, k_buffer: vk::Buffer) {
+        let infos = [
+            buffer_info(q_buffer),
+            buffer_info(k_buffer),
+            buffer_info(self.q_weight_buffer.buffer),
+            buffer_info(self.k_weight_buffer.buffer),
+            buffer_info(self.cos_buffer.buffer),
+            buffer_info(self.sin_buffer.buffer),
+            buffer_info(self.q_out_buffer.buffer),
+            buffer_info(self.k_out_buffer.buffer),
+        ];
+        let writes = infos
+            .iter()
+            .enumerate()
+            .map(|(i, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.descriptor_set)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(info))
+            })
+            .collect::<Vec<_>>();
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
     }
 }
 
