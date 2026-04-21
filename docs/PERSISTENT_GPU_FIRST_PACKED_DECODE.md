@@ -32,6 +32,39 @@ Same strong configuration on an explicit one-token step:
 - `orchestration_ms=5.015`
 - `dispatch_count=226`
 
+### Latest milestone checkpoints
+
+Using the same strong packed settings, the latest sequential explicit one-token checkpoints are:
+
+#### Current strong packed baseline
+
+- total: `317.920 ms`
+- throughput: about `3.15 tok/s`
+- `gpu_ms=205.739`
+- `download_ms=52.680`
+- `non_offloaded_dense_ms=29.317`
+- `compile_ms=22.919`
+- `orchestration_ms=3.173`
+- `dispatch_count=226`
+
+#### Warmed `JENGINE_GPU_FULL_LAST_LAYER=1`
+
+- total: `579.275 ms`
+- throughput: about `1.73 tok/s`
+- `gpu_ms=250.561`
+- `download_ms=68.479`
+- `non_offloaded_dense_ms=67.258`
+- `compile_ms=343.751`
+- `orchestration_ms=0.0`
+- `dispatch_count=238`
+
+Interpretation:
+
+- the dormant GPU-first full-last-layer path is real and prewarming is wired in
+- but this path is still materially worse than the current strong packed baseline
+- so the next redesign step still needs to focus on reducing CPU-visible glue, compile/setup overhead, and dispatch count rather than merely enabling the path
+
+
 ## Current architecture
 
 Today the runtime is still structurally a CPU-driven reference decode loop with packed GPU subroutines inserted into it.
