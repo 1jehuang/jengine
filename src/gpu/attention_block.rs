@@ -139,6 +139,10 @@ impl CachedGpuAttentionBlockRunner {
         })
     }
 
+    pub fn compile_duration(&self) -> Duration {
+        self.compile_duration
+    }
+
     pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> {
         self.add_runner.shared_context()
     }

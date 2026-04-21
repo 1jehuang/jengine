@@ -267,6 +267,10 @@ impl CachedGpuFullLastLayerRunner {
         })
     }
 
+    pub fn compile_duration(&self) -> Duration {
+        self.compile_duration
+    }
+
     pub fn run_argmax_from_resident_residual(
         &mut self,
         source_context: &Arc<SharedGpuPackedContext>,
