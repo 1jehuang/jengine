@@ -23,7 +23,7 @@ use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
 use crate::runtime::assets::{BonsaiAssetPaths};
 use crate::runtime::decode_plan::PackedDecodePlan;
-use crate::runtime::decode_report::MemoryReport;
+use crate::runtime::decode_report::{MemoryReport, build_memory_report};
 use crate::runtime::gpu_decode_env::{
     packed_enabled_label, packed_use_attention_full, packed_use_gpu_attention_block,
     packed_use_gpu_embedding, packed_use_gpu_final_norm, packed_use_gpu_first_session,
@@ -3630,27 +3630,20 @@ impl ReferenceModel {
         let gpu_cache_buffer_bytes = self.gpu_cache_buffer_bytes();
         let activation_working_bytes = self.activation_working_bytes();
         let staging_bytes = gpu_cache_buffer_bytes;
-        MemoryReport {
+        build_memory_report(
             prompt_tokens,
             generated_tokens,
-            total_sequence_tokens,
             estimated_model_fp16_bytes,
             source_weight_bytes,
             kv_cache_bytes_per_token_fp16,
             kv_cache_bytes_per_token_runtime_f32,
             kv_cache_total_bytes_fp16,
             kv_cache_total_bytes_runtime_f32,
-            kv_cache_reserved_bytes_runtime_f32: kv_cache_total_bytes_runtime_f32,
             packed_cache_bytes,
             gpu_cache_buffer_bytes,
             activation_working_bytes,
             staging_bytes,
-            estimated_runtime_working_set_bytes: estimated_model_fp16_bytes
-                + kv_cache_total_bytes_runtime_f32
-                + packed_cache_bytes
-                + gpu_cache_buffer_bytes
-                + activation_working_bytes,
-        }
+        )
     }
 
     pub(crate) fn prewarm_packed_decode_caches_internal(

@@ -50,6 +50,45 @@ impl MemoryReport {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn build_memory_report(
+    prompt_tokens: usize,
+    generated_tokens: usize,
+    estimated_model_fp16_bytes: usize,
+    source_weight_bytes: usize,
+    kv_cache_bytes_per_token_fp16: usize,
+    kv_cache_bytes_per_token_runtime_f32: usize,
+    kv_cache_total_bytes_fp16: usize,
+    kv_cache_total_bytes_runtime_f32: usize,
+    packed_cache_bytes: usize,
+    gpu_cache_buffer_bytes: usize,
+    activation_working_bytes: usize,
+    staging_bytes: usize,
+) -> MemoryReport {
+    let total_sequence_tokens = prompt_tokens + generated_tokens;
+    MemoryReport {
+        prompt_tokens,
+        generated_tokens,
+        total_sequence_tokens,
+        estimated_model_fp16_bytes,
+        source_weight_bytes,
+        kv_cache_bytes_per_token_fp16,
+        kv_cache_bytes_per_token_runtime_f32,
+        kv_cache_total_bytes_fp16,
+        kv_cache_total_bytes_runtime_f32,
+        kv_cache_reserved_bytes_runtime_f32: kv_cache_total_bytes_runtime_f32,
+        packed_cache_bytes,
+        gpu_cache_buffer_bytes,
+        activation_working_bytes,
+        staging_bytes,
+        estimated_runtime_working_set_bytes: estimated_model_fp16_bytes
+            + kv_cache_total_bytes_runtime_f32
+            + packed_cache_bytes
+            + gpu_cache_buffer_bytes
+            + activation_working_bytes,
+    }
+}
+
 fn human_bytes(bytes: usize) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
