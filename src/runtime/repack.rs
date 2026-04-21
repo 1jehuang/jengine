@@ -12,6 +12,16 @@ pub struct PackedTernaryTensor {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct RowGroupPairSidecar {
+    pub rows: usize,
+    pub cols: usize,
+    pub group_size: usize,
+    pub groups_per_row: usize,
+    pub pair_codes: Vec<u8>,
+    pub scales: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct PackReport {
     pub elements: usize,
     pub groups: usize,
@@ -275,6 +285,119 @@ pub fn matvec_packed_ternary(
     matvec_packed_ternary_reference(packed, input)
 }
 
+pub fn build_row_group_pair_sidecar(
+    packed: &PackedTernaryTensor,
+) -> Result<RowGroupPairSidecar, RepackError> {
+    if packed.shape.len() != 2 {
+        return Err(RepackError::Shape(
+            "row-group sidecar requires a rank-2 tensor".to_string(),
+        ));
+    }
+    let rows = packed.shape[0];
+    let cols = packed.shape[1];
+    if cols % packed.group_size != 0 {
+        return Err(RepackError::Shape(format!(
+            "row-group sidecar requires cols {cols} to be divisible by group_size {}",
+            packed.group_size
+        )));
+    }
+    if packed.group_size % 2 != 0 {
+        return Err(RepackError::Shape(format!(
+            "row-group sidecar requires even group_size, got {}",
+            packed.group_size
+        )));
+    }
+    let groups_per_row = cols / packed.group_size;
+    let expected_groups = rows * groups_per_row;
+    if packed.scales.len() != expected_groups {
+        return Err(RepackError::Shape(format!(
+            "packed tensor stores {} scales but row-group sidecar expects {expected_groups}",
+            packed.scales.len()
+        )));
+    }
+    if packed.original_len != rows * cols {
+        return Err(RepackError::Shape(format!(
+            "packed tensor stores {} elements but row-group sidecar expects {}",
+            packed.original_len,
+            rows * cols
+        )));
+    }
+
+    let pair_codes_per_group = packed.group_size / 2;
+    let mut pair_codes = Vec::with_capacity(expected_groups * pair_codes_per_group);
+    for row in 0..rows {
+        let row_start = row * cols;
+        for group in 0..groups_per_row {
+            let group_start = row_start + group * packed.group_size;
+            for pair in 0..pair_codes_per_group {
+                let code0 = get_code(&packed.packed_codes, group_start + pair * 2);
+                let code1 = get_code(&packed.packed_codes, group_start + pair * 2 + 1);
+                pair_codes.push(code0 | (code1 << 2));
+            }
+        }
+    }
+
+    Ok(RowGroupPairSidecar {
+        rows,
+        cols,
+        group_size: packed.group_size,
+        groups_per_row,
+        pair_codes,
+        scales: packed.scales.clone(),
+    })
+}
+
+pub fn matvec_row_group_pair_sidecar(
+    sidecar: &RowGroupPairSidecar,
+    input: &[f32],
+) -> Result<Vec<f32>, RepackError> {
+    if input.len() != sidecar.cols {
+        return Err(RepackError::Shape(format!(
+            "input length {} does not match sidecar columns {}",
+            input.len(),
+            sidecar.cols
+        )));
+    }
+    let expected_groups = sidecar.rows * sidecar.groups_per_row;
+    if sidecar.scales.len() != expected_groups {
+        return Err(RepackError::Shape(format!(
+            "sidecar stores {} scales but expects {expected_groups}",
+            sidecar.scales.len()
+        )));
+    }
+    let pair_codes_per_group = sidecar.group_size / 2;
+    if sidecar.pair_codes.len() != expected_groups * pair_codes_per_group {
+        return Err(RepackError::Shape(format!(
+            "sidecar stores {} pair codes but expects {}",
+            sidecar.pair_codes.len(),
+            expected_groups * pair_codes_per_group
+        )));
+    }
+
+    let mut output = vec![0.0f32; sidecar.rows];
+    for (row, out) in output.iter_mut().enumerate() {
+        let mut row_sum = 0.0f32;
+        let row_group_base = row * sidecar.groups_per_row;
+        let row_pair_base = row_group_base * pair_codes_per_group;
+        for group in 0..sidecar.groups_per_row {
+            let scale = sidecar.scales[row_group_base + group];
+            if scale == 0.0 {
+                continue;
+            }
+            let input_group_start = group * sidecar.group_size;
+            let pair_group_start = row_pair_base + group * pair_codes_per_group;
+            let pair_group_end = pair_group_start + pair_codes_per_group;
+            let signed_input_sum = accumulate_pair_signed_sum(
+                &sidecar.pair_codes[pair_group_start..pair_group_end],
+                &input[input_group_start..input_group_start + sidecar.group_size],
+            );
+            row_sum += scale * signed_input_sum;
+        }
+        *out = row_sum;
+    }
+    Ok(output)
+}
+
 fn matvec_packed_ternary_grouped_aligned(
     packed: &PackedTernaryTensor,
     input: &[f32],
@@ -331,6 +454,17 @@ fn accumulate_group_signed_sum(codes: &[u8], input: &[f32]) -> f32 {
         sum += code_input_contribution((byte >> 2) & 0b11, input[base + 1]);
         sum += code_input_contribution((byte >> 4) & 0b11, input[base + 2]);
         sum += code_input_contribution((byte >> 6) & 0b11, input[base + 3]);
+    }
+    sum
+}
+
+fn accumulate_pair_signed_sum(pair_codes: &[u8], input: &[f32]) -> f32 {
+    debug_assert_eq!(pair_codes.len() * 2, input.len());
+    let mut sum = 0.0f32;
+    for (pair_index, &pair_code) in pair_codes.iter().enumerate() {
+        let base = pair_index * 2;
+        sum += code_input_contribution(pair_code & 0b11, input[base]);
+        sum += code_input_contribution((pair_code >> 2) & 0b11, input[base + 1]);
     }
     sum
 }
@@ -398,9 +532,9 @@ fn get_code(bytes: &[u8], element_index: usize) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        TERNARY_G128_GROUP_SIZE, analyze_ternary_packability, embedding_lookup_packed_ternary,
-        matvec_packed_ternary, matvec_packed_ternary_reference, pack_ternary_g128,
-        unpack_ternary_g128,
+        TERNARY_G128_GROUP_SIZE, analyze_ternary_packability, build_row_group_pair_sidecar,
+        embedding_lookup_packed_ternary, matvec_packed_ternary, matvec_packed_ternary_reference,
+        matvec_row_group_pair_sidecar, pack_ternary_g128, unpack_ternary_g128,
     };
 
     #[test]
@@ -479,6 +613,56 @@ mod tests {
 
         for (optimized_value, reference_value) in optimized.iter().zip(reference.iter()) {
             assert!((optimized_value - reference_value).abs() <= 1e-6);
+        }
+    }
+
+    #[test]
+    fn builds_row_group_pair_sidecar_for_aligned_rank2_tensor() {
+        let rows = 2;
+        let cols = TERNARY_G128_GROUP_SIZE;
+        let values = (0..(rows * cols))
+            .map(|index| match index % 3 {
+                0 => 0.0,
+                1 => 1.5,
+                _ => -1.5,
+            })
+            .collect::<Vec<_>>();
+        let (packed, _) = pack_ternary_g128(&values, vec![rows, cols], 1e-6).unwrap();
+
+        let sidecar = build_row_group_pair_sidecar(&packed).unwrap();
+
+        assert_eq!(sidecar.rows, rows);
+        assert_eq!(sidecar.cols, cols);
+        assert_eq!(sidecar.group_size, TERNARY_G128_GROUP_SIZE);
+        assert_eq!(sidecar.groups_per_row, 1);
+        assert_eq!(sidecar.scales, packed.scales);
+        assert_eq!(sidecar.pair_codes.len(), rows * (TERNARY_G128_GROUP_SIZE / 2));
+    }
+
+    #[test]
+    fn row_group_pair_sidecar_matches_reference_on_aligned_groups() {
+        let rows = 3;
+        let cols = TERNARY_G128_GROUP_SIZE * 2;
+        let values = (0..(rows * cols))
+            .map(|index| match index % 5 {
+                0 => 0.0,
+                1 => 1.25,
+                2 => -1.25,
+                3 => 1.25,
+                _ => -1.25,
+            })
+            .collect::<Vec<_>>();
+        let input = (0..cols)
+            .map(|index| (index % 11) as f32 * 0.07 - 0.3)
+            .collect::<Vec<_>>();
+        let (packed, _) = pack_ternary_g128(&values, vec![rows, cols], 1e-6).unwrap();
+        let sidecar = build_row_group_pair_sidecar(&packed).unwrap();
+
+        let reference = matvec_packed_ternary_reference(&packed, &input).unwrap();
+        let sidecar_output = matvec_row_group_pair_sidecar(&sidecar, &input).unwrap();
+
+        for (sidecar_value, reference_value) in sidecar_output.iter().zip(reference.iter()) {
+            assert!((sidecar_value - reference_value).abs() <= 1e-6);
         }
     }
 }
