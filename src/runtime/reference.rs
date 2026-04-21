@@ -103,6 +103,17 @@ type ResidentHostQkvEntry = (
     crate::gpu::packed_matvec::GpuPackedMatvecReport,
     Duration,
 );
+type FirstLayerTensorQkvEntry = (
+    Vec<f32>,
+    GpuResidentBuffer,
+    GpuResidentBuffer,
+    GpuResidentBuffer,
+    GpuResidentBuffer,
+    GpuEmbeddingLookupReport,
+    GpuWeightedRmsNormReport,
+    crate::gpu::packed_matvec::GpuPackedMatvecReport,
+    Duration,
+);
 
 pub struct PersistentPackedDecodeSession<'a> {
     model: &'a ReferenceModel,
@@ -4161,6 +4172,40 @@ impl ReferenceModel {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn try_first_layer_gpu_entry_tensor_qkv(
+        &self,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+        resident_hidden_tensor_qkv: &Option<ResidentTensorQkvEntry>,
+        resident_hidden_entry_qkv: &Option<ResidentHostQkvEntry>,
+        layer_idx: usize,
+        token_id: usize,
+        use_attention_qkv: bool,
+        use_gpu_attention_block: bool,
+        input_norm_weight: &[f32],
+        layer_tensors: &LayerTensorNames,
+    ) -> Result<Option<FirstLayerTensorQkvEntry>, ReferenceError> {
+        if resident_hidden_tensor_qkv.is_none()
+            && resident_hidden_entry_qkv.is_none()
+            && layer_idx == 0
+            && packed_use_gpu_embedding()
+            && packed_use_gpu_first_session()
+            && use_attention_qkv
+            && use_gpu_attention_block
+        {
+            return Ok(Some(gpu_first_session.run_first_layer_embedding_norm_qkv_tensors(
+                layer_idx,
+                token_id,
+                input_norm_weight,
+                &layer_tensors.q_proj_weight,
+                &layer_tensors.k_proj_weight,
+                &layer_tensors.v_proj_weight,
+                self.config.num_key_value_heads * self.config.head_dim,
+            )?));
+        }
+        Ok(None)
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -6436,28 +6481,17 @@ impl ReferenceModel {
                 &input_norm_weight,
                 layer_tensors,
             )?;
-            let first_layer_gpu_entry_tensor_qkv = if resident_hidden_tensor_qkv.is_none()
-                && resident_hidden_entry_qkv.is_none()
-                && layer_idx == 0
-                && packed_use_gpu_embedding()
-                && packed_use_gpu_first_session()
-                && use_attention_qkv
-                && use_gpu_attention_block
-            {
-                Some(
-                    gpu_first_session.run_first_layer_embedding_norm_qkv_tensors(
-                        layer_idx,
-                        token_id,
-                        &input_norm_weight,
-                        &layer_tensors.q_proj_weight,
-                        &layer_tensors.k_proj_weight,
-                        &layer_tensors.v_proj_weight,
-                        self.config.num_key_value_heads * self.config.head_dim,
-                    )?,
-                )
-            } else {
-                None
-            };
+            let first_layer_gpu_entry_tensor_qkv = self.try_first_layer_gpu_entry_tensor_qkv(
+                gpu_first_session,
+                &resident_hidden_tensor_qkv,
+                &resident_hidden_entry_qkv,
+                layer_idx,
+                token_id,
+                use_attention_qkv,
+                use_gpu_attention_block,
+                &input_norm_weight,
+                layer_tensors,
+            )?;
             let first_layer_gpu_entry_qkv = if first_layer_gpu_entry_tensor_qkv.is_none()
                 && resident_hidden_tensor_qkv.is_none()
                 && resident_hidden_entry_qkv.is_none()
