@@ -148,6 +148,37 @@ impl GpuKvCache {
         Ok(())
     }
 
+    pub fn append_from_tensors(
+        &mut self,
+        key: &GpuResidentBuffer,
+        value: &GpuResidentBuffer,
+    ) -> Result<(), GpuKvCacheError> {
+        if key.len != self.kv_width || value.len != self.kv_width {
+            return Err(GpuKvCacheError::Shape(format!(
+                "kv append expects key/value width {} but got {}/{}",
+                self.kv_width, key.len, value.len
+            )));
+        }
+        if self.len_tokens >= self.tokens_capacity {
+            return Err(GpuKvCacheError::Shape(format!(
+                "kv cache capacity {} exceeded",
+                self.tokens_capacity
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, &key.shared_context)
+            || !Arc::ptr_eq(&self._shared_context, &value.shared_context)
+        {
+            return Err(GpuKvCacheError::Shape(
+                "resident kv append requires matching Vulkan context".to_string(),
+            ));
+        }
+        let offset_bytes = self.len_tokens * self.kv_width * std::mem::size_of::<f32>();
+        self.copy_into_key_slot(key.buffer, key.buffer_size, offset_bytes)?;
+        self.copy_into_value_slot(value.buffer, value.buffer_size, offset_bytes)?;
+        self.len_tokens += 1;
+        Ok(())
+    }
+
     pub fn len_tokens(&self) -> usize {
         self.len_tokens
     }
@@ -210,6 +241,53 @@ impl GpuKvCache {
                 copy_command,
                 source_buffer,
                 self.key_buffer.buffer,
+                &region,
+            );
+            self.device.end_command_buffer(copy_command)?;
+            self.device.reset_fences(&[self.fence])?;
+        }
+        let submit_info =
+            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.device
+                .free_command_buffers(self.command_pool, &[copy_command]);
+        }
+        Ok(())
+    }
+
+    fn copy_into_value_slot(
+        &self,
+        source_buffer: vk::Buffer,
+        source_buffer_size: u64,
+        offset_bytes: usize,
+    ) -> Result<(), GpuKvCacheError> {
+        let byte_len = self.kv_width * std::mem::size_of::<f32>();
+        let end = offset_bytes + byte_len;
+        if byte_len as u64 > source_buffer_size || end as u64 > self.value_buffer.size {
+            return Err(GpuKvCacheError::Shape(format!(
+                "kv value copy [{}..{}) exceeds source {} or destination {}",
+                offset_bytes, end, source_buffer_size, self.value_buffer.size
+            )));
+        }
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let copy_command = unsafe { self.device.allocate_command_buffers(&alloc)?[0] };
+        unsafe {
+            self.device
+                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
+            let region = [vk::BufferCopy::default()
+                .src_offset(0)
+                .dst_offset(offset_bytes as u64)
+                .size(byte_len as u64)];
+            self.device.cmd_copy_buffer(
+                copy_command,
+                source_buffer,
+                self.value_buffer.buffer,
                 &region,
             );
             self.device.end_command_buffer(copy_command)?;

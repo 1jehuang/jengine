@@ -966,6 +966,21 @@ impl<'a> GpuFirstRunnerCache<'a> {
             })
     }
 
+    fn append_gpu_kv_tensors(
+        &mut self,
+        layer_idx: usize,
+        key: &GpuResidentBuffer,
+        value: &GpuResidentBuffer,
+    ) -> Result<(), ReferenceError> {
+        self.ensure_gpu_kv_cache(layer_idx)?
+            .append_from_tensors(key, value)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu-first resident kv append failed for layer {layer_idx}: {error}"
+                ))
+            })
+    }
+
     fn gpu_kv_state(
         &self,
         layer_idx: usize,
@@ -1136,6 +1151,36 @@ impl<'a> GpuFirstRunnerCache<'a> {
         ))
     }
 
+    fn ensure_raw_f32_single_projection_runner(
+        &mut self,
+        cache_key: &str,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(Duration, &mut CachedGpuPackedMatvecRunner), ReferenceError> {
+        let (packed, _, _) = self.model.get_or_create_projection_cache(tensor_name, rows, cols)?;
+        self.ensure_raw_f32_projection_runner(cache_key, &packed)
+    }
+
+    fn run_qk_rope_resident_query_and_key(
+        &mut self,
+        q: &GpuResidentBuffer,
+        k: &GpuResidentBuffer,
+        q_weight: &[f32],
+        k_weight: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<(GpuResidentBuffer, GpuResidentBuffer, GpuQkRopeReport, Duration), ReferenceError>
+    {
+        let (compile_duration, runner) = self.ensure_qk_rope_runner()?;
+        let report = runner
+            .run_resident_from_tensors(q, k, q_weight, k_weight, cos, sin)
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let query_out = runner.query_resident_output();
+        let key_out = runner.key_resident_output();
+        Ok((query_out, key_out, report, compile_duration))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_first_layer_embedding_norm_qkv_to_host(
         &mut self,
@@ -1286,6 +1331,24 @@ impl<'a> GpuFirstRunnerCache<'a> {
         }
     }
 
+    fn read_hidden_output(
+        &mut self,
+        state: ResidentHiddenState,
+    ) -> Result<(Vec<f32>, Duration), ReferenceError> {
+        match state {
+            ResidentHiddenState::Mlp { layer_idx } => self
+                .mlp_blocks
+                .get_mut(&layer_idx)
+                .ok_or_else(|| {
+                    ReferenceError::Decode(format!(
+                        "gpu-first mlp block output missing for layer {layer_idx}"
+                    ))
+                })?
+                .read_output()
+                .map_err(|error| ReferenceError::Decode(error.to_string())),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_layer_input_norm_qkv_from_hidden_resident(
         &mut self,
@@ -1359,6 +1422,116 @@ impl<'a> GpuFirstRunnerCache<'a> {
             norm_report,
             qkv_report,
             norm_compile_duration + qkv_compile_duration,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_layer_input_norm_qkv_tensors_from_hidden_resident(
+        &mut self,
+        state: ResidentHiddenState,
+        layer_idx: usize,
+        input_norm_weight: &[f32],
+        q_proj_name: &str,
+        k_proj_name: &str,
+        v_proj_name: &str,
+        kv_rows: usize,
+    ) -> Result<
+        (
+            GpuResidentBuffer,
+            GpuResidentBuffer,
+            GpuResidentBuffer,
+            GpuResidentBuffer,
+            GpuWeightedRmsNormReport,
+            crate::gpu::packed_matvec::GpuPackedMatvecReport,
+            Duration,
+        ),
+        ReferenceError,
+    > {
+        let hidden_size = self.model.config.hidden_size;
+        let hidden_resident = self.resident_hidden_output(state)?;
+
+        let (norm_compile_duration, norm_context, norm_report) = {
+            let (norm_compile_duration, input_norm_runner) = self.ensure_input_norm_runner()?;
+            let norm_report = input_norm_runner
+                .run_resident_from_tensor(&hidden_resident, input_norm_weight)
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+            (
+                norm_compile_duration,
+                input_norm_runner.resident_output(),
+                norm_report,
+            )
+        };
+
+        let q_key = format!("gpu_first::layer::{layer_idx}::q_proj::{q_proj_name}");
+        let k_key = format!("gpu_first::layer::{layer_idx}::k_proj::{k_proj_name}");
+        let v_key = format!("gpu_first::layer::{layer_idx}::v_proj::{v_proj_name}");
+        let (q_compile_duration, q_runner) = self.ensure_raw_f32_single_projection_runner(
+            &q_key,
+            q_proj_name,
+            hidden_size,
+            hidden_size,
+        )?;
+        let q_report = q_runner
+            .run_resident_from_f32_tensor(&norm_context)
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let q_tensor = GpuResidentBuffer::new(
+            q_runner.shared_context().clone(),
+            q_runner.output_buffer_handle(),
+            hidden_size,
+            q_runner.output_buffer_size(),
+        );
+
+        let (k_compile_duration, k_runner) = self.ensure_raw_f32_single_projection_runner(
+            &k_key,
+            k_proj_name,
+            kv_rows,
+            hidden_size,
+        )?;
+        let k_report = k_runner
+            .run_resident_from_f32_tensor(&norm_context)
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let k_tensor = GpuResidentBuffer::new(
+            k_runner.shared_context().clone(),
+            k_runner.output_buffer_handle(),
+            kv_rows,
+            k_runner.output_buffer_size(),
+        );
+
+        let (v_compile_duration, v_runner) = self.ensure_raw_f32_single_projection_runner(
+            &v_key,
+            v_proj_name,
+            kv_rows,
+            hidden_size,
+        )?;
+        let v_report = v_runner
+            .run_resident_from_f32_tensor(&norm_context)
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let v_tensor = GpuResidentBuffer::new(
+            v_runner.shared_context().clone(),
+            v_runner.output_buffer_handle(),
+            kv_rows,
+            v_runner.output_buffer_size(),
+        );
+
+        let qkv_report = crate::gpu::packed_matvec::GpuPackedMatvecReport {
+            rows: hidden_size + 2 * kv_rows,
+            cols: hidden_size,
+            compile_duration: Duration::ZERO,
+            upload_duration: q_report.upload_duration + k_report.upload_duration + v_report.upload_duration,
+            gpu_duration: q_report.gpu_duration + k_report.gpu_duration + v_report.gpu_duration,
+            download_duration: Duration::ZERO,
+            max_abs_diff: 0.0,
+            mean_abs_diff: 0.0,
+        };
+
+        Ok((
+            hidden_resident,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            norm_report,
+            qkv_report,
+            norm_compile_duration + q_compile_duration + k_compile_duration + v_compile_duration,
         ))
     }
 
@@ -6238,12 +6411,22 @@ impl ReferenceModel {
             .take(self.config.num_hidden_layers)
         {
             let layer_tensors = &self.layer_tensors[layer_idx];
+            let use_gpu_attention_block =
+                use_attention_qkv && use_attention_full && Self::packed_use_gpu_attention_block();
+            let use_gpu_attention_mlp_block = use_gpu_attention_block
+                && use_mlp_gu
+                && use_mlp_full
+                && Self::packed_use_gpu_swiglu_block();
 
             let input_norm_weight =
                 self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
-            let resident_hidden_entry_qkv =
-                if layer_idx > 0 && use_attention_qkv && resident_hidden_state.is_some() {
-                    Some(gpu_first_session.run_layer_input_norm_qkv_from_hidden_resident(
+            let resident_hidden_tensor_qkv =
+                if layer_idx > 0
+                    && use_attention_qkv
+                    && resident_hidden_state.is_some()
+                    && use_gpu_attention_block
+                {
+                    Some(gpu_first_session.run_layer_input_norm_qkv_tensors_from_hidden_resident(
                         resident_hidden_state.expect("resident hidden state should exist"),
                         layer_idx,
                         &input_norm_weight,
@@ -6255,7 +6438,25 @@ impl ReferenceModel {
                 } else {
                     None
                 };
-            let first_layer_gpu_entry_qkv = if resident_hidden_entry_qkv.is_none()
+            let resident_hidden_entry_qkv = if layer_idx > 0
+                && use_attention_qkv
+                && resident_hidden_state.is_some()
+                && !use_gpu_attention_block
+            {
+                Some(gpu_first_session.run_layer_input_norm_qkv_from_hidden_resident(
+                    resident_hidden_state.expect("resident hidden state should exist"),
+                    layer_idx,
+                    &input_norm_weight,
+                    &layer_tensors.q_proj_weight,
+                    &layer_tensors.k_proj_weight,
+                    &layer_tensors.v_proj_weight,
+                    self.config.num_key_value_heads * self.config.head_dim,
+                )?)
+            } else {
+                None
+            };
+            let first_layer_gpu_entry_qkv = if resident_hidden_tensor_qkv.is_none()
+                && resident_hidden_entry_qkv.is_none()
                 && layer_idx == 0
                 && Self::packed_use_gpu_embedding()
                 && Self::packed_use_gpu_first_session()
@@ -6327,6 +6528,35 @@ impl ReferenceModel {
                 norm_report,
                 qkv_report,
                 compile_duration,
+            )) = resident_hidden_tensor_qkv.as_ref()
+            {
+                session.metrics.compile_duration += *compile_duration;
+                session.metrics.activation_upload_duration +=
+                    norm_report.upload_duration + qkv_report.upload_duration;
+                session.metrics.upload_duration +=
+                    norm_report.upload_duration + qkv_report.upload_duration;
+                session.metrics.gpu_duration += norm_report.gpu_duration + qkv_report.gpu_duration;
+                session.metrics.download_duration +=
+                    norm_report.download_duration + qkv_report.download_duration;
+                session.metrics.activation_upload_bytes +=
+                    self.config.hidden_size * std::mem::size_of::<f32>();
+                session.metrics.upload_bytes +=
+                    self.config.hidden_size * std::mem::size_of::<f32>();
+                metrics.norm_duration += norm_report.upload_duration
+                    + norm_report.gpu_duration
+                    + norm_report.download_duration;
+                metrics.qkv_duration += qkv_report.upload_duration
+                    + qkv_report.gpu_duration
+                    + qkv_report.download_duration;
+                vec![0.0; self.config.hidden_size]
+            } else if let Some((
+                _hidden_resident,
+                _q,
+                _k,
+                _v,
+                norm_report,
+                qkv_report,
+                compile_duration,
             )) = resident_hidden_entry_qkv.as_ref()
             {
                 session.metrics.compile_duration += *compile_duration;
@@ -6350,6 +6580,14 @@ impl ReferenceModel {
                 metrics.qkv_duration += qkv_report.upload_duration
                     + qkv_report.gpu_duration
                     + qkv_report.download_duration;
+                let (materialized_hidden, hidden_download_duration) = gpu_first_session
+                    .read_hidden_output(
+                        resident_hidden_state.expect("resident hidden state should exist"),
+                    )?;
+                hidden = materialized_hidden;
+                session.metrics.download_duration += hidden_download_duration;
+                session.metrics.download_bytes +=
+                    self.config.hidden_size * std::mem::size_of::<f32>();
                 vec![0.0; self.config.hidden_size]
             } else if layer_idx == 0
                 && Self::packed_use_gpu_embedding()
@@ -6400,7 +6638,7 @@ impl ReferenceModel {
                 hidden_states
             };
             let residual = hidden.clone();
-            let residual_resident = resident_hidden_entry_qkv
+            let residual_resident = resident_hidden_tensor_qkv
                 .as_ref()
                 .map(|(hidden_resident, ..)| hidden_resident.clone());
 
@@ -6434,62 +6672,84 @@ impl ReferenceModel {
                 *non_offloaded_dense_duration += elapsed;
             }
 
-            let use_gpu_attention_block =
-                use_attention_qkv && use_attention_full && Self::packed_use_gpu_attention_block();
-            let use_gpu_attention_mlp_block = use_gpu_attention_block
-                && use_mlp_gu
-                && use_mlp_full
-                && Self::packed_use_gpu_swiglu_block();
-
             let started_at = Instant::now();
             let q_norm_weight = self.load_vector_f32_resolved(&layer_tensors.q_norm_weight)?;
             let k_norm_weight = self.load_vector_f32_resolved(&layer_tensors.k_norm_weight)?;
             let mut q_resident: Option<GpuResidentBuffer> = None;
             let mut kv_appended_on_gpu = false;
             if use_gpu_attention_block {
-                let ((q_out, key_out), qk_rope_report, compile_duration) = gpu_first_session
-                    .run_qk_rope_query_to_host_key_resident(
-                        &q,
-                        &k,
-                        &q_norm_weight,
-                        &k_norm_weight,
-                        &cos,
-                        &sin,
-                    )?;
-                q = q_out;
-                q_resident = Some(
+                if let Some((_, q_tensor, k_tensor, v_tensor, ..)) = resident_hidden_tensor_qkv.as_ref() {
+                    let (query_out, key_out, qk_rope_report, compile_duration) = gpu_first_session
+                        .run_qk_rope_resident_query_and_key(
+                            q_tensor,
+                            k_tensor,
+                            &q_norm_weight,
+                            &k_norm_weight,
+                            &cos,
+                            &sin,
+                        )?;
+                    q_resident = Some(query_out);
+                    gpu_first_session.append_gpu_kv_tensors(layer_idx, &key_out, v_tensor)?;
+                    kv_appended_on_gpu = true;
+                    metrics.norm_duration += qk_rope_report.upload_duration
+                        + qk_rope_report.gpu_duration
+                        + qk_rope_report.download_duration;
+                    session.metrics.compile_duration += compile_duration;
+                    session.metrics.activation_upload_duration += qk_rope_report.upload_duration;
+                    session.metrics.upload_duration += qk_rope_report.upload_duration;
+                    session.metrics.gpu_duration += qk_rope_report.gpu_duration;
+                    session.metrics.download_duration += qk_rope_report.download_duration;
+                    session.metrics.activation_upload_bytes +=
+                        (q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
+                            * std::mem::size_of::<f32>();
+                    session.metrics.upload_bytes +=
+                        (q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
+                            * std::mem::size_of::<f32>();
+                } else {
+                    let ((q_out, key_out), qk_rope_report, compile_duration) = gpu_first_session
+                        .run_qk_rope_query_to_host_key_resident(
+                            &q,
+                            &k,
+                            &q_norm_weight,
+                            &k_norm_weight,
+                            &cos,
+                            &sin,
+                        )?;
+                    q = q_out;
+                    q_resident = Some(
+                        gpu_first_session
+                            .qk_rope_runner
+                            .as_ref()
+                            .expect("qk rope runner should exist after execution")
+                            .query_resident_output(),
+                    );
                     gpu_first_session
-                        .qk_rope_runner
-                        .as_ref()
-                        .expect("qk rope runner should exist after execution")
-                        .query_resident_output(),
-                );
-                gpu_first_session
-                    .append_gpu_kv_key_tensor_and_value_host(layer_idx, &key_out, &v)?;
-                kv_appended_on_gpu = true;
-                metrics.norm_duration += qk_rope_report.upload_duration
-                    + qk_rope_report.gpu_duration
-                    + qk_rope_report.download_duration;
-                session.metrics.compile_duration += compile_duration;
-                session.metrics.activation_upload_duration += qk_rope_report.upload_duration;
-                session.metrics.upload_duration += qk_rope_report.upload_duration;
-                session.metrics.gpu_duration += qk_rope_report.gpu_duration;
-                session.metrics.download_duration += qk_rope_report.download_duration;
-                session.metrics.activation_upload_bytes += (q.len()
-                    + k.len()
-                    + q_norm_weight.len()
-                    + k_norm_weight.len()
-                    + cos.len()
-                    + sin.len())
-                    * std::mem::size_of::<f32>();
-                session.metrics.upload_bytes += (q.len()
-                    + k.len()
-                    + q_norm_weight.len()
-                    + k_norm_weight.len()
-                    + cos.len()
-                    + sin.len())
-                    * std::mem::size_of::<f32>();
-                session.metrics.download_bytes += q.len() * std::mem::size_of::<f32>();
+                        .append_gpu_kv_key_tensor_and_value_host(layer_idx, &key_out, &v)?;
+                    kv_appended_on_gpu = true;
+                    metrics.norm_duration += qk_rope_report.upload_duration
+                        + qk_rope_report.gpu_duration
+                        + qk_rope_report.download_duration;
+                    session.metrics.compile_duration += compile_duration;
+                    session.metrics.activation_upload_duration += qk_rope_report.upload_duration;
+                    session.metrics.upload_duration += qk_rope_report.upload_duration;
+                    session.metrics.gpu_duration += qk_rope_report.gpu_duration;
+                    session.metrics.download_duration += qk_rope_report.download_duration;
+                    session.metrics.activation_upload_bytes += (q.len()
+                        + k.len()
+                        + q_norm_weight.len()
+                        + k_norm_weight.len()
+                        + cos.len()
+                        + sin.len())
+                        * std::mem::size_of::<f32>();
+                    session.metrics.upload_bytes += (q.len()
+                        + k.len()
+                        + q_norm_weight.len()
+                        + k_norm_weight.len()
+                        + cos.len()
+                        + sin.len())
+                        * std::mem::size_of::<f32>();
+                    session.metrics.download_bytes += q.len() * std::mem::size_of::<f32>();
+                }
             } else {
                 apply_head_rms_norm_weighted(
                     &mut q,
@@ -8294,10 +8554,16 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when gpu block flags are enabled");
         };
-        let expected_key = format!(
-            "gpu_first::layer::1::qkv_triplet::{}||{}||{}",
+        let expected_q_key = format!(
+            "gpu_first::layer::1::q_proj::{}",
             model.layer_tensors[1].q_proj_weight,
+        );
+        let expected_k_key = format!(
+            "gpu_first::layer::1::k_proj::{}",
             model.layer_tensors[1].k_proj_weight,
+        );
+        let expected_v_key = format!(
+            "gpu_first::layer::1::v_proj::{}",
             model.layer_tensors[1].v_proj_weight,
         );
         assert!(
@@ -8305,7 +8571,21 @@ mod tests {
                 .inner
                 .gpu_first_session
                 .raw_f32_projection_runners
-                .contains_key(&expected_key)
+                .contains_key(&expected_q_key)
+        );
+        assert!(
+            session
+                .inner
+                .gpu_first_session
+                .raw_f32_projection_runners
+                .contains_key(&expected_k_key)
+        );
+        assert!(
+            session
+                .inner
+                .gpu_first_session
+                .raw_f32_projection_runners
+                .contains_key(&expected_v_key)
         );
         assert!(session.inner.cache[0].keys.is_empty());
         assert!(session.inner.cache[0].values.is_empty());

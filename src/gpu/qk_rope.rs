@@ -354,6 +354,59 @@ impl CachedGpuQkRopeRunner {
         })
     }
 
+    pub fn run_resident_from_tensors(
+        &mut self,
+        q: &GpuResidentBuffer,
+        k: &GpuResidentBuffer,
+        q_weight: &[f32],
+        k_weight: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<GpuQkRopeReport, GpuQkRopeError> {
+        if q.len != self.query_len
+            || k.len != self.key_len
+            || q_weight.len() != self.head_dim
+            || k_weight.len() != self.head_dim
+            || cos.len() != self.head_dim
+            || sin.len() != self.head_dim
+        {
+            return Err(GpuQkRopeError::Shape(
+                "qk rope tensor input shapes must match runner dimensions".to_string(),
+            ));
+        }
+        let copy_q_duration = self.copy_input_from_buffer(
+            &q.shared_context,
+            q.buffer,
+            q.buffer_size,
+            self.q_buffer.buffer,
+            self.q_buffer.size,
+            self.query_len,
+        )?;
+        let copy_k_duration = self.copy_input_from_buffer(
+            &k.shared_context,
+            k.buffer,
+            k.buffer_size,
+            self.k_buffer.buffer,
+            self.k_buffer.size,
+            self.key_len,
+        )?;
+        let upload_started = Instant::now();
+        write_f32_buffer(&self.q_weight_buffer, q_weight)?;
+        write_f32_buffer(&self.k_weight_buffer, k_weight)?;
+        write_f32_buffer(&self.cos_buffer, cos)?;
+        write_f32_buffer(&self.sin_buffer, sin)?;
+        let upload_duration = copy_q_duration + copy_k_duration + upload_started.elapsed();
+        let gpu_duration = self.submit_and_wait()?;
+        Ok(GpuQkRopeReport {
+            query_len: self.query_len,
+            key_len: self.key_len,
+            compile_duration: Duration::ZERO,
+            upload_duration,
+            gpu_duration,
+            download_duration: Duration::ZERO,
+        })
+    }
+
     pub fn run_with_output(
         &mut self,
         q: &[f32],
@@ -407,6 +460,54 @@ impl CachedGpuQkRopeRunner {
             self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
         }
         Ok(gpu_started.elapsed())
+    }
+
+    fn copy_input_from_buffer(
+        &self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: vk::Buffer,
+        source_buffer_size: u64,
+        destination_buffer: vk::Buffer,
+        destination_buffer_size: u64,
+        len: usize,
+    ) -> Result<Duration, GpuQkRopeError> {
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuQkRopeError::Shape(
+                "resident qk-rope chaining requires matching Vulkan context".to_string(),
+            ));
+        }
+        let byte_len = len * std::mem::size_of::<f32>();
+        if byte_len as u64 > source_buffer_size || byte_len as u64 > destination_buffer_size {
+            return Err(GpuQkRopeError::Shape(format!(
+                "copy {} bytes exceeds source {} or destination {} buffer size",
+                byte_len, source_buffer_size, destination_buffer_size
+            )));
+        }
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let copy_command = unsafe { self.device.allocate_command_buffers(&alloc)?[0] };
+        unsafe {
+            self.device
+                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
+            let region = [vk::BufferCopy::default().size(byte_len as u64)];
+            self.device
+                .cmd_copy_buffer(copy_command, source_buffer, destination_buffer, &region);
+            self.device.end_command_buffer(copy_command)?;
+            self.device.reset_fences(&[self.fence])?;
+        }
+        let submit_info =
+            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
+        let started = Instant::now();
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.device
+                .free_command_buffers(self.command_pool, &[copy_command]);
+        }
+        Ok(started.elapsed())
     }
 }
 
