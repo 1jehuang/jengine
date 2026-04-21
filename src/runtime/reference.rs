@@ -24,6 +24,13 @@ use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRun
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::decode_plan::PackedDecodePlan;
 use crate::runtime::gpu_decode_engine::{GpuDecodeEngine, PackedDecodeRequest};
+use crate::runtime::gpu_decode_env::{
+    gpu_first_use_attention_full, gpu_first_use_mlp_full, packed_enabled_label,
+    packed_use_attention_full, packed_use_gpu_attention_block, packed_use_gpu_embedding,
+    packed_use_gpu_final_norm, packed_use_gpu_first_session, packed_use_gpu_full_last_layer,
+    packed_use_gpu_mlp_entry, packed_use_gpu_swiglu_block, packed_use_gpu_tail,
+    packed_use_mlp_full,
+};
 use crate::runtime::gpu_decode_metrics::{
     PackedAttentionStageMetrics, PackedGpuSessionMetrics, PackedMlpStageMetrics,
 };
@@ -525,8 +532,8 @@ impl<'a> PersistentPackedDecodeSession<'a> {
             next_position: 0,
             use_attention_qkv,
             use_mlp_gu,
-            use_attention_full: use_attention_qkv && ReferenceModel::packed_use_attention_full(),
-            use_mlp_full: use_mlp_gu && ReferenceModel::packed_use_mlp_full(),
+            use_attention_full: use_attention_qkv && packed_use_attention_full(),
+            use_mlp_full: use_mlp_gu && packed_use_mlp_full(),
             argmax_only,
         }
     }
@@ -663,15 +670,8 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
             argmax_only,
             false,
         );
-        inner.use_attention_full = use_attention_qkv
-            && (ReferenceModel::packed_use_attention_full()
-                || ReferenceModel::packed_use_gpu_attention_block()
-                || ReferenceModel::packed_use_gpu_full_last_layer());
-        inner.use_mlp_full = use_mlp_gu
-            && (ReferenceModel::packed_use_mlp_full()
-                || ReferenceModel::packed_use_gpu_swiglu_block()
-                || ReferenceModel::packed_use_gpu_full_last_layer()
-                || ReferenceModel::packed_use_gpu_mlp_entry());
+        inner.use_attention_full = gpu_first_use_attention_full(use_attention_qkv);
+        inner.use_mlp_full = gpu_first_use_mlp_full(use_mlp_gu);
         Self { inner }
     }
 
@@ -1678,25 +1678,25 @@ impl<'a> GpuFirstRunnerCache<'a> {
     ) -> Result<(), ReferenceError> {
         let _ = self.get_or_create_shared_context()?;
 
-        if ReferenceModel::packed_use_gpu_embedding()
-            || ReferenceModel::packed_use_gpu_attention_block()
-            || ReferenceModel::packed_use_gpu_tail()
-            || ReferenceModel::packed_use_gpu_full_last_layer()
-            || ReferenceModel::packed_use_gpu_swiglu_block()
+        if packed_use_gpu_embedding()
+            || packed_use_gpu_attention_block()
+            || packed_use_gpu_tail()
+            || packed_use_gpu_full_last_layer()
+            || packed_use_gpu_swiglu_block()
         {
             let _ = self.ensure_embedding_lookup_runner()?;
             let _ = self.ensure_input_norm_runner()?;
         }
 
         if use_attention_qkv
-            && (ReferenceModel::packed_use_gpu_attention_block()
-                || ReferenceModel::packed_use_gpu_tail()
-                || ReferenceModel::packed_use_gpu_full_last_layer())
+            && (packed_use_gpu_attention_block()
+                || packed_use_gpu_tail()
+                || packed_use_gpu_full_last_layer())
         {
             let _ = self.ensure_qk_rope_runner()?;
             for layer_idx in 0..self.model.config.num_hidden_layers {
                 let _ = self.ensure_gpu_kv_cache(layer_idx)?;
-                if ReferenceModel::packed_use_gpu_attention_block() {
+                if packed_use_gpu_attention_block() {
                     for seq_len in 1..=self.kv_capacity_tokens.max(1) {
                         let _ = self.ensure_attention_block(layer_idx)?;
                     }
@@ -1705,20 +1705,20 @@ impl<'a> GpuFirstRunnerCache<'a> {
         }
 
         if use_mlp_gu
-            && (ReferenceModel::packed_use_gpu_swiglu_block()
-                || ReferenceModel::packed_use_gpu_tail()
-                || ReferenceModel::packed_use_gpu_full_last_layer())
+            && (packed_use_gpu_swiglu_block()
+                || packed_use_gpu_tail()
+                || packed_use_gpu_full_last_layer())
         {
             for layer_idx in 0..self.model.config.num_hidden_layers {
                 let _ = self.ensure_mlp_block(layer_idx)?;
             }
         }
 
-        if ReferenceModel::packed_use_gpu_tail() {
+        if packed_use_gpu_tail() {
             let _ = self.ensure_tail_block()?;
         }
 
-        if ReferenceModel::packed_use_gpu_full_last_layer() {
+        if packed_use_gpu_full_last_layer() {
             let last_layer_idx = self.model.config.num_hidden_layers - 1;
             for seq_len in 1..=self.kv_capacity_tokens.max(1) {
                 let _ = self.ensure_attention_block(last_layer_idx)?;
@@ -3910,54 +3910,6 @@ pub struct ReferenceModel {
 }
 
 impl ReferenceModel {
-    fn packed_enabled_label(use_attention_qkv: bool, use_mlp_gu: bool) -> String {
-        PackedDecodePlan::from_env(use_attention_qkv, use_mlp_gu, false).enabled_label()
-    }
-
-    fn packed_use_mlp_full() -> bool {
-        std::env::var_os("JENGINE_PACKED_MLP_FULL").is_some()
-    }
-
-    fn packed_use_attention_full() -> bool {
-        std::env::var_os("JENGINE_PACKED_ATTENTION_FULL").is_some()
-    }
-
-    fn packed_use_gpu_final_norm() -> bool {
-        std::env::var_os("JENGINE_GPU_FINAL_NORM").is_some()
-    }
-
-    fn packed_use_gpu_swiglu_block() -> bool {
-        std::env::var_os("JENGINE_GPU_SWIGLU_BLOCK").is_some()
-    }
-
-    fn packed_use_gpu_attention_block() -> bool {
-        std::env::var_os("JENGINE_GPU_ATTENTION_BLOCK").is_some()
-    }
-
-    fn packed_use_gpu_embedding() -> bool {
-        std::env::var_os("JENGINE_GPU_EMBEDDING").is_some()
-    }
-
-    fn packed_use_gpu_first_session() -> bool {
-        Self::packed_use_gpu_attention_block()
-            || Self::packed_use_gpu_embedding()
-            || Self::packed_use_gpu_swiglu_block()
-            || Self::packed_use_gpu_full_last_layer()
-            || Self::packed_use_gpu_tail()
-    }
-
-    fn packed_use_gpu_mlp_entry() -> bool {
-        std::env::var_os("JENGINE_GPU_MLP_ENTRY").is_some()
-    }
-
-    fn packed_use_gpu_full_last_layer() -> bool {
-        std::env::var_os("JENGINE_GPU_FULL_LAST_LAYER").is_some()
-    }
-
-    fn packed_use_gpu_tail() -> bool {
-        std::env::var_os("JENGINE_GPU_TAIL").is_some()
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn finish_packed_decode_metrics(
         enabled_projections: String,
@@ -6052,7 +6004,7 @@ impl ReferenceModel {
         }
 
         Ok(session.finish_metrics(
-            Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
+            packed_enabled_label(use_attention_qkv, use_mlp_gu),
             total_started.elapsed(),
             String::new(),
         ))
@@ -6197,7 +6149,7 @@ impl ReferenceModel {
                 "attention_single_query",
                 attn_elapsed,
             );
-            let use_attention_full = use_attention_qkv && Self::packed_use_attention_full();
+            let use_attention_full = use_attention_qkv && packed_use_attention_full();
             let oproj_started_at = Instant::now();
             let attn_output = if use_attention_full {
                 session.run_projection(
@@ -6274,7 +6226,7 @@ impl ReferenceModel {
                     dense_started_at,
                 )
             };
-            let use_mlp_full = use_mlp_gu && Self::packed_use_mlp_full();
+            let use_mlp_full = use_mlp_gu && packed_use_mlp_full();
             let swiglu_started_at = Instant::now();
             let mlp = swiglu(&gate, &up);
             let swiglu_elapsed = swiglu_started_at.elapsed();
@@ -6337,7 +6289,7 @@ impl ReferenceModel {
         Ok((
             hidden,
             Self::finish_packed_decode_metrics(
-                Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
+                packed_enabled_label(use_attention_qkv, use_mlp_gu),
                 total_started.elapsed(),
                 &metrics,
                 &attention_stage_metrics,
@@ -6437,7 +6389,7 @@ impl ReferenceModel {
             tokenizer.decode(&output_ids.iter().map(|id| *id as u32).collect::<Vec<_>>())?;
 
         Ok(session.finish_result(
-            Self::packed_enabled_label(use_attention_qkv, use_mlp_gu),
+            packed_enabled_label(use_attention_qkv, use_mlp_gu),
             total_started.elapsed(),
             output_ids,
             output_text,
@@ -6922,8 +6874,7 @@ impl ReferenceModel {
         argmax_only: bool,
     ) -> Result<PackedDecodeStepResult, ReferenceError> {
         let started_at = Instant::now();
-        let mut hidden = if Self::packed_use_gpu_embedding() && Self::packed_use_gpu_first_session()
-        {
+        let mut hidden = if packed_use_gpu_embedding() && packed_use_gpu_first_session() {
             Vec::new()
         } else {
             self.embedding_lookup_resolved("model.embed_tokens.weight", token_id)?
@@ -6945,11 +6896,11 @@ impl ReferenceModel {
         {
             let layer_tensors = &self.layer_tensors[layer_idx];
             let use_gpu_attention_block =
-                use_attention_qkv && use_attention_full && Self::packed_use_gpu_attention_block();
+                use_attention_qkv && use_attention_full && packed_use_gpu_attention_block();
             let use_gpu_attention_mlp_block = use_gpu_attention_block
                 && use_mlp_gu
                 && use_mlp_full
-                && Self::packed_use_gpu_swiglu_block();
+                && packed_use_gpu_swiglu_block();
 
             let input_norm_weight =
                 self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
@@ -6994,8 +6945,8 @@ impl ReferenceModel {
             let first_layer_gpu_entry_tensor_qkv = if resident_hidden_tensor_qkv.is_none()
                 && resident_hidden_entry_qkv.is_none()
                 && layer_idx == 0
-                && Self::packed_use_gpu_embedding()
-                && Self::packed_use_gpu_first_session()
+                && packed_use_gpu_embedding()
+                && packed_use_gpu_first_session()
                 && use_attention_qkv
                 && use_gpu_attention_block
             {
@@ -7017,8 +6968,8 @@ impl ReferenceModel {
                 && resident_hidden_tensor_qkv.is_none()
                 && resident_hidden_entry_qkv.is_none()
                 && layer_idx == 0
-                && Self::packed_use_gpu_embedding()
-                && Self::packed_use_gpu_first_session()
+                && packed_use_gpu_embedding()
+                && packed_use_gpu_first_session()
                 && use_attention_qkv
             {
                 Some(
@@ -7189,8 +7140,8 @@ impl ReferenceModel {
                     self.config.hidden_size * std::mem::size_of::<f32>();
                 vec![0.0; self.config.hidden_size]
             } else if layer_idx == 0
-                && Self::packed_use_gpu_embedding()
-                && Self::packed_use_gpu_first_session()
+                && packed_use_gpu_embedding()
+                && packed_use_gpu_first_session()
             {
                 let started_at = Instant::now();
                 let (
@@ -7440,7 +7391,7 @@ impl ReferenceModel {
             let use_gpu_attention_only = use_gpu_attention_block && !use_gpu_attention_mlp_block;
             if use_gpu_attention_only {
                 let use_gpu_attention_tail = argmax_only
-                    && Self::packed_use_gpu_tail()
+                    && packed_use_gpu_tail()
                     && layer_idx + 1 == self.config.num_hidden_layers;
                 if use_gpu_attention_tail {
                     let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
@@ -7515,7 +7466,7 @@ impl ReferenceModel {
 
             let use_gpu_full_last_layer_block = use_gpu_attention_mlp_block
                 && argmax_only
-                && Self::packed_use_gpu_full_last_layer()
+                && packed_use_gpu_full_last_layer()
                 && layer_idx + 1 == self.config.num_hidden_layers;
             if use_gpu_full_last_layer_block {
                 let post_norm_weight =
@@ -7689,7 +7640,7 @@ impl ReferenceModel {
             let use_gpu_full_last_layer = use_mlp_gu
                 && use_mlp_full
                 && argmax_only
-                && Self::packed_use_gpu_full_last_layer()
+                && packed_use_gpu_full_last_layer()
                 && layer_idx + 1 == self.config.num_hidden_layers;
             if use_gpu_full_last_layer {
                 let post_norm_weight =
@@ -7748,14 +7699,14 @@ impl ReferenceModel {
             }
             let post_norm_weight =
                 self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
-            let use_gpu_mlp_entry = use_mlp_gu && use_mlp_full && Self::packed_use_gpu_mlp_entry();
+            let use_gpu_mlp_entry = use_mlp_gu && use_mlp_full && packed_use_gpu_mlp_entry();
             let use_gpu_mlp_only = use_mlp_gu
                 && use_mlp_full
-                && Self::packed_use_gpu_swiglu_block()
+                && packed_use_gpu_swiglu_block()
                 && !use_gpu_attention_mlp_block;
             let use_gpu_mlp_tail = use_gpu_mlp_only
                 && argmax_only
-                && Self::packed_use_gpu_tail()
+                && packed_use_gpu_tail()
                 && layer_idx + 1 == self.config.num_hidden_layers;
             if use_gpu_mlp_only {
                 if use_gpu_mlp_tail {
@@ -7850,10 +7801,10 @@ impl ReferenceModel {
 
             let started_at = Instant::now();
             let use_gpu_swiglu_block =
-                use_mlp_gu && use_mlp_full && Self::packed_use_gpu_swiglu_block();
+                use_mlp_gu && use_mlp_full && packed_use_gpu_swiglu_block();
             let use_gpu_tail = use_gpu_swiglu_block
-                && Self::packed_use_gpu_tail()
-                && Self::packed_use_gpu_final_norm()
+                && packed_use_gpu_tail()
+                && packed_use_gpu_final_norm()
                 && argmax_only
                 && layer_idx + 1 == self.config.num_hidden_layers;
             let (
@@ -8050,7 +8001,7 @@ impl ReferenceModel {
                     + tail_report.logits_gpu_duration;
                 session.metrics.download_duration += tail_report.logits_download_duration;
                 next_token
-            } else if Self::packed_use_gpu_tail() {
+            } else if packed_use_gpu_tail() {
                 let (tail_result, tail_report, compile_duration) = gpu_first_session
                     .run_tail_from_host_hidden(&hidden, &final_norm_weight, true)?;
                 let next_token = match tail_result {
@@ -8067,7 +8018,7 @@ impl ReferenceModel {
                     + tail_report.logits_gpu_duration;
                 session.metrics.download_duration += tail_report.logits_download_duration;
                 next_token
-            } else if Self::packed_use_gpu_final_norm() {
+            } else if packed_use_gpu_final_norm() {
                 let final_norm = session.run_final_norm_resident(&hidden, &final_norm_weight)?;
                 metrics.norm_duration += norm_started.elapsed();
                 let logits_started = Instant::now();
@@ -8119,7 +8070,7 @@ impl ReferenceModel {
                     + tail_report.logits_gpu_duration;
                 session.metrics.download_duration += tail_report.logits_download_duration;
                 logits
-            } else if Self::packed_use_gpu_tail() {
+            } else if packed_use_gpu_tail() {
                 let (tail_result, tail_report, compile_duration) = gpu_first_session
                     .run_tail_from_host_hidden(&hidden, &final_norm_weight, false)?;
                 let logits = match tail_result {
@@ -8551,12 +8502,12 @@ fn attention_single_query(
 #[cfg(test)]
 mod tests {
     use super::{PackedDecodeSession, PackedDecodeStepResult, ReferenceModel};
+    use crate::runtime::gpu_decode_env::{ScopedEnvVars, lock_env, packed_enabled_label};
     use crate::runtime::packed_model::write_packed_model_artifact;
     use half::f16;
     use safetensors::tensor::{Dtype, TensorView, serialize};
     use std::collections::BTreeMap;
     use std::fs;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
     use tokenizers::Tokenizer;
     use tokenizers::models::wordlevel::WordLevel;
@@ -8812,52 +8763,6 @@ mod tests {
         fs::write(root.join("model.safetensors"), bytes).expect("model should be written");
     }
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
-    fn set_env(key: &str, value: &str) {
-        unsafe { std::env::set_var(key, value) }
-    }
-
-    fn remove_env(key: &str) {
-        unsafe { std::env::remove_var(key) }
-    }
-
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        env_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    struct ScopedEnvVars(Vec<(&'static str, Option<String>)>);
-
-    impl ScopedEnvVars {
-        fn set(pairs: &[(&'static str, &'static str)]) -> Self {
-            let previous = pairs
-                .iter()
-                .map(|(key, value)| {
-                    let old = std::env::var(key).ok();
-                    set_env(key, value);
-                    (*key, old)
-                })
-                .collect();
-            Self(previous)
-        }
-    }
-
-    impl Drop for ScopedEnvVars {
-        fn drop(&mut self) {
-            for (key, value) in self.0.drain(..) {
-                match value {
-                    Some(old) => set_env(key, &old),
-                    None => remove_env(key),
-                }
-            }
-        }
-    }
-
     #[test]
     fn runs_end_to_end_greedy_decode_on_synthetic_model() {
         let dir = tempdir().expect("tempdir should be created");
@@ -8990,7 +8895,7 @@ mod tests {
         assert_eq!(predicted, 2);
 
         let result = session.finish_result(
-            ReferenceModel::packed_enabled_label(true, true),
+            packed_enabled_label(true, true),
             Duration::ZERO,
             vec![2, 2],
             "tok2 tok2".to_string(),
