@@ -24,7 +24,6 @@ use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRun
 use crate::runtime::assets::BonsaiAssetPaths;
 use crate::runtime::decode_plan::PackedDecodePlan;
 use crate::runtime::decode_report::{MemoryReport, build_memory_report};
-use crate::runtime::gpu_decode_engine::{GpuDecodeEngine, PackedDecodeRequest};
 use crate::runtime::gpu_decode_env::{
     packed_enabled_label, packed_use_attention_full, packed_use_gpu_attention_block,
     packed_use_gpu_embedding, packed_use_gpu_final_norm, packed_use_gpu_first_session,
@@ -39,7 +38,7 @@ use crate::runtime::gpu_decode_metrics::{
     finish_packed_decode_metrics,
 };
 use crate::runtime::gpu_decode_model_state::{HybridQProjCache, LayerTensorNames};
-use crate::runtime::gpu_decode_output::{DecodeResult, PackedDecodeResult, PackedDispatchTrace};
+use crate::runtime::gpu_decode_output::{DecodeResult, PackedDispatchTrace};
 use crate::runtime::gpu_decode_projection_state::{
     PackedProjectionCache, PreparedProjectionRunner, ResidentGpuFinalNorm,
     ResidentGpuPackedActivation, ResidentGpuPackedActivationKeepalive, ResidentGpuSwigluCombined,
@@ -6857,64 +6856,6 @@ impl ReferenceModel {
         Ok(self
             .generate_packed_greedy(prompt, max_new_tokens, use_attention_qkv, use_mlp_gu)?
             .metrics)
-    }
-
-    pub fn generate_packed_greedy(
-        &self,
-        prompt: &str,
-        max_new_tokens: usize,
-        use_attention_qkv: bool,
-        use_mlp_gu: bool,
-    ) -> Result<PackedDecodeResult, ReferenceError> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
-        GpuDecodeEngine::new(
-            self,
-            PackedDecodeRequest::new(1, use_attention_qkv, use_mlp_gu, true),
-        )
-        .generate_from_prompt(tokenizer, prompt, max_new_tokens)
-    }
-
-    pub fn generate_packed_from_token_ids(
-        &self,
-        prompt_ids: &[usize],
-        max_new_tokens: usize,
-        use_attention_qkv: bool,
-        use_mlp_gu: bool,
-    ) -> Result<PackedDecodeResult, ReferenceError> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
-        GpuDecodeEngine::new(
-            self,
-            PackedDecodeRequest::new(
-                prompt_ids.len() + max_new_tokens,
-                use_attention_qkv,
-                use_mlp_gu,
-                true,
-            ),
-        )
-        .generate_from_token_ids(tokenizer, prompt_ids, max_new_tokens)
-    }
-
-    pub fn prefill_logits_for_variant(
-        &self,
-        prompt: &str,
-        use_attention_qkv: bool,
-        use_mlp_gu: bool,
-    ) -> Result<Vec<f32>, ReferenceError> {
-        let tokenizer = self
-            .tokenizer
-            .as_ref()
-            .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
-        GpuDecodeEngine::new(
-            self,
-            PackedDecodeRequest::new(1, use_attention_qkv, use_mlp_gu, false),
-        )
-        .prefill_logits_from_prompt(tokenizer, prompt)
     }
 
     pub fn compare_prefill_logits_against(

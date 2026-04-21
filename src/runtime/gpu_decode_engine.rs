@@ -635,6 +635,64 @@ impl<'a> GpuDecodeEngine<'a> {
 }
 
 impl ReferenceModel {
+    pub fn generate_packed_greedy(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+    ) -> Result<PackedDecodeResult, ReferenceError> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
+        GpuDecodeEngine::new(
+            self,
+            PackedDecodeRequest::new(1, use_attention_qkv, use_mlp_gu, true),
+        )
+        .generate_from_prompt(tokenizer, prompt, max_new_tokens)
+    }
+
+    pub fn generate_packed_from_token_ids(
+        &self,
+        prompt_ids: &[usize],
+        max_new_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+    ) -> Result<PackedDecodeResult, ReferenceError> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
+        GpuDecodeEngine::new(
+            self,
+            PackedDecodeRequest::new(
+                prompt_ids.len() + max_new_tokens,
+                use_attention_qkv,
+                use_mlp_gu,
+                true,
+            ),
+        )
+        .generate_from_token_ids(tokenizer, prompt_ids, max_new_tokens)
+    }
+
+    pub fn prefill_logits_for_variant(
+        &self,
+        prompt: &str,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+    ) -> Result<Vec<f32>, ReferenceError> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
+        GpuDecodeEngine::new(
+            self,
+            PackedDecodeRequest::new(1, use_attention_qkv, use_mlp_gu, false),
+        )
+        .prefill_logits_from_prompt(tokenizer, prompt)
+    }
+
     pub fn prewarm_packed_decode_caches(
         &self,
         use_attention_qkv: bool,
