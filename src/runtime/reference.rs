@@ -686,6 +686,146 @@ impl<'a> PersistentPackedDecodeSession<'a> {
     }
 }
 
+pub struct GpuFirstPackedDecodeSession<'a> {
+    inner: PersistentPackedDecodeSession<'a>,
+}
+
+impl<'a> GpuFirstPackedDecodeSession<'a> {
+    fn new(
+        model: &'a ReferenceModel,
+        expected_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        argmax_only: bool,
+    ) -> Self {
+        Self {
+            inner: PersistentPackedDecodeSession::new(
+                model,
+                expected_tokens,
+                use_attention_qkv,
+                use_mlp_gu,
+                argmax_only,
+            ),
+        }
+    }
+
+    pub fn push_prompt_token(
+        &mut self,
+        token_id: usize,
+    ) -> Result<PackedDecodeStepResult, ReferenceError> {
+        self.inner.push_prompt_token(token_id)
+    }
+
+    pub fn push_generated_token(
+        &mut self,
+        token_id: usize,
+    ) -> Result<PackedDecodeStepResult, ReferenceError> {
+        self.inner.push_generated_token(token_id)
+    }
+
+    pub fn next_position(&self) -> usize {
+        self.inner.next_position
+    }
+
+    pub fn finish_metrics(
+        self,
+        enabled_projections: String,
+        total_duration: Duration,
+        output_text: String,
+    ) -> PackedDecodeMetrics {
+        self.inner
+            .finish_metrics(enabled_projections, total_duration, output_text)
+    }
+
+    pub fn finish_result(
+        self,
+        enabled_projections: String,
+        total_duration: Duration,
+        output_token_ids: Vec<usize>,
+        output_text: String,
+    ) -> PackedDecodeResult {
+        self.inner.finish_result(
+            enabled_projections,
+            total_duration,
+            output_token_ids,
+            output_text,
+        )
+    }
+}
+
+pub enum PackedDecodeSession<'a> {
+    Legacy(PersistentPackedDecodeSession<'a>),
+    GpuFirst(GpuFirstPackedDecodeSession<'a>),
+}
+
+impl<'a> PackedDecodeSession<'a> {
+    pub fn push_prompt_token(
+        &mut self,
+        token_id: usize,
+    ) -> Result<PackedDecodeStepResult, ReferenceError> {
+        match self {
+            Self::Legacy(session) => session.push_prompt_token(token_id),
+            Self::GpuFirst(session) => session.push_prompt_token(token_id),
+        }
+    }
+
+    pub fn push_generated_token(
+        &mut self,
+        token_id: usize,
+    ) -> Result<PackedDecodeStepResult, ReferenceError> {
+        match self {
+            Self::Legacy(session) => session.push_generated_token(token_id),
+            Self::GpuFirst(session) => session.push_generated_token(token_id),
+        }
+    }
+
+    pub fn next_position(&self) -> usize {
+        match self {
+            Self::Legacy(session) => session.next_position,
+            Self::GpuFirst(session) => session.next_position(),
+        }
+    }
+
+    pub fn is_gpu_first(&self) -> bool {
+        matches!(self, Self::GpuFirst(_))
+    }
+
+    pub fn finish_metrics(
+        self,
+        enabled_projections: String,
+        total_duration: Duration,
+        output_text: String,
+    ) -> PackedDecodeMetrics {
+        match self {
+            Self::Legacy(session) => session.finish_metrics(enabled_projections, total_duration, output_text),
+            Self::GpuFirst(session) => session.finish_metrics(enabled_projections, total_duration, output_text),
+        }
+    }
+
+    pub fn finish_result(
+        self,
+        enabled_projections: String,
+        total_duration: Duration,
+        output_token_ids: Vec<usize>,
+        output_text: String,
+    ) -> PackedDecodeResult {
+        match self {
+            Self::Legacy(session) => session.finish_result(
+                enabled_projections,
+                total_duration,
+                output_token_ids,
+                output_text,
+            ),
+            Self::GpuFirst(session) => session.finish_result(
+                enabled_projections,
+                total_duration,
+                output_token_ids,
+                output_text,
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct PackedDecodeValidationReport {
     pub enabled_projections: String,
@@ -2454,6 +2594,13 @@ impl ReferenceModel {
         std::env::var_os("JENGINE_GPU_ATTENTION_BLOCK").is_some()
     }
 
+    fn packed_use_gpu_first_session() -> bool {
+        Self::packed_use_gpu_attention_block()
+            || Self::packed_use_gpu_swiglu_block()
+            || Self::packed_use_gpu_full_last_layer()
+            || Self::packed_use_gpu_tail()
+    }
+
     fn packed_use_gpu_mlp_entry() -> bool {
         std::env::var_os("JENGINE_GPU_MLP_ENTRY").is_some()
     }
@@ -2757,14 +2904,24 @@ impl ReferenceModel {
         use_attention_qkv: bool,
         use_mlp_gu: bool,
         argmax_only: bool,
-    ) -> PersistentPackedDecodeSession<'_> {
-        PersistentPackedDecodeSession::new(
-            self,
-            expected_tokens,
-            use_attention_qkv,
-            use_mlp_gu,
-            argmax_only,
-        )
+    ) -> PackedDecodeSession<'_> {
+        if Self::packed_use_gpu_first_session() {
+            PackedDecodeSession::GpuFirst(GpuFirstPackedDecodeSession::new(
+                self,
+                expected_tokens,
+                use_attention_qkv,
+                use_mlp_gu,
+                argmax_only,
+            ))
+        } else {
+            PackedDecodeSession::Legacy(PersistentPackedDecodeSession::new(
+                self,
+                expected_tokens,
+                use_attention_qkv,
+                use_mlp_gu,
+                argmax_only,
+            ))
+        }
     }
 
     fn packed_cache_bytes(&self) -> usize {
@@ -4208,7 +4365,7 @@ impl ReferenceModel {
         let mut session =
             self.begin_packed_decode_session(prompt_ids.len(), use_attention_qkv, use_mlp_gu, true);
         for (position, &token_id) in prompt_ids.iter().enumerate() {
-            debug_assert_eq!(position, session.next_position);
+            debug_assert_eq!(position, session.next_position());
             let _ = session.push_prompt_token(token_id)?;
         }
 
@@ -4568,7 +4725,7 @@ impl ReferenceModel {
         let mut last_next_token = None;
 
         for (position, &token_id) in prompt_ids.iter().enumerate() {
-            debug_assert_eq!(position, session.next_position);
+            debug_assert_eq!(position, session.next_position());
             let step = session.push_prompt_token(token_id)?;
             last_next_token = Some(match step {
                 PackedDecodeStepResult::NextToken(token_id) => token_id,
@@ -4584,7 +4741,7 @@ impl ReferenceModel {
                 ReferenceError::Decode("argmax failed on empty logits".to_string())
             })?;
             output_ids.push(next_token);
-            debug_assert_eq!(prompt_ids.len() + generation_index, session.next_position);
+            debug_assert_eq!(prompt_ids.len() + generation_index, session.next_position());
             let step = session.push_generated_token(next_token)?;
             last_next_token = Some(match step {
                 PackedDecodeStepResult::NextToken(token_id) => token_id,
@@ -6405,6 +6562,26 @@ mod tests {
         assert_eq!(result.decode_metrics.prompt_tokens, 1);
         assert_eq!(result.decode_metrics.generated_tokens, 1);
         assert!(!result.dispatch_trace.is_empty());
+    }
+
+    #[test]
+    fn selects_gpu_first_decode_session_when_gpu_first_flags_are_enabled() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let _guard = env_lock().lock().expect("env lock should be acquired");
+
+        let legacy = model.begin_packed_decode_session(2, true, true, true);
+        assert!(!legacy.is_gpu_first());
+
+        let _env = ScopedEnvVars::set(&[("JENGINE_GPU_ATTENTION_BLOCK", "1")]);
+        let gpu_first = model.begin_packed_decode_session(2, true, true, true);
+        assert!(gpu_first.is_gpu_first());
     }
 
     #[test]
