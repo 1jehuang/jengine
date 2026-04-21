@@ -23,6 +23,7 @@ use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::decode_plan::PackedDecodePlan;
+use crate::runtime::gpu_decode_engine::GpuDecodeEngine;
 use crate::runtime::gpu_decode_state::{GpuKvBinding, GpuTailResult, GpuTailStepReport, ResidentHiddenState};
 use crate::runtime::packed_model::{PackedModelError, PackedModelStore};
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
@@ -622,7 +623,7 @@ impl<'a> PersistentPackedDecodeSession<'a> {
         }
     }
 
-    fn new(
+    pub(crate) fn new(
         model: &'a ReferenceModel,
         expected_tokens: usize,
         use_attention_qkv: bool,
@@ -739,7 +740,7 @@ pub struct GpuFirstPackedDecodeSession<'a> {
 }
 
 impl<'a> GpuFirstPackedDecodeSession<'a> {
-    fn new(
+    pub(crate) fn new(
         model: &'a ReferenceModel,
         expected_tokens: usize,
         use_attention_qkv: bool,
@@ -4521,24 +4522,14 @@ impl ReferenceModel {
         use_mlp_gu: bool,
         argmax_only: bool,
     ) -> PackedDecodeSession<'_> {
-        let plan = PackedDecodePlan::from_env(use_attention_qkv, use_mlp_gu, argmax_only);
-        if plan.gpu_first_session {
-            PackedDecodeSession::GpuFirst(GpuFirstPackedDecodeSession::new(
-                self,
-                expected_tokens,
-                use_attention_qkv,
-                use_mlp_gu,
-                argmax_only,
-            ))
-        } else {
-            PackedDecodeSession::Legacy(PersistentPackedDecodeSession::new(
-                self,
-                expected_tokens,
-                use_attention_qkv,
-                use_mlp_gu,
-                argmax_only,
-            ))
-        }
+        GpuDecodeEngine::new(
+            self,
+            expected_tokens,
+            use_attention_qkv,
+            use_mlp_gu,
+            argmax_only,
+        )
+        .begin_packed_session()
     }
 
     fn packed_cache_bytes(&self) -> usize {
