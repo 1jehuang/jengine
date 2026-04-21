@@ -378,14 +378,14 @@ impl CachedGpuQkRopeRunner {
                 "qk rope tensor input shapes must match runner dimensions".to_string(),
             ));
         }
-        let copy_duration = self.copy_inputs_from_buffers(q, k)?;
         let upload_started = Instant::now();
+        self.copy_inputs_from_buffers(q, k)?;
         write_f32_buffer(&self.q_weight_buffer, q_weight)?;
         write_f32_buffer(&self.k_weight_buffer, k_weight)?;
         write_f32_buffer(&self.cos_buffer, cos)?;
         write_f32_buffer(&self.sin_buffer, sin)?;
-        let upload_duration = copy_duration + upload_started.elapsed();
-        let gpu_duration = self.submit_and_wait()?;
+        let upload_duration = upload_started.elapsed();
+        let gpu_duration = self.submit_copy_and_compute_and_wait()?;
         Ok(GpuQkRopeReport {
             query_len: self.query_len,
             key_len: self.key_len,
@@ -451,11 +451,24 @@ impl CachedGpuQkRopeRunner {
         Ok(gpu_started.elapsed())
     }
 
+    fn submit_copy_and_compute_and_wait(&self) -> Result<Duration, GpuQkRopeError> {
+        unsafe { self.device.reset_fences(&[self.fence])? };
+        let command_buffers = [self.copy_command_buffer, self.command_buffer];
+        let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+        let gpu_started = Instant::now();
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        Ok(gpu_started.elapsed())
+    }
+
     fn copy_inputs_from_buffers(
         &self,
         q: &GpuResidentBuffer,
         k: &GpuResidentBuffer,
-    ) -> Result<Duration, GpuQkRopeError> {
+    ) -> Result<(), GpuQkRopeError> {
         if !Arc::ptr_eq(&self._shared_context, &q.shared_context)
             || !Arc::ptr_eq(&self._shared_context, &k.shared_context)
         {
@@ -489,18 +502,36 @@ impl CachedGpuQkRopeRunner {
             let k_region = [vk::BufferCopy::default().size(k_byte_len as u64)];
             self.device
                 .cmd_copy_buffer(copy_command, k.buffer, self.k_buffer.buffer, &k_region);
+            let barriers = [
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(self.q_buffer.buffer)
+                    .offset(0)
+                    .size(q_byte_len as u64),
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(self.k_buffer.buffer)
+                    .offset(0)
+                    .size(k_byte_len as u64),
+            ];
+            self.device.cmd_pipeline_barrier(
+                copy_command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barriers,
+                &[],
+            );
             self.device.end_command_buffer(copy_command)?;
-            self.device.reset_fences(&[self.fence])?;
         }
-        let submit_info =
-            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
-        let started = Instant::now();
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &submit_info, self.fence)?;
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
-        Ok(started.elapsed())
+        Ok(())
     }
 }
 
