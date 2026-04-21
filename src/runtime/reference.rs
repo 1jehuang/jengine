@@ -1495,6 +1495,30 @@ impl<'a> GpuFirstRunnerCache<'a> {
         Ok((hidden, mlp_report, mlp_compile_duration, download_duration))
     }
 
+    fn run_mlp_layer_to_tail_argmax(
+        &mut self,
+        layer_idx: usize,
+        residual: &[f32],
+        post_norm_weight: &[f32],
+        final_norm_weight: &[f32],
+    ) -> Result<(usize, GpuMlpBlockReport, GpuTailBlockReport, Duration), ReferenceError> {
+        let (mlp_compile_duration, mlp_block) = self.ensure_mlp_block(layer_idx)?;
+        let mlp_report = mlp_block
+            .run_with_host_residual(residual, post_norm_weight)
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let mlp_output = mlp_block.resident_output();
+        let (tail_compile_duration, tail_block) = self.ensure_tail_block()?;
+        let tail_report = tail_block
+            .run_argmax_from_resident_tensor(&mlp_output, final_norm_weight)
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        Ok((
+            tail_report.argmax_index,
+            mlp_report,
+            tail_report,
+            mlp_compile_duration + tail_compile_duration,
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_attention_to_full_last_layer_argmax(
         &mut self,
@@ -6095,31 +6119,70 @@ impl ReferenceModel {
                 && use_mlp_full
                 && Self::packed_use_gpu_swiglu_block()
                 && !use_gpu_attention_mlp_block;
+            let use_gpu_mlp_tail = use_gpu_mlp_only
+                && argmax_only
+                && Self::packed_use_gpu_tail()
+                && layer_idx + 1 == self.config.num_hidden_layers;
             if use_gpu_mlp_only {
-                let (next_hidden, mlp_report, compile_duration, download_duration) =
-                    gpu_first_session.run_mlp_layer_to_host(
-                        layer_idx,
-                        &residual,
-                        &post_norm_weight,
-                    )?;
-                hidden = next_hidden;
-                metrics.norm_duration += mlp_report.post_norm_gpu_duration;
-                mlp_stage_metrics.swiglu_duration += mlp_report.swiglu_pack_gpu_duration;
-                mlp_stage_metrics.down_duration += mlp_report.down_gpu_duration;
-                mlp_stage_metrics.residual_duration += mlp_report.residual_add_gpu_duration;
-                metrics.mlp_duration += mlp_report.post_norm_gpu_duration
-                    + mlp_report.pair_gpu_duration
-                    + mlp_report.swiglu_pack_gpu_duration
-                    + mlp_report.down_gpu_duration
-                    + mlp_report.residual_add_gpu_duration;
-                session.metrics.compile_duration += compile_duration;
-                session.metrics.gpu_duration += mlp_report.post_norm_gpu_duration
-                    + mlp_report.pair_gpu_duration
-                    + mlp_report.swiglu_pack_gpu_duration
-                    + mlp_report.down_gpu_duration
-                    + mlp_report.residual_add_gpu_duration;
-                session.metrics.download_duration += download_duration;
-                continue;
+                if use_gpu_mlp_tail {
+                    let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
+                    let (next_token, mlp_report, tail_report, compile_duration) =
+                        gpu_first_session.run_mlp_layer_to_tail_argmax(
+                            layer_idx,
+                            &residual,
+                            &post_norm_weight,
+                            &final_norm_weight,
+                        )?;
+                    metrics.norm_duration += mlp_report.post_norm_gpu_duration
+                        + tail_report.final_norm_gpu_duration;
+                    mlp_stage_metrics.swiglu_duration += mlp_report.swiglu_pack_gpu_duration;
+                    mlp_stage_metrics.down_duration += mlp_report.down_gpu_duration;
+                    mlp_stage_metrics.residual_duration += mlp_report.residual_add_gpu_duration;
+                    metrics.mlp_duration += mlp_report.post_norm_gpu_duration
+                        + mlp_report.pair_gpu_duration
+                        + mlp_report.swiglu_pack_gpu_duration
+                        + mlp_report.down_gpu_duration
+                        + mlp_report.residual_add_gpu_duration;
+                    metrics.logits_duration += tail_report.pack_gpu_duration
+                        + tail_report.logits_gpu_duration
+                        + tail_report.logits_download_duration;
+                    session.metrics.compile_duration += compile_duration;
+                    session.metrics.gpu_duration += mlp_report.post_norm_gpu_duration
+                        + mlp_report.pair_gpu_duration
+                        + mlp_report.swiglu_pack_gpu_duration
+                        + mlp_report.down_gpu_duration
+                        + mlp_report.residual_add_gpu_duration
+                        + tail_report.final_norm_gpu_duration
+                        + tail_report.pack_gpu_duration
+                        + tail_report.logits_gpu_duration;
+                    session.metrics.download_duration += tail_report.logits_download_duration;
+                    return Ok(PackedDecodeStepResult::NextToken(next_token));
+                } else {
+                    let (next_hidden, mlp_report, compile_duration, download_duration) =
+                        gpu_first_session.run_mlp_layer_to_host(
+                            layer_idx,
+                            &residual,
+                            &post_norm_weight,
+                        )?;
+                    hidden = next_hidden;
+                    metrics.norm_duration += mlp_report.post_norm_gpu_duration;
+                    mlp_stage_metrics.swiglu_duration += mlp_report.swiglu_pack_gpu_duration;
+                    mlp_stage_metrics.down_duration += mlp_report.down_gpu_duration;
+                    mlp_stage_metrics.residual_duration += mlp_report.residual_add_gpu_duration;
+                    metrics.mlp_duration += mlp_report.post_norm_gpu_duration
+                        + mlp_report.pair_gpu_duration
+                        + mlp_report.swiglu_pack_gpu_duration
+                        + mlp_report.down_gpu_duration
+                        + mlp_report.residual_add_gpu_duration;
+                    session.metrics.compile_duration += compile_duration;
+                    session.metrics.gpu_duration += mlp_report.post_norm_gpu_duration
+                        + mlp_report.pair_gpu_duration
+                        + mlp_report.swiglu_pack_gpu_duration
+                        + mlp_report.down_gpu_duration
+                        + mlp_report.residual_add_gpu_duration;
+                    session.metrics.download_duration += download_duration;
+                    continue;
+                }
             }
             let mut pair_from_gpu_norm: Option<ResidentPackedPairProjection> = None;
             if use_gpu_mlp_entry {
@@ -7383,6 +7446,35 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when gpu tail is enabled");
         };
+        assert!(session.inner.gpu_first_session.tail_block.is_some());
+    }
+
+    #[test]
+    fn runs_gpu_mlp_tail_path_without_gpu_attention_block() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let _guard = lock_env();
+        let _env = ScopedEnvVars::set(&[
+            ("JENGINE_PACKED_MLP_FULL", "1"),
+            ("JENGINE_GPU_SWIGLU_BLOCK", "1"),
+            ("JENGINE_GPU_TAIL", "1"),
+        ]);
+
+        let mut session = model.begin_packed_decode_session(2, false, true, true);
+        let _ = session
+            .push_prompt_token(2)
+            .expect("gpu mlp tail token should decode");
+
+        let PackedDecodeSession::GpuFirst(session) = session else {
+            panic!("gpu-first session should be selected when gpu mlp tail is enabled");
+        };
+        assert!(session.inner.gpu_first_session.mlp_blocks.contains_key(&0));
         assert!(session.inner.gpu_first_session.tail_block.is_some());
     }
 
