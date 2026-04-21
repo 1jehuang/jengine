@@ -35,6 +35,19 @@ fn sha256_hex_for_path(path: &Path) -> Result<String, PackedModelError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+pub fn resolve_source_file_sha256(
+    manifest: &PackedModelManifest,
+) -> Result<Option<String>, PackedModelError> {
+    if let Some(existing) = &manifest.source_file_sha256 {
+        return Ok(Some(existing.clone()));
+    }
+    let path = Path::new(&manifest.source_safetensors_path);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(sha256_hex_for_path(path)?))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorPackSpec {
     pub name: String,

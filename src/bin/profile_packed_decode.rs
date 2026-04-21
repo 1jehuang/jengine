@@ -1,5 +1,6 @@
 use jengine::report::{timestamped_profile_path, write_json_value};
 use jengine::runtime::gpu_decode_metrics::{DecodeMetrics, PackedDecodeMetrics};
+use jengine::runtime::packed_model::resolve_source_file_sha256;
 use jengine::runtime::reference::ReferenceModel;
 use serde_json::json;
 use std::path::PathBuf;
@@ -90,6 +91,9 @@ fn main() {
     let model = ReferenceModel::load_from_root_with_packed_artifact(&root, &artifact_dir)
         .expect("packed reference model should load");
     let manifest = model.packed_model_manifest().cloned();
+    let artifact_source_file_sha256 = manifest
+        .as_ref()
+        .and_then(|manifest| resolve_source_file_sha256(manifest).ok().flatten());
     if std::env::var_os("JENGINE_PREWARM_PACKED").is_some() {
         let expected_tokens = model
             .prompt_analysis(&prompt)
@@ -120,6 +124,10 @@ fn main() {
         "packed_metrics": packed_metrics_json(&result.metrics),
         "dispatch_trace": result.dispatch_trace,
         "packed_artifact_manifest": manifest,
+        "packed_artifact_provenance": {
+            "artifact_manifest_sha256": artifact_source_file_sha256,
+            "artifact_source_file_sha256": artifact_source_file_sha256,
+        },
     });
     let output = serde_json::to_string_pretty(&document).expect("profile JSON should serialize");
 

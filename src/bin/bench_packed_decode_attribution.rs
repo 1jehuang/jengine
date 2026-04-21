@@ -1,4 +1,5 @@
 use jengine::report::append_jsonl_record;
+use jengine::runtime::packed_model::resolve_source_file_sha256;
 use jengine::runtime::reference::ReferenceModel;
 use serde_json::json;
 use std::io::{self, Write};
@@ -82,6 +83,9 @@ fn main() {
             .expect("packed model should load")
     });
     let manifest = model.packed_model_manifest().cloned();
+    let artifact_source_file_sha256 = manifest
+        .as_ref()
+        .and_then(|manifest| resolve_source_file_sha256(manifest).ok().flatten());
     if std::env::var_os("JENGINE_PREWARM_PACKED").is_some() {
         let use_attention_full = std::env::var_os("JENGINE_PACKED_ATTENTION_FULL").is_some();
         let use_mlp_full = std::env::var_os("JENGINE_PACKED_MLP_FULL").is_some();
@@ -155,7 +159,8 @@ fn main() {
                 "e2e_pct_of_hw": e2e_pct_of_hw,
                 "stream_window_pct_of_hw": stream_window_pct_of_hw,
                 "summary": metrics.summarize(),
-                "artifact_manifest_sha256": manifest.as_ref().and_then(|m| m.source_file_sha256.clone()),
+                "artifact_manifest_sha256": artifact_source_file_sha256,
+                "artifact_source_file_sha256": artifact_source_file_sha256,
                 "artifact_created_unix_secs": manifest.as_ref().map(|m| m.created_unix_secs),
                 "artifact_source_file_bytes": manifest.as_ref().map(|m| m.source_file_bytes),
             }),
@@ -181,7 +186,8 @@ fn main() {
             "avg_total_ms": total_ms_sum / iterations as f64,
             "avg_e2e_gbps": e2e_gbps_sum / iterations as f64,
             "avg_stream_window_gbps": stream_window_gbps_sum / iterations as f64,
-            "artifact_manifest_sha256": manifest.as_ref().and_then(|m| m.source_file_sha256.clone()),
+            "artifact_manifest_sha256": artifact_source_file_sha256,
+            "artifact_source_file_sha256": artifact_source_file_sha256,
             "artifact_created_unix_secs": manifest.as_ref().map(|m| m.created_unix_secs),
             "artifact_source_file_bytes": manifest.as_ref().map(|m| m.source_file_bytes),
         }),
