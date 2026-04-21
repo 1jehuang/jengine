@@ -4444,6 +4444,20 @@ impl ReferenceModel {
         Ok(gpu_hidden_states)
     }
 
+    fn residual_resident_source(
+        &self,
+        first_layer_gpu_entry_tensor_qkv: &Option<FirstLayerTensorQkvEntry>,
+        resident_hidden_tensor_qkv: &Option<ResidentTensorQkvEntry>,
+    ) -> Option<GpuResidentBuffer> {
+        if let Some((_, hidden_resident, ..)) = first_layer_gpu_entry_tensor_qkv.as_ref() {
+            Some(hidden_resident.clone())
+        } else {
+            resident_hidden_tensor_qkv
+                .as_ref()
+                .map(|(hidden_resident, ..)| hidden_resident.clone())
+        }
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -6783,14 +6797,8 @@ impl ReferenceModel {
                 hidden_states
             };
             let residual = hidden.clone();
-            let residual_resident =
-                if let Some((_, hidden_resident, ..)) = first_layer_gpu_entry_tensor_qkv.as_ref() {
-                    Some(hidden_resident.clone())
-                } else {
-                    resident_hidden_tensor_qkv
-                        .as_ref()
-                        .map(|(hidden_resident, ..)| hidden_resident.clone())
-                };
+            let residual_resident = self
+                .residual_resident_source(&first_layer_gpu_entry_tensor_qkv, &resident_hidden_tensor_qkv);
 
             let started_at = Instant::now();
             let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
