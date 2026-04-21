@@ -678,6 +678,20 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
             .map(|cache| cache.len_tokens())
     }
 
+    pub(crate) fn cpu_kv_is_empty(&self, layer_idx: usize) -> Option<bool> {
+        self.inner
+            .cache
+            .get(layer_idx)
+            .map(LayerCache::cpu_kv_is_empty)
+    }
+
+    pub(crate) fn cpu_kv_capacities(&self, layer_idx: usize) -> Option<(usize, usize)> {
+        self.inner
+            .cache
+            .get(layer_idx)
+            .map(|cache| (cache.keys_capacity(), cache.values_capacity()))
+    }
+
     pub(crate) fn has_attention_block(&self, layer_idx: usize) -> bool {
         self.inner.gpu_first_session.attention_blocks.contains_key(&layer_idx)
     }
@@ -8945,10 +8959,8 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when block flags are enabled");
         };
-        assert!(session.inner.cache[0].keys.is_empty());
-        assert!(session.inner.cache[0].values.is_empty());
-        assert_eq!(session.inner.cache[0].keys.capacity(), 0);
-        assert_eq!(session.inner.cache[0].values.capacity(), 0);
+        assert_eq!(session.cpu_kv_is_empty(0), Some(true));
+        assert_eq!(session.cpu_kv_capacities(0), Some((0, 0)));
         let kv_cache = session
             .inner
             .gpu_first_session
@@ -8982,10 +8994,8 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when gpu attention is enabled");
         };
-        assert!(session.inner.cache[0].keys.is_empty());
-        assert!(session.inner.cache[0].values.is_empty());
-        assert_eq!(session.inner.cache[0].keys.capacity(), 0);
-        assert_eq!(session.inner.cache[0].values.capacity(), 0);
+        assert_eq!(session.cpu_kv_is_empty(0), Some(true));
+        assert_eq!(session.cpu_kv_capacities(0), Some((0, 0)));
         let kv_cache = session
             .inner
             .gpu_first_session
@@ -9016,8 +9026,7 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when gpu attention is enabled");
         };
-        assert!(session.inner.cache[0].keys.is_empty());
-        assert!(session.inner.cache[0].values.is_empty());
+        assert_eq!(session.cpu_kv_is_empty(0), Some(true));
         assert!(
             session.has_attention_block(0)
         );
@@ -9154,8 +9163,7 @@ mod tests {
             !session.has_raw_f32_projection_runner(&legacy_triplet_key)
         );
         assert!(session.has_qk_rope_runner());
-        assert!(session.inner.cache[0].keys.is_empty());
-        assert!(session.inner.cache[0].values.is_empty());
+        assert_eq!(session.cpu_kv_is_empty(0), Some(true));
         assert_eq!(
             session
                 .gpu_kv_len_tokens(0)
@@ -9211,10 +9219,8 @@ mod tests {
         assert!(
             session.has_raw_f32_projection_runner(&expected_v_key)
         );
-        assert!(session.inner.cache[0].keys.is_empty());
-        assert!(session.inner.cache[0].values.is_empty());
-        assert!(session.inner.cache[1].keys.is_empty());
-        assert!(session.inner.cache[1].values.is_empty());
+        assert_eq!(session.cpu_kv_is_empty(0), Some(true));
+        assert_eq!(session.cpu_kv_is_empty(1), Some(true));
         assert_eq!(
             session
                 .gpu_kv_len_tokens(0)
@@ -9394,10 +9400,8 @@ mod tests {
         assert!(
             session.has_full_last_layer_block()
         );
-        assert!(session.inner.cache[0].keys.is_empty());
-        assert!(session.inner.cache[0].values.is_empty());
-        assert!(session.inner.cache[1].keys.is_empty());
-        assert!(session.inner.cache[1].values.is_empty());
+        assert_eq!(session.cpu_kv_is_empty(0), Some(true));
+        assert_eq!(session.cpu_kv_is_empty(1), Some(true));
         assert_eq!(
             session
                 .gpu_kv_len_tokens(0)
@@ -9450,33 +9454,21 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when gpu block flags are enabled");
         };
-        for (layer_idx, layer_cache) in session.inner.cache.iter().enumerate().take(2) {
-            assert!(
-                layer_cache.cpu_kv_is_empty(),
-                "layer {layer_idx} cpu key cache should stay empty"
-            );
-            assert!(
-                layer_cache.cpu_kv_is_empty(),
-                "layer {layer_idx} cpu value cache should stay empty"
+        for layer_idx in 0..2 {
+            assert_eq!(
+                session.cpu_kv_is_empty(layer_idx),
+                Some(true),
+                "layer {layer_idx} cpu kv cache should stay empty"
             );
             assert_eq!(
-                layer_cache.keys_capacity(),
-                0,
-                "layer {layer_idx} cpu key cache should not be preallocated"
-            );
-            assert_eq!(
-                layer_cache.values_capacity(),
-                0,
-                "layer {layer_idx} cpu value cache should not be preallocated"
+                session.cpu_kv_capacities(layer_idx),
+                Some((0, 0)),
+                "layer {layer_idx} cpu kv cache should not be preallocated"
             );
             assert_eq!(
                 session
-                    .inner
-                    .gpu_first_session
-                    .gpu_kv_caches
-                    .get(&layer_idx)
-                    .expect("layer gpu kv cache should exist")
-                    .len_tokens(),
+                    .gpu_kv_len_tokens(layer_idx)
+                    .expect("layer gpu kv cache should exist"),
                 2,
                 "layer {layer_idx} gpu kv cache should contain both decoded tokens"
             );
@@ -9545,18 +9537,13 @@ mod tests {
         assert!(
             session.has_raw_f32_projection_runner(&expected_v_key)
         );
-        for (layer_idx, layer_cache) in session.inner.cache.iter().enumerate().take(2) {
-            assert!(layer_cache.cpu_kv_is_empty());
-            assert_eq!(layer_cache.keys_capacity(), 0);
-            assert_eq!(layer_cache.values_capacity(), 0);
+        for layer_idx in 0..2 {
+            assert_eq!(session.cpu_kv_is_empty(layer_idx), Some(true));
+            assert_eq!(session.cpu_kv_capacities(layer_idx), Some((0, 0)));
             assert_eq!(
                 session
-                    .inner
-                    .gpu_first_session
-                    .gpu_kv_caches
-                    .get(&layer_idx)
-                    .expect("layer gpu kv cache should exist")
-                    .len_tokens(),
+                    .gpu_kv_len_tokens(layer_idx)
+                    .expect("layer gpu kv cache should exist"),
                 2,
                 "layer {layer_idx} gpu kv cache should contain both decoded tokens"
             );
@@ -9599,33 +9586,21 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when gpu attention is enabled");
         };
-        for (layer_idx, layer_cache) in session.inner.cache.iter().enumerate().take(2) {
-            assert!(
-                layer_cache.cpu_kv_is_empty(),
-                "layer {layer_idx} cpu key cache should stay empty"
-            );
-            assert!(
-                layer_cache.cpu_kv_is_empty(),
-                "layer {layer_idx} cpu value cache should stay empty"
+        for layer_idx in 0..2 {
+            assert_eq!(
+                session.cpu_kv_is_empty(layer_idx),
+                Some(true),
+                "layer {layer_idx} cpu kv cache should stay empty"
             );
             assert_eq!(
-                layer_cache.keys_capacity(),
-                0,
-                "layer {layer_idx} cpu key cache should not be preallocated"
-            );
-            assert_eq!(
-                layer_cache.values_capacity(),
-                0,
-                "layer {layer_idx} cpu value cache should not be preallocated"
+                session.cpu_kv_capacities(layer_idx),
+                Some((0, 0)),
+                "layer {layer_idx} cpu kv cache should not be preallocated"
             );
             assert_eq!(
                 session
-                    .inner
-                    .gpu_first_session
-                    .gpu_kv_caches
-                    .get(&layer_idx)
-                    .expect("layer gpu kv cache should exist")
-                    .len_tokens(),
+                    .gpu_kv_len_tokens(layer_idx)
+                    .expect("layer gpu kv cache should exist"),
                 2,
                 "layer {layer_idx} gpu kv cache should contain both decoded tokens"
             );
