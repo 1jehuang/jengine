@@ -4283,6 +4283,49 @@ impl ReferenceModel {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn apply_resident_host_qkv_entry(
+        &self,
+        entry: &ResidentHostQkvEntry,
+        hidden: &mut Vec<f32>,
+        metrics: &mut DecodeMetrics,
+        session: &mut PackedGpuSession<'_>,
+        resident_hidden_state: ResidentHiddenState,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+    ) -> Result<Vec<f32>, ReferenceError> {
+        let (
+            _hidden_resident,
+            _q,
+            _k,
+            _v,
+            norm_report,
+            qkv_report,
+            compile_duration,
+        ) = entry;
+        session.metrics.compile_duration += *compile_duration;
+        session.metrics.activation_upload_duration +=
+            norm_report.upload_duration + qkv_report.upload_duration;
+        session.metrics.upload_duration += norm_report.upload_duration + qkv_report.upload_duration;
+        session.metrics.gpu_duration += norm_report.gpu_duration + qkv_report.gpu_duration;
+        session.metrics.download_duration +=
+            norm_report.download_duration + qkv_report.download_duration;
+        session.metrics.activation_upload_bytes += self.config.hidden_size * std::mem::size_of::<f32>();
+        session.metrics.upload_bytes += self.config.hidden_size * std::mem::size_of::<f32>();
+        session.metrics.download_bytes += (self.config.hidden_size
+            + 2 * (self.config.num_key_value_heads * self.config.head_dim))
+            * std::mem::size_of::<f32>();
+        metrics.norm_duration +=
+            norm_report.upload_duration + norm_report.gpu_duration + norm_report.download_duration;
+        metrics.qkv_duration +=
+            qkv_report.upload_duration + qkv_report.gpu_duration + qkv_report.download_duration;
+        let (materialized_hidden, hidden_download_duration) =
+            gpu_first_session.read_hidden_output(resident_hidden_state)?;
+        *hidden = materialized_hidden;
+        session.metrics.download_duration += hidden_download_duration;
+        session.metrics.download_bytes += self.config.hidden_size * std::mem::size_of::<f32>();
+        Ok(vec![0.0; self.config.hidden_size])
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn apply_first_layer_tensor_qkv_entry(
         &self,
         entry: &FirstLayerTensorQkvEntry,
@@ -6672,46 +6715,15 @@ impl ReferenceModel {
                 self.apply_first_layer_host_qkv_entry(entry, &mut hidden, metrics, session)
             } else if let Some(entry) = resident_hidden_tensor_qkv.as_ref() {
                 self.apply_resident_tensor_qkv_entry(entry, metrics, session)
-            } else if let Some((
-                _hidden_resident,
-                _q,
-                _k,
-                _v,
-                norm_report,
-                qkv_report,
-                compile_duration,
-            )) = resident_hidden_entry_qkv.as_ref()
-            {
-                session.metrics.compile_duration += *compile_duration;
-                session.metrics.activation_upload_duration +=
-                    norm_report.upload_duration + qkv_report.upload_duration;
-                session.metrics.upload_duration +=
-                    norm_report.upload_duration + qkv_report.upload_duration;
-                session.metrics.gpu_duration += norm_report.gpu_duration + qkv_report.gpu_duration;
-                session.metrics.download_duration +=
-                    norm_report.download_duration + qkv_report.download_duration;
-                session.metrics.activation_upload_bytes +=
-                    self.config.hidden_size * std::mem::size_of::<f32>();
-                session.metrics.upload_bytes +=
-                    self.config.hidden_size * std::mem::size_of::<f32>();
-                session.metrics.download_bytes += (self.config.hidden_size
-                    + 2 * (self.config.num_key_value_heads * self.config.head_dim))
-                    * std::mem::size_of::<f32>();
-                metrics.norm_duration += norm_report.upload_duration
-                    + norm_report.gpu_duration
-                    + norm_report.download_duration;
-                metrics.qkv_duration += qkv_report.upload_duration
-                    + qkv_report.gpu_duration
-                    + qkv_report.download_duration;
-                let (materialized_hidden, hidden_download_duration) = gpu_first_session
-                    .read_hidden_output(
-                        resident_hidden_state.expect("resident hidden state should exist"),
-                    )?;
-                hidden = materialized_hidden;
-                session.metrics.download_duration += hidden_download_duration;
-                session.metrics.download_bytes +=
-                    self.config.hidden_size * std::mem::size_of::<f32>();
-                vec![0.0; self.config.hidden_size]
+            } else if let Some(entry) = resident_hidden_entry_qkv.as_ref() {
+                self.apply_resident_host_qkv_entry(
+                    entry,
+                    &mut hidden,
+                    metrics,
+                    session,
+                    resident_hidden_state.expect("resident hidden state should exist"),
+                    gpu_first_session,
+                )?
             } else if layer_idx == 0
                 && packed_use_gpu_embedding()
                 && packed_use_gpu_first_session()
