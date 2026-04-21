@@ -27,6 +27,11 @@ use crate::runtime::gpu_decode_engine::{GpuDecodeEngine, PackedDecodeRequest};
 use crate::runtime::gpu_decode_metrics::{
     PackedAttentionStageMetrics, PackedGpuSessionMetrics, PackedMlpStageMetrics,
 };
+use crate::runtime::gpu_decode_projection_state::{
+    PackedProjectionCache, PreparedProjectionRunner, ResidentGpuFinalNorm,
+    ResidentGpuPackedActivation, ResidentGpuPackedActivationKeepalive, ResidentGpuSwigluCombined,
+    ResidentGpuVectorAdd, ResidentPackedPairProjection, ResidentPackedProjection,
+};
 use crate::runtime::gpu_decode_scratch::PackedDecodeScratch;
 use crate::runtime::gpu_decode_state::{GpuKvBinding, GpuTailResult, GpuTailStepReport, ResidentHiddenState};
 use crate::runtime::packed_model::{PackedModelError, PackedModelStore};
@@ -286,15 +291,6 @@ impl LayerCache {
 #[derive(Debug, Clone)]
 struct HybridQProjCache {
     layer_idx: usize,
-    rows: usize,
-    cols: usize,
-    group_size: usize,
-    code_words: Vec<u32>,
-    scales: Vec<f32>,
-}
-
-#[derive(Debug, Clone)]
-struct PackedProjectionCache {
     rows: usize,
     cols: usize,
     group_size: usize,
@@ -2397,85 +2393,6 @@ impl<'a> GpuFirstRunnerCache<'a> {
     }
 }
 
-struct PreparedProjectionRunner {
-    packed: Rc<PackedProjectionCache>,
-    runner: CachedProjectionGpuRunner,
-    compile_duration: Duration,
-    weight_upload_duration: Duration,
-    pack_cache_hit: bool,
-    gpu_cache_hit: bool,
-}
-
-struct ResidentPackedProjection {
-    tensor_name: String,
-    operation: String,
-    rows: usize,
-    cols: usize,
-    tensor: GpuResidentBuffer,
-    prepared: PreparedProjectionRunner,
-    report: crate::gpu::packed_matvec::GpuPackedMatvecReport,
-}
-
-#[allow(dead_code)]
-struct ResidentPackedPairProjection {
-    tensor_name: String,
-    first_rows: usize,
-    second_rows: usize,
-    cols: usize,
-    tensor: GpuResidentBuffer,
-    activation_upload_bytes: usize,
-    prepared: PreparedProjectionRunner,
-    report: crate::gpu::packed_matvec::GpuPackedMatvecReport,
-}
-
-struct ResidentGpuFinalNorm {
-    #[allow(dead_code)]
-    runner: CachedWeightedRmsNormGpuRunner,
-    tensor: GpuResidentBuffer,
-    len: usize,
-    report: crate::gpu::weighted_rms_norm::GpuWeightedRmsNormReport,
-    compile_duration: Duration,
-    gpu_cache_hit: bool,
-}
-
-struct ResidentGpuVectorAdd {
-    #[allow(dead_code)]
-    runner: CachedVectorAddGpuRunner,
-    tensor: GpuResidentBuffer,
-    len: usize,
-    report: crate::gpu::vector_add::GpuVectorAddReport,
-    compile_duration: Duration,
-    gpu_cache_hit: bool,
-}
-
-#[allow(dead_code)]
-enum ResidentPackedActivationKeepalive {
-    PackF16(CachedPackF16PairsGpuRunner),
-    SwigluPackF16(CachedSwigluPackF16PairsGpuRunner),
-}
-
-struct ResidentGpuPackedActivation {
-    #[allow(dead_code)]
-    keepalive: ResidentPackedActivationKeepalive,
-    tensor: GpuResidentBuffer,
-    logical_len: usize,
-    upload_duration: Duration,
-    gpu_duration: Duration,
-    compile_duration: Duration,
-    gpu_cache_hit: bool,
-}
-
-#[allow(dead_code)]
-struct ResidentGpuSwigluCombined {
-    #[allow(dead_code)]
-    runner: CachedSwigluCombinedGpuRunner,
-    tensor: GpuResidentBuffer,
-    len: usize,
-    report: crate::gpu::swiglu_combined::GpuSwigluCombinedReport,
-    compile_duration: Duration,
-    gpu_cache_hit: bool,
-}
-
 struct PackedGpuSession<'a> {
     model: &'a ReferenceModel,
     metrics: PackedGpuSessionMetrics,
@@ -2846,7 +2763,7 @@ impl<'a> PackedGpuSession<'a> {
             download_bytes: 0,
         });
         Ok(ResidentGpuPackedActivation {
-            keepalive: ResidentPackedActivationKeepalive::PackF16(runner.clone()),
+            keepalive: ResidentGpuPackedActivationKeepalive::PackF16(runner.clone()),
             tensor: GpuResidentBuffer::new(
                 runner.borrow().shared_context().clone(),
                 runner.borrow().output_buffer_handle(),
@@ -3030,7 +2947,7 @@ impl<'a> PackedGpuSession<'a> {
             download_bytes: 0,
         });
         Ok(ResidentGpuPackedActivation {
-            keepalive: ResidentPackedActivationKeepalive::SwigluPackF16(runner.clone()),
+            keepalive: ResidentGpuPackedActivationKeepalive::SwigluPackF16(runner.clone()),
             tensor: GpuResidentBuffer::new(
                 runner.borrow().shared_context().clone(),
                 runner.borrow().output_buffer_handle(),
@@ -3092,7 +3009,7 @@ impl<'a> PackedGpuSession<'a> {
             download_bytes: 0,
         });
         Ok(ResidentGpuPackedActivation {
-            keepalive: ResidentPackedActivationKeepalive::PackF16(runner.clone()),
+            keepalive: ResidentGpuPackedActivationKeepalive::PackF16(runner.clone()),
             tensor: GpuResidentBuffer::new(
                 runner.borrow().shared_context().clone(),
                 runner.borrow().output_buffer_handle(),
