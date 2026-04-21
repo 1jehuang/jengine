@@ -472,12 +472,7 @@ impl CachedGpuAttentionSingleQueryRunner {
         if query.len != self.query_len || key.len != self.kv_len || value.len != self.kv_len {
             return Err(GpuAttentionSingleQueryError::Shape(format!(
                 "query len {}, key len {}, value len {} must match {}, {}, {}",
-                query.len,
-                key.len,
-                value.len,
-                self.query_len,
-                self.kv_len,
-                self.kv_len
+                query.len, key.len, value.len, self.query_len, self.kv_len, self.kv_len
             )));
         }
         let query_copy_duration = self.copy_query_from_buffer(
@@ -569,8 +564,12 @@ impl CachedGpuAttentionSingleQueryRunner {
             self.device
                 .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
             let region = [vk::BufferCopy::default().size(byte_len as u64)];
-            self.device
-                .cmd_copy_buffer(copy_command, source_buffer, self.query_buffer.buffer, &region);
+            self.device.cmd_copy_buffer(
+                copy_command,
+                source_buffer,
+                self.query_buffer.buffer,
+                &region,
+            );
             self.device.end_command_buffer(copy_command)?;
             self.device.reset_fences(&[self.fence])?;
         }

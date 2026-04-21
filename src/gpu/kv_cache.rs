@@ -206,8 +206,12 @@ impl GpuKvCache {
                 .src_offset(0)
                 .dst_offset(offset_bytes as u64)
                 .size(byte_len as u64)];
-            self.device
-                .cmd_copy_buffer(copy_command, source_buffer, self.key_buffer.buffer, &region);
+            self.device.cmd_copy_buffer(
+                copy_command,
+                source_buffer,
+                self.key_buffer.buffer,
+                &region,
+            );
             self.device.end_command_buffer(copy_command)?;
             self.device.reset_fences(&[self.fence])?;
         }
@@ -285,7 +289,9 @@ fn find_memory_type(
 ) -> Result<u32, GpuKvCacheError> {
     for i in 0..props.memory_type_count {
         let matches_type = (filter & (1 << i)) != 0;
-        let has_flags = props.memory_types[i as usize].property_flags.contains(flags);
+        let has_flags = props.memory_types[i as usize]
+            .property_flags
+            .contains(flags);
         if matches_type && has_flags {
             return Ok(i);
         }
@@ -326,11 +332,7 @@ fn read_f32_prefix(buffer: &BufferAllocation, len: usize) -> Result<Vec<f32>, Gp
     }
     let mut output = vec![0f32; len];
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            buffer.mapped_ptr,
-            output.as_mut_ptr() as *mut u8,
-            byte_len,
-        );
+        std::ptr::copy_nonoverlapping(buffer.mapped_ptr, output.as_mut_ptr() as *mut u8, byte_len);
     }
     Ok(output)
 }

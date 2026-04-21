@@ -461,7 +461,9 @@ fn find_memory_type(
 ) -> Result<u32, GpuEmbeddingLookupError> {
     for i in 0..props.memory_type_count {
         let matches_type = (filter & (1 << i)) != 0;
-        let has_flags = props.memory_types[i as usize].property_flags.contains(flags);
+        let has_flags = props.memory_types[i as usize]
+            .property_flags
+            .contains(flags);
         if matches_type && has_flags {
             return Ok(i);
         }
@@ -471,7 +473,10 @@ fn find_memory_type(
     ))
 }
 
-fn write_u32_buffer(buffer: &BufferAllocation, data: &[u32]) -> Result<(), GpuEmbeddingLookupError> {
+fn write_u32_buffer(
+    buffer: &BufferAllocation,
+    data: &[u32],
+) -> Result<(), GpuEmbeddingLookupError> {
     let byte_len = std::mem::size_of_val(data) as u64;
     if byte_len > buffer.size {
         return Err(GpuEmbeddingLookupError::Shape(format!(
@@ -502,7 +507,10 @@ fn zero_buffer(buffer: &BufferAllocation, byte_len: usize) -> Result<(), GpuEmbe
     Ok(())
 }
 
-fn read_f32_buffer(buffer: &BufferAllocation, len: usize) -> Result<Vec<f32>, GpuEmbeddingLookupError> {
+fn read_f32_buffer(
+    buffer: &BufferAllocation,
+    len: usize,
+) -> Result<Vec<f32>, GpuEmbeddingLookupError> {
     let byte_len = len * std::mem::size_of::<f32>();
     if byte_len as u64 > buffer.size {
         return Err(GpuEmbeddingLookupError::Shape(format!(
@@ -512,11 +520,7 @@ fn read_f32_buffer(buffer: &BufferAllocation, len: usize) -> Result<Vec<f32>, Gp
     }
     let mut output = vec![0f32; len];
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            buffer.mapped_ptr,
-            output.as_mut_ptr() as *mut u8,
-            byte_len,
-        );
+        std::ptr::copy_nonoverlapping(buffer.mapped_ptr, output.as_mut_ptr() as *mut u8, byte_len);
     }
     Ok(output)
 }

@@ -7,9 +7,7 @@ use crate::gpu::packed_matvec::{
     CachedGpuPackedMatvecRunner, GpuPackedMatvecError, SharedGpuPackedContext,
 };
 use crate::gpu::resident_buffer::GpuResidentBuffer;
-use crate::gpu::weighted_rms_norm::{
-    CachedGpuWeightedRmsNormRunner, GpuWeightedRmsNormError,
-};
+use crate::gpu::weighted_rms_norm::{CachedGpuWeightedRmsNormRunner, GpuWeightedRmsNormError};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GpuTailBlockReport {
@@ -54,8 +52,9 @@ impl CachedGpuTailBlockRunner {
         let (final_norm_runner, final_norm_compile) =
             CachedGpuWeightedRmsNormRunner::new_with_context(context.clone(), hidden, epsilon)
                 .map_err(map_weighted_rms_norm_error)?;
-        let (pack_runner, pack_compile) = CachedGpuPackF16PairsRunner::new_with_context(context.clone(), hidden)
-            .map_err(map_pack_f16_pairs_error)?;
+        let (pack_runner, pack_compile) =
+            CachedGpuPackF16PairsRunner::new_with_context(context.clone(), hidden)
+                .map_err(map_pack_f16_pairs_error)?;
         let (logits_runner, logits_compile) = CachedGpuPackedMatvecRunner::new_with_context(
             context,
             &logits_spec.code_words,
@@ -107,8 +106,10 @@ impl CachedGpuTailBlockRunner {
                 self.pack_runner.output_buffer_size(),
             )
             .map_err(map_packed_matvec_error)?;
-        let (argmax_index, logits_download_duration) =
-            self.logits_runner.argmax_output().map_err(map_packed_matvec_error)?;
+        let (argmax_index, logits_download_duration) = self
+            .logits_runner
+            .argmax_output()
+            .map_err(map_packed_matvec_error)?;
         Ok(GpuTailBlockReport {
             hidden: self.hidden,
             vocab: self.vocab,
@@ -162,8 +163,10 @@ impl CachedGpuTailBlockRunner {
                 self.pack_runner.output_buffer_size(),
             )
             .map_err(map_packed_matvec_error)?;
-        let (argmax_index, logits_download_duration) =
-            self.logits_runner.argmax_output().map_err(map_packed_matvec_error)?;
+        let (argmax_index, logits_download_duration) = self
+            .logits_runner
+            .argmax_output()
+            .map_err(map_packed_matvec_error)?;
         Ok(GpuTailBlockReport {
             hidden: self.hidden,
             vocab: self.vocab,
