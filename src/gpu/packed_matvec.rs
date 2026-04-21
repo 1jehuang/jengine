@@ -1313,7 +1313,10 @@ fn argmax_f32_buffer(buffer: &BufferAllocation, len: usize) -> Result<usize, Gpu
             "argmax requires at least one output element".to_string(),
         ));
     }
-    let values = unsafe { std::slice::from_raw_parts(buffer.mapped_ptr as *const f32, len) };
+    let mut values = vec![0.0f32; len];
+    unsafe {
+        std::ptr::copy_nonoverlapping(buffer.mapped_ptr as *const f32, values.as_mut_ptr(), len);
+    }
     let mut best_index = 0usize;
     let mut best_value = values[0];
     for (index, value) in values.iter().enumerate().skip(1) {
