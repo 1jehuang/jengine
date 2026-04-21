@@ -4955,6 +4955,80 @@ impl ReferenceModel {
         Ok(hidden)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run_gpu_mlp_only_tail_argmax(
+        &self,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+        layer_idx: usize,
+        residual: &[f32],
+        post_norm_weight: &[f32],
+        mlp_stage_metrics: &mut PackedMlpStageMetrics,
+        metrics: &mut DecodeMetrics,
+        session: &mut PackedGpuSession<'_>,
+    ) -> Result<usize, ReferenceError> {
+        let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
+        let (next_token, mlp_report, tail_report, compile_duration) =
+            gpu_first_session.run_mlp_layer_to_tail_argmax(
+                layer_idx,
+                residual,
+                post_norm_weight,
+                &final_norm_weight,
+            )?;
+        metrics.norm_duration += mlp_report.post_norm_gpu_duration + tail_report.final_norm_gpu_duration;
+        mlp_stage_metrics.swiglu_duration += mlp_report.swiglu_pack_gpu_duration;
+        mlp_stage_metrics.down_duration += mlp_report.down_gpu_duration;
+        mlp_stage_metrics.residual_duration += mlp_report.residual_add_gpu_duration;
+        metrics.mlp_duration += mlp_report.post_norm_gpu_duration
+            + mlp_report.pair_gpu_duration
+            + mlp_report.swiglu_pack_gpu_duration
+            + mlp_report.down_gpu_duration
+            + mlp_report.residual_add_gpu_duration;
+        metrics.logits_duration += tail_report.pack_gpu_duration
+            + tail_report.logits_gpu_duration
+            + tail_report.logits_download_duration;
+        session.metrics.compile_duration += compile_duration;
+        session.metrics.gpu_duration += mlp_report.post_norm_gpu_duration
+            + mlp_report.pair_gpu_duration
+            + mlp_report.swiglu_pack_gpu_duration
+            + mlp_report.down_gpu_duration
+            + mlp_report.residual_add_gpu_duration
+            + tail_report.final_norm_gpu_duration
+            + tail_report.pack_gpu_duration
+            + tail_report.logits_gpu_duration;
+        session.metrics.download_duration += tail_report.logits_download_duration;
+        Ok(next_token)
+    }
+
+    fn run_gpu_mlp_only_resident_handoff(
+        &self,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+        layer_idx: usize,
+        residual: &[f32],
+        post_norm_weight: &[f32],
+        mlp_stage_metrics: &mut PackedMlpStageMetrics,
+        metrics: &mut DecodeMetrics,
+        session: &mut PackedGpuSession<'_>,
+    ) -> Result<(), ReferenceError> {
+        let (mlp_report, compile_duration) =
+            gpu_first_session.run_mlp_layer_resident(layer_idx, residual, post_norm_weight)?;
+        metrics.norm_duration += mlp_report.post_norm_gpu_duration;
+        mlp_stage_metrics.swiglu_duration += mlp_report.swiglu_pack_gpu_duration;
+        mlp_stage_metrics.down_duration += mlp_report.down_gpu_duration;
+        mlp_stage_metrics.residual_duration += mlp_report.residual_add_gpu_duration;
+        metrics.mlp_duration += mlp_report.post_norm_gpu_duration
+            + mlp_report.pair_gpu_duration
+            + mlp_report.swiglu_pack_gpu_duration
+            + mlp_report.down_gpu_duration
+            + mlp_report.residual_add_gpu_duration;
+        session.metrics.compile_duration += compile_duration;
+        session.metrics.gpu_duration += mlp_report.post_norm_gpu_duration
+            + mlp_report.pair_gpu_duration
+            + mlp_report.swiglu_pack_gpu_duration
+            + mlp_report.down_gpu_duration
+            + mlp_report.residual_add_gpu_duration;
+        Ok(())
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -7540,60 +7614,27 @@ impl ReferenceModel {
                 && layer_idx + 1 == self.config.num_hidden_layers;
             if use_gpu_mlp_only {
                 if use_gpu_mlp_tail {
-                    let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
-                    let (next_token, mlp_report, tail_report, compile_duration) = gpu_first_session
-                        .run_mlp_layer_to_tail_argmax(
-                            layer_idx,
-                            &residual,
-                            &post_norm_weight,
-                            &final_norm_weight,
-                        )?;
-                    metrics.norm_duration +=
-                        mlp_report.post_norm_gpu_duration + tail_report.final_norm_gpu_duration;
-                    mlp_stage_metrics.swiglu_duration += mlp_report.swiglu_pack_gpu_duration;
-                    mlp_stage_metrics.down_duration += mlp_report.down_gpu_duration;
-                    mlp_stage_metrics.residual_duration += mlp_report.residual_add_gpu_duration;
-                    metrics.mlp_duration += mlp_report.post_norm_gpu_duration
-                        + mlp_report.pair_gpu_duration
-                        + mlp_report.swiglu_pack_gpu_duration
-                        + mlp_report.down_gpu_duration
-                        + mlp_report.residual_add_gpu_duration;
-                    metrics.logits_duration += tail_report.pack_gpu_duration
-                        + tail_report.logits_gpu_duration
-                        + tail_report.logits_download_duration;
-                    session.metrics.compile_duration += compile_duration;
-                    session.metrics.gpu_duration += mlp_report.post_norm_gpu_duration
-                        + mlp_report.pair_gpu_duration
-                        + mlp_report.swiglu_pack_gpu_duration
-                        + mlp_report.down_gpu_duration
-                        + mlp_report.residual_add_gpu_duration
-                        + tail_report.final_norm_gpu_duration
-                        + tail_report.pack_gpu_duration
-                        + tail_report.logits_gpu_duration;
-                    session.metrics.download_duration += tail_report.logits_download_duration;
-                    return Ok(PackedDecodeStepResult::NextToken(next_token));
-                } else {
-                    let (mlp_report, compile_duration) = gpu_first_session.run_mlp_layer_resident(
+                    let next_token = self.run_gpu_mlp_only_tail_argmax(
+                        gpu_first_session,
                         layer_idx,
                         &residual,
                         &post_norm_weight,
+                        mlp_stage_metrics,
+                        metrics,
+                        session,
+                    )?;
+                    return Ok(PackedDecodeStepResult::NextToken(next_token));
+                } else {
+                    self.run_gpu_mlp_only_resident_handoff(
+                        gpu_first_session,
+                        layer_idx,
+                        &residual,
+                        &post_norm_weight,
+                        mlp_stage_metrics,
+                        metrics,
+                        session,
                     )?;
                     resident_hidden_state = Some(ResidentHiddenState::Mlp { layer_idx });
-                    metrics.norm_duration += mlp_report.post_norm_gpu_duration;
-                    mlp_stage_metrics.swiglu_duration += mlp_report.swiglu_pack_gpu_duration;
-                    mlp_stage_metrics.down_duration += mlp_report.down_gpu_duration;
-                    mlp_stage_metrics.residual_duration += mlp_report.residual_add_gpu_duration;
-                    metrics.mlp_duration += mlp_report.post_norm_gpu_duration
-                        + mlp_report.pair_gpu_duration
-                        + mlp_report.swiglu_pack_gpu_duration
-                        + mlp_report.down_gpu_duration
-                        + mlp_report.residual_add_gpu_duration;
-                    session.metrics.compile_duration += compile_duration;
-                    session.metrics.gpu_duration += mlp_report.post_norm_gpu_duration
-                        + mlp_report.pair_gpu_duration
-                        + mlp_report.swiglu_pack_gpu_duration
-                        + mlp_report.down_gpu_duration
-                        + mlp_report.residual_add_gpu_duration;
                     continue;
                 }
             }
