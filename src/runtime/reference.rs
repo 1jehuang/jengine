@@ -2608,8 +2608,45 @@ impl<'a> PackedGpuSession<'a> {
         cols: usize,
         input: &[f32],
     ) -> Result<usize, ReferenceError> {
-        let resident = self.run_projection_resident(tensor_name, rows, cols, input, "argmax")?;
-        self.argmax_projection_output(resident)
+        let prepared = self.prepare_projection_runner(tensor_name, rows, cols)?;
+        let (argmax_index, report) = prepared
+            .runner
+            .borrow_mut()
+            .run_with_argmax(input)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection argmax failed for {tensor_name}: {error}"
+                ))
+            })?;
+        let weight_upload_bytes = usize::from(!prepared.gpu_cache_hit)
+            * (prepared.packed.code_words.len() * std::mem::size_of::<u32>()
+                + prepared.packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        self.account_projection_report(
+            &prepared.packed,
+            cols,
+            prepared.weight_upload_duration,
+            prepared.gpu_cache_hit,
+            &report,
+            0,
+        );
+        self.push_dispatch_trace(
+            tensor_name,
+            "argmax",
+            rows,
+            cols,
+            prepared.pack_cache_hit,
+            prepared.gpu_cache_hit,
+            prepared.compile_duration,
+            prepared.weight_upload_duration,
+            report.upload_duration,
+            report.gpu_duration,
+            report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            0,
+        );
+        Ok(argmax_index)
     }
 
     fn run_projection_argmax_from_packed_activation(
@@ -2620,10 +2657,10 @@ impl<'a> PackedGpuSession<'a> {
         activation: ResidentGpuPackedActivation,
     ) -> Result<usize, ReferenceError> {
         let prepared = self.prepare_projection_runner(tensor_name, rows, cols)?;
-        let mut report = prepared
+        let (argmax_index, report) = prepared
             .runner
             .borrow_mut()
-            .run_resident_from_packed_buffer(
+            .run_with_argmax_from_packed_buffer(
                 &activation.tensor.shared_context,
                 activation.tensor.buffer,
                 activation.tensor.len,
@@ -2631,16 +2668,9 @@ impl<'a> PackedGpuSession<'a> {
             )
             .map_err(|error| {
                 ReferenceError::Decode(format!(
-                    "gpu packed projection chaining failed for {tensor_name}: {error}"
+                    "gpu packed projection argmax failed for {tensor_name}: {error}"
                 ))
             })?;
-        let (argmax_index, logits_download_duration) =
-            prepared.runner.borrow().argmax_output().map_err(|error| {
-                ReferenceError::Decode(format!(
-                    "gpu projection argmax failed for {tensor_name}: {error}"
-                ))
-            })?;
-        report.download_duration = logits_download_duration;
 
         self.metrics.compile_duration += activation.compile_duration;
         self.metrics.upload_duration += activation.upload_duration;
@@ -2783,54 +2813,6 @@ impl<'a> PackedGpuSession<'a> {
             download_bytes,
         );
         Ok(output)
-    }
-
-    fn argmax_projection_output(
-        &mut self,
-        resident: ResidentPackedProjection,
-    ) -> Result<usize, ReferenceError> {
-        let (argmax_index, download_duration) = resident
-            .prepared
-            .runner
-            .borrow()
-            .argmax_output()
-            .map_err(|error| {
-            ReferenceError::Decode(format!(
-                "gpu projection argmax failed for {}: {error}",
-                resident.tensor_name
-            ))
-        })?;
-        let mut report = resident.report;
-        report.download_duration = download_duration;
-        let weight_upload_bytes = usize::from(!resident.prepared.gpu_cache_hit)
-            * (resident.prepared.packed.code_words.len() * std::mem::size_of::<u32>()
-                + resident.prepared.packed.scales.len() * std::mem::size_of::<f32>());
-        let activation_upload_bytes = resident.cols.div_ceil(2) * std::mem::size_of::<u32>();
-        self.account_projection_report(
-            &resident.prepared.packed,
-            resident.cols,
-            resident.prepared.weight_upload_duration,
-            resident.prepared.gpu_cache_hit,
-            &report,
-            0,
-        );
-        self.push_dispatch_trace(
-            &resident.tensor_name,
-            &resident.operation,
-            resident.rows,
-            resident.cols,
-            resident.prepared.pack_cache_hit,
-            resident.prepared.gpu_cache_hit,
-            resident.prepared.compile_duration,
-            resident.prepared.weight_upload_duration,
-            report.upload_duration,
-            report.gpu_duration,
-            report.download_duration,
-            weight_upload_bytes,
-            activation_upload_bytes,
-            0,
-        );
-        Ok(argmax_index)
     }
 
     fn prepare_projection_runner(
