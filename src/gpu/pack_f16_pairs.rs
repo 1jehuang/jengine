@@ -224,6 +224,23 @@ impl CachedGpuPackF16PairsRunner {
                 push_bytes,
             );
             device.cmd_dispatch(command_buffer, packed_len.div_ceil(64) as u32, 1, 1);
+            let output_barrier = [vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(output_buffer.buffer)
+                .offset(0)
+                .size(output_buffer.size)];
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &output_barrier,
+                &[],
+            );
             device.end_command_buffer(command_buffer)?;
         }
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
@@ -287,6 +304,35 @@ impl CachedGpuPackF16PairsRunner {
         })
     }
 
+    pub fn prepare_resident_from_f32_buffer(
+        &mut self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: vk::Buffer,
+        source_len: usize,
+        source_buffer_size: u64,
+    ) -> Result<(), GpuPackF16PairsError> {
+        if source_len != self.len {
+            return Err(GpuPackF16PairsError::Shape(format!(
+                "source len {} does not match destination len {}",
+                source_len, self.len
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuPackF16PairsError::Shape(
+                "resident chaining requires runners to share the same Vulkan context".to_string(),
+            ));
+        }
+        let byte_len = self.len * std::mem::size_of::<f32>();
+        if byte_len as u64 > source_buffer_size {
+            return Err(GpuPackF16PairsError::Shape(format!(
+                "source {} bytes exceeds provided buffer size {}",
+                byte_len, source_buffer_size
+            )));
+        }
+        self.bind_input_buffer(source_buffer);
+        Ok(())
+    }
+
     pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> {
         &self._shared_context
     }
@@ -301,6 +347,10 @@ impl CachedGpuPackF16PairsRunner {
 
     pub fn output_buffer_size(&self) -> u64 {
         self.output_buffer.size
+    }
+
+    pub fn command_buffer_handle(&self) -> vk::CommandBuffer {
+        self.command_buffer
     }
 
     fn submit_and_wait(&self) -> Result<Duration, GpuPackF16PairsError> {

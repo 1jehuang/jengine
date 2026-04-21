@@ -65,6 +65,7 @@ pub struct CachedGpuFullLastLayerRunner {
     final_norm_runner: CachedGpuWeightedRmsNormRunner,
     pack_runner: CachedGpuPackF16PairsRunner,
     logits_runner: CachedGpuPackedMatvecRunner,
+    submit_fence: ash::vk::Fence,
 }
 
 impl CachedGpuFullLastLayerRunner {
@@ -126,6 +127,13 @@ impl CachedGpuFullLastLayerRunner {
             logits_spec.cols,
         )
         .map_err(map_packed_matvec_error)?;
+        let submit_fence = unsafe {
+            post_norm_runner
+                .shared_context()
+                .device
+                .create_fence(&ash::vk::FenceCreateInfo::default(), None)
+        }
+        .map_err(|error| GpuFullLastLayerError(format!("vulkan fence creation failed: {error:?}")))?;
 
         Ok(Self {
             hidden,
@@ -149,6 +157,7 @@ impl CachedGpuFullLastLayerRunner {
             final_norm_runner,
             pack_runner,
             logits_runner,
+            submit_fence,
         })
     }
 
@@ -307,9 +316,8 @@ impl CachedGpuFullLastLayerRunner {
             ));
         }
 
-        let post_norm_report = self
-            .post_norm_runner
-            .run_resident_from_f32_buffer(
+        self.post_norm_runner
+            .prepare_resident_from_f32_buffer(
                 source_context,
                 source_buffer,
                 source_len,
@@ -317,36 +325,32 @@ impl CachedGpuFullLastLayerRunner {
                 post_norm_weight,
             )
             .map_err(map_weighted_rms_norm_error)?;
-        let pair_report = self
-            .pair_runner
-            .run_resident_from_f32_buffer(
+        self.pair_runner
+            .prepare_resident_from_f32_buffer(
                 self.post_norm_runner.shared_context(),
                 self.post_norm_runner.output_buffer_handle(),
                 self.hidden,
                 self.post_norm_runner.output_buffer_size(),
             )
             .map_err(map_packed_matvec_error)?;
-        let swiglu_pack_report = self
-            .swiglu_pack_runner
-            .run_with_output_from_buffer(
+        self.swiglu_pack_runner
+            .prepare_with_output_from_buffer(
                 self.pair_runner.shared_context(),
                 self.pair_runner.output_buffer_handle(),
                 self.intermediate * 2,
                 self.pair_runner.output_buffer_size(),
             )
             .map_err(map_swiglu_pack_error)?;
-        let down_report = self
-            .down_runner
-            .run_resident_from_packed_buffer(
+        self.down_runner
+            .prepare_resident_from_packed_buffer(
                 self.swiglu_pack_runner.shared_context(),
                 self.swiglu_pack_runner.output_buffer_handle(),
                 self.swiglu_pack_runner.packed_len(),
                 self.swiglu_pack_runner.output_buffer_size(),
             )
             .map_err(map_packed_matvec_error)?;
-        let add_report = self
-            .add_runner
-            .run_resident_from_buffers(
+        self.add_runner
+            .prepare_resident_from_buffers(
                 self.down_runner.shared_context(),
                 self.down_runner.output_buffer_handle(),
                 self.hidden,
@@ -356,9 +360,8 @@ impl CachedGpuFullLastLayerRunner {
                 source_buffer_size,
             )
             .map_err(map_vector_add_error)?;
-        let final_norm_report = self
-            .final_norm_runner
-            .run_resident_from_f32_buffer(
+        self.final_norm_runner
+            .prepare_resident_from_f32_buffer(
                 self.add_runner.shared_context(),
                 self.add_runner.output_buffer_handle(),
                 self.hidden,
@@ -366,24 +369,58 @@ impl CachedGpuFullLastLayerRunner {
                 final_norm_weight,
             )
             .map_err(map_weighted_rms_norm_error)?;
-        let pack_report = self
-            .pack_runner
-            .run_resident_from_f32_buffer(
+        self.pack_runner
+            .prepare_resident_from_f32_buffer(
                 self.final_norm_runner.shared_context(),
                 self.final_norm_runner.output_buffer_handle(),
                 self.hidden,
                 self.final_norm_runner.output_buffer_size(),
             )
             .map_err(map_pack_f16_pairs_error)?;
-        let logits_report = self
-            .logits_runner
-            .run_resident_from_packed_buffer(
+        self.logits_runner
+            .prepare_resident_from_packed_buffer(
                 self.pack_runner.shared_context(),
                 self.pack_runner.output_buffer_handle(),
                 self.pack_runner.packed_len(),
                 self.pack_runner.output_buffer_size(),
             )
             .map_err(map_packed_matvec_error)?;
+        let command_buffers = [
+            self.post_norm_runner.command_buffer_handle(),
+            self.pair_runner.command_buffer_handle(),
+            self.swiglu_pack_runner.command_buffer_handle(),
+            self.down_runner.command_buffer_handle(),
+            self.add_runner.command_buffer_handle(),
+            self.final_norm_runner.command_buffer_handle(),
+            self.pack_runner.command_buffer_handle(),
+            self.logits_runner.command_buffer_handle(),
+        ];
+        let submit_info = [ash::vk::SubmitInfo::default().command_buffers(&command_buffers)];
+        let gpu_started = std::time::Instant::now();
+        unsafe {
+            self.post_norm_runner
+                .shared_context()
+                .device
+                .reset_fences(&[self.submit_fence])
+        }
+        .map_err(|error| GpuFullLastLayerError(format!("vulkan fence reset failed: {error:?}")))?;
+        unsafe {
+            self.post_norm_runner.shared_context().device.queue_submit(
+                self.post_norm_runner.shared_context().queue,
+                &submit_info,
+                self.submit_fence,
+            )
+        }
+        .map_err(|error| GpuFullLastLayerError(format!("vulkan queue submit failed: {error:?}")))?;
+        unsafe {
+            self.post_norm_runner.shared_context().device.wait_for_fences(
+                &[self.submit_fence],
+                true,
+                u64::MAX,
+            )
+        }
+        .map_err(|error| GpuFullLastLayerError(format!("vulkan fence wait failed: {error:?}")))?;
+        let total_gpu_duration = gpu_started.elapsed();
         let (argmax_index, logits_download_duration) = self
             .logits_runner
             .argmax_output()
@@ -394,14 +431,14 @@ impl CachedGpuFullLastLayerRunner {
             intermediate: self.intermediate,
             vocab: self.vocab,
             compile_duration: self.compile_duration,
-            post_norm_gpu_duration: post_norm_report.gpu_duration,
-            pair_gpu_duration: pair_report.gpu_duration,
-            swiglu_pack_gpu_duration: swiglu_pack_report.gpu_duration,
-            down_gpu_duration: down_report.gpu_duration,
-            residual_add_gpu_duration: add_report.gpu_duration,
-            final_norm_gpu_duration: final_norm_report.gpu_duration,
-            pack_gpu_duration: pack_report.gpu_duration,
-            logits_gpu_duration: logits_report.gpu_duration,
+            post_norm_gpu_duration: total_gpu_duration,
+            pair_gpu_duration: Duration::ZERO,
+            swiglu_pack_gpu_duration: Duration::ZERO,
+            down_gpu_duration: Duration::ZERO,
+            residual_add_gpu_duration: Duration::ZERO,
+            final_norm_gpu_duration: Duration::ZERO,
+            pack_gpu_duration: Duration::ZERO,
+            logits_gpu_duration: Duration::ZERO,
             logits_download_duration,
             argmax_index,
         })
@@ -426,4 +463,15 @@ fn map_vector_add_error(error: GpuVectorAddError) -> GpuFullLastLayerError {
 
 fn map_swiglu_pack_error(error: GpuSwigluPackF16PairsError) -> GpuFullLastLayerError {
     GpuFullLastLayerError(error.to_string())
+}
+
+impl Drop for CachedGpuFullLastLayerRunner {
+    fn drop(&mut self) {
+        unsafe {
+            self.post_norm_runner
+                .shared_context()
+                .device
+                .destroy_fence(self.submit_fence, None);
+        }
+    }
 }

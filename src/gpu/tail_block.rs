@@ -50,6 +50,7 @@ pub struct CachedGpuTailBlockRunner {
     final_norm_runner: CachedGpuWeightedRmsNormRunner,
     pack_runner: CachedGpuPackF16PairsRunner,
     logits_runner: CachedGpuPackedMatvecRunner,
+    submit_fence: ash::vk::Fence,
 }
 
 impl CachedGpuTailBlockRunner {
@@ -75,6 +76,13 @@ impl CachedGpuTailBlockRunner {
             logits_spec.cols,
         )
         .map_err(map_packed_matvec_error)?;
+        let submit_fence = unsafe {
+            final_norm_runner
+                .shared_context()
+                .device
+                .create_fence(&ash::vk::FenceCreateInfo::default(), None)
+        }
+        .map_err(|error| GpuTailBlockError(format!("vulkan fence creation failed: {error:?}")))?;
         Ok(Self {
             hidden,
             vocab,
@@ -82,6 +90,7 @@ impl CachedGpuTailBlockRunner {
             final_norm_runner,
             pack_runner,
             logits_runner,
+            submit_fence,
         })
     }
 
@@ -196,9 +205,8 @@ impl CachedGpuTailBlockRunner {
                 "tail block resident inputs must match hidden size".to_string(),
             ));
         }
-        let final_norm_report = self
-            .final_norm_runner
-            .run_resident_from_f32_buffer(
+        self.final_norm_runner
+            .prepare_resident_from_f32_buffer(
                 source_context,
                 source_buffer,
                 source_len,
@@ -206,24 +214,53 @@ impl CachedGpuTailBlockRunner {
                 final_norm_weight,
             )
             .map_err(map_weighted_rms_norm_error)?;
-        let pack_report = self
-            .pack_runner
-            .run_resident_from_f32_buffer(
+        self.pack_runner
+            .prepare_resident_from_f32_buffer(
                 self.final_norm_runner.shared_context(),
                 self.final_norm_runner.output_buffer_handle(),
                 self.hidden,
                 self.final_norm_runner.output_buffer_size(),
             )
             .map_err(map_pack_f16_pairs_error)?;
-        let logits_report = self
-            .logits_runner
-            .run_resident_from_packed_buffer(
+        self.logits_runner
+            .prepare_resident_from_packed_buffer(
                 self.pack_runner.shared_context(),
                 self.pack_runner.output_buffer_handle(),
                 self.pack_runner.packed_len(),
                 self.pack_runner.output_buffer_size(),
             )
             .map_err(map_packed_matvec_error)?;
+        let command_buffers = [
+            self.final_norm_runner.command_buffer_handle(),
+            self.pack_runner.command_buffer_handle(),
+            self.logits_runner.command_buffer_handle(),
+        ];
+        let submit_info = [ash::vk::SubmitInfo::default().command_buffers(&command_buffers)];
+        let gpu_started = std::time::Instant::now();
+        unsafe {
+            self.final_norm_runner
+                .shared_context()
+                .device
+                .reset_fences(&[self.submit_fence])
+        }
+        .map_err(|error| GpuTailBlockError(format!("vulkan fence reset failed: {error:?}")))?;
+        unsafe {
+            self.final_norm_runner.shared_context().device.queue_submit(
+                self.final_norm_runner.shared_context().queue,
+                &submit_info,
+                self.submit_fence,
+            )
+        }
+        .map_err(|error| GpuTailBlockError(format!("vulkan queue submit failed: {error:?}")))?;
+        unsafe {
+            self.final_norm_runner.shared_context().device.wait_for_fences(
+                &[self.submit_fence],
+                true,
+                u64::MAX,
+            )
+        }
+        .map_err(|error| GpuTailBlockError(format!("vulkan fence wait failed: {error:?}")))?;
+        let total_gpu_duration = gpu_started.elapsed();
         let (argmax_index, logits_download_duration) = self
             .logits_runner
             .argmax_output()
@@ -232,9 +269,9 @@ impl CachedGpuTailBlockRunner {
             hidden: self.hidden,
             vocab: self.vocab,
             compile_duration: self.compile_duration,
-            final_norm_gpu_duration: final_norm_report.gpu_duration,
-            pack_gpu_duration: pack_report.gpu_duration,
-            logits_gpu_duration: logits_report.gpu_duration,
+            final_norm_gpu_duration: total_gpu_duration,
+            pack_gpu_duration: Duration::ZERO,
+            logits_gpu_duration: Duration::ZERO,
             logits_download_duration,
             argmax_index,
         })
@@ -253,9 +290,8 @@ impl CachedGpuTailBlockRunner {
                 "tail block resident inputs must match hidden size".to_string(),
             ));
         }
-        let final_norm_report = self
-            .final_norm_runner
-            .run_resident_from_f32_buffer(
+        self.final_norm_runner
+            .prepare_resident_from_f32_buffer(
                 source_context,
                 source_buffer,
                 source_len,
@@ -263,24 +299,53 @@ impl CachedGpuTailBlockRunner {
                 final_norm_weight,
             )
             .map_err(map_weighted_rms_norm_error)?;
-        let pack_report = self
-            .pack_runner
-            .run_resident_from_f32_buffer(
+        self.pack_runner
+            .prepare_resident_from_f32_buffer(
                 self.final_norm_runner.shared_context(),
                 self.final_norm_runner.output_buffer_handle(),
                 self.hidden,
                 self.final_norm_runner.output_buffer_size(),
             )
             .map_err(map_pack_f16_pairs_error)?;
-        let logits_report = self
-            .logits_runner
-            .run_resident_from_packed_buffer(
+        self.logits_runner
+            .prepare_resident_from_packed_buffer(
                 self.pack_runner.shared_context(),
                 self.pack_runner.output_buffer_handle(),
                 self.pack_runner.packed_len(),
                 self.pack_runner.output_buffer_size(),
             )
             .map_err(map_packed_matvec_error)?;
+        let command_buffers = [
+            self.final_norm_runner.command_buffer_handle(),
+            self.pack_runner.command_buffer_handle(),
+            self.logits_runner.command_buffer_handle(),
+        ];
+        let submit_info = [ash::vk::SubmitInfo::default().command_buffers(&command_buffers)];
+        let gpu_started = std::time::Instant::now();
+        unsafe {
+            self.final_norm_runner
+                .shared_context()
+                .device
+                .reset_fences(&[self.submit_fence])
+        }
+        .map_err(|error| GpuTailBlockError(format!("vulkan fence reset failed: {error:?}")))?;
+        unsafe {
+            self.final_norm_runner.shared_context().device.queue_submit(
+                self.final_norm_runner.shared_context().queue,
+                &submit_info,
+                self.submit_fence,
+            )
+        }
+        .map_err(|error| GpuTailBlockError(format!("vulkan queue submit failed: {error:?}")))?;
+        unsafe {
+            self.final_norm_runner.shared_context().device.wait_for_fences(
+                &[self.submit_fence],
+                true,
+                u64::MAX,
+            )
+        }
+        .map_err(|error| GpuTailBlockError(format!("vulkan fence wait failed: {error:?}")))?;
+        let total_gpu_duration = gpu_started.elapsed();
         let (logits, logits_download_duration) = self
             .logits_runner
             .read_output()
@@ -291,9 +356,9 @@ impl CachedGpuTailBlockRunner {
                 hidden: self.hidden,
                 vocab: self.vocab,
                 compile_duration: self.compile_duration,
-                final_norm_gpu_duration: final_norm_report.gpu_duration,
-                pack_gpu_duration: pack_report.gpu_duration,
-                logits_gpu_duration: logits_report.gpu_duration,
+                final_norm_gpu_duration: total_gpu_duration,
+                pack_gpu_duration: Duration::ZERO,
+                logits_gpu_duration: Duration::ZERO,
                 logits_download_duration,
             },
         ))
@@ -342,4 +407,15 @@ fn map_weighted_rms_norm_error(error: GpuWeightedRmsNormError) -> GpuTailBlockEr
 
 fn map_pack_f16_pairs_error(error: GpuPackF16PairsError) -> GpuTailBlockError {
     GpuTailBlockError(error.to_string())
+}
+
+impl Drop for CachedGpuTailBlockRunner {
+    fn drop(&mut self) {
+        unsafe {
+            self.final_norm_runner
+                .shared_context()
+                .device
+                .destroy_fence(self.submit_fence, None);
+        }
+    }
 }
