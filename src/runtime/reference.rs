@@ -30,8 +30,9 @@ use crate::runtime::gpu_decode_env::{
     packed_use_gpu_tail, packed_use_mlp_full,
 };
 use crate::runtime::gpu_decode_metrics::{
-    PackedAttentionStageMetrics, PackedDecodeMetrics, PackedGpuSessionMetrics,
-    PackedMlpStageMetrics,
+    AttentionProjectionMixMetrics, HybridProjectionDecodeMetrics, MlpProjectionMixMetrics,
+    PackedAttentionStageMetrics, PackedDecodeMetrics, PackedDecodeValidationReport,
+    PackedGpuSessionMetrics, PackedMlpStageMetrics,
 };
 use crate::runtime::gpu_decode_model_state::{HybridQProjCache, LayerTensorNames};
 use crate::runtime::gpu_decode_output::{PackedDecodeResult, PackedDispatchTrace};
@@ -291,94 +292,6 @@ type CachedSwigluPackF16PairsGpuRunner = Rc<RefCell<CachedGpuSwigluPackF16PairsR
 #[allow(dead_code)]
 type CachedSwigluPackF16PairsGpuCacheEntry = (CachedSwigluPackF16PairsGpuRunner, Duration, bool);
 type ProjectionTripletOutputs = (Vec<f32>, Vec<f32>, Vec<f32>);
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct AttentionProjectionMixMetrics {
-    pub enabled_projections: String,
-    pub total_duration: Duration,
-    pub pack_duration: Duration,
-    pub compile_duration: Duration,
-    pub upload_duration: Duration,
-    pub gpu_duration: Duration,
-    pub download_duration: Duration,
-    pub max_abs_diff: f32,
-    pub mean_abs_diff: f32,
-}
-
-impl AttentionProjectionMixMetrics {
-    pub fn summarize(&self) -> String {
-        format!(
-            "enabled={} total_ms={:.3} pack_ms={:.3} compile_ms={:.3} upload_ms={:.3} gpu_ms={:.3} download_ms={:.3} max_abs_diff={:.6} mean_abs_diff={:.6}",
-            self.enabled_projections,
-            self.total_duration.as_secs_f64() * 1_000.0,
-            self.pack_duration.as_secs_f64() * 1_000.0,
-            self.compile_duration.as_secs_f64() * 1_000.0,
-            self.upload_duration.as_secs_f64() * 1_000.0,
-            self.gpu_duration.as_secs_f64() * 1_000.0,
-            self.download_duration.as_secs_f64() * 1_000.0,
-            self.max_abs_diff,
-            self.mean_abs_diff,
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct MlpProjectionMixMetrics {
-    pub enabled_projections: String,
-    pub total_duration: Duration,
-    pub pack_duration: Duration,
-    pub compile_duration: Duration,
-    pub upload_duration: Duration,
-    pub gpu_duration: Duration,
-    pub download_duration: Duration,
-    pub max_abs_diff: f32,
-    pub mean_abs_diff: f32,
-}
-
-impl MlpProjectionMixMetrics {
-    pub fn summarize(&self) -> String {
-        format!(
-            "enabled={} total_ms={:.3} pack_ms={:.3} compile_ms={:.3} upload_ms={:.3} gpu_ms={:.3} download_ms={:.3} max_abs_diff={:.6} mean_abs_diff={:.6}",
-            self.enabled_projections,
-            self.total_duration.as_secs_f64() * 1_000.0,
-            self.pack_duration.as_secs_f64() * 1_000.0,
-            self.compile_duration.as_secs_f64() * 1_000.0,
-            self.upload_duration.as_secs_f64() * 1_000.0,
-            self.gpu_duration.as_secs_f64() * 1_000.0,
-            self.download_duration.as_secs_f64() * 1_000.0,
-            self.max_abs_diff,
-            self.mean_abs_diff,
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct HybridProjectionDecodeMetrics {
-    pub enabled_projections: String,
-    pub total_duration: Duration,
-    pub pack_duration: Duration,
-    pub compile_duration: Duration,
-    pub upload_duration: Duration,
-    pub gpu_duration: Duration,
-    pub download_duration: Duration,
-    pub output_text: String,
-}
-
-impl HybridProjectionDecodeMetrics {
-    pub fn summarize(&self) -> String {
-        format!(
-            "enabled={} total_ms={:.3} pack_ms={:.3} compile_ms={:.3} upload_ms={:.3} gpu_ms={:.3} download_ms={:.3} output={}",
-            self.enabled_projections,
-            self.total_duration.as_secs_f64() * 1_000.0,
-            self.pack_duration.as_secs_f64() * 1_000.0,
-            self.compile_duration.as_secs_f64() * 1_000.0,
-            self.upload_duration.as_secs_f64() * 1_000.0,
-            self.gpu_duration.as_secs_f64() * 1_000.0,
-            self.download_duration.as_secs_f64() * 1_000.0,
-            self.output_text,
-        )
-    }
-}
 
 pub struct PersistentPackedDecodeSession<'a> {
     model: &'a ReferenceModel,
@@ -665,23 +578,6 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
             total_duration,
             output_token_ids,
             output_text,
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct PackedDecodeValidationReport {
-    pub enabled_projections: String,
-    pub prompt_tokens: usize,
-    pub max_abs_diff: f32,
-    pub mean_abs_diff: f32,
-}
-
-impl PackedDecodeValidationReport {
-    pub fn summarize(&self) -> String {
-        format!(
-            "enabled={} prompt_tokens={} max_abs_diff={:.6} mean_abs_diff={:.6}",
-            self.enabled_projections, self.prompt_tokens, self.max_abs_diff, self.mean_abs_diff,
         )
     }
 }
