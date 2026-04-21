@@ -940,6 +940,21 @@ impl<'a> GpuFirstRunnerCache<'a> {
             })
     }
 
+    fn append_gpu_kv_key_tensor_and_value_host(
+        &mut self,
+        layer_idx: usize,
+        key: &GpuResidentBuffer,
+        value: &[f32],
+    ) -> Result<(), ReferenceError> {
+        self.ensure_gpu_kv_cache(layer_idx)?
+            .append_key_from_tensor_and_value_host(key, value)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu-first resident key kv append failed for layer {layer_idx}: {error}"
+                ))
+            })
+    }
+
     fn gpu_kv_state(
         &self,
         layer_idx: usize,
@@ -1036,7 +1051,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         ))
     }
 
-    fn run_qk_rope_to_host(
+    fn run_qk_rope_query_to_host_key_resident(
         &mut self,
         q: &[f32],
         k: &[f32],
@@ -1044,12 +1059,17 @@ impl<'a> GpuFirstRunnerCache<'a> {
         k_weight: &[f32],
         cos: &[f32],
         sin: &[f32],
-    ) -> Result<((Vec<f32>, Vec<f32>), GpuQkRopeReport, Duration), ReferenceError> {
+    ) -> Result<((Vec<f32>, GpuResidentBuffer), GpuQkRopeReport, Duration), ReferenceError> {
         let (compile_duration, runner) = self.ensure_qk_rope_runner()?;
-        let ((q_out, k_out), report) = runner
-            .run_with_output(q, k, q_weight, k_weight, cos, sin)
+        let mut report = runner
+            .run_resident(q, k, q_weight, k_weight, cos, sin)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-        Ok(((q_out, k_out), report, compile_duration))
+        let (q_out, download_duration) = runner
+            .read_query_output()
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        report.download_duration = download_duration;
+        let key_out = runner.key_resident_output();
+        Ok(((q_out, key_out), report, compile_duration))
     }
 
     fn ensure_raw_f32_projection_runner(
@@ -5950,9 +5970,10 @@ impl ReferenceModel {
             let started_at = Instant::now();
             let q_norm_weight = self.load_vector_f32_resolved(&layer_tensors.q_norm_weight)?;
             let k_norm_weight = self.load_vector_f32_resolved(&layer_tensors.k_norm_weight)?;
+            let mut kv_appended_on_gpu = false;
             if use_gpu_attention_block {
-                let ((q_out, k_out), qk_rope_report, compile_duration) =
-                    gpu_first_session.run_qk_rope_to_host(
+                let ((q_out, key_out), qk_rope_report, compile_duration) =
+                    gpu_first_session.run_qk_rope_query_to_host_key_resident(
                         &q,
                         &k,
                         &q_norm_weight,
@@ -5961,7 +5982,9 @@ impl ReferenceModel {
                         &sin,
                     )?;
                 q = q_out;
-                k = k_out;
+                gpu_first_session
+                    .append_gpu_kv_key_tensor_and_value_host(layer_idx, &key_out, &v)?;
+                kv_appended_on_gpu = true;
                 metrics.norm_duration += qk_rope_report.upload_duration
                     + qk_rope_report.gpu_duration
                     + qk_rope_report.download_duration;
@@ -5976,7 +5999,7 @@ impl ReferenceModel {
                 session.metrics.upload_bytes +=
                     (q.len() + k.len() + q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
                         * std::mem::size_of::<f32>();
-                session.metrics.download_bytes += (q.len() + k.len()) * std::mem::size_of::<f32>();
+                session.metrics.download_bytes += q.len() * std::mem::size_of::<f32>();
             } else {
                 apply_head_rms_norm_weighted(
                     &mut q,
@@ -6007,7 +6030,7 @@ impl ReferenceModel {
                 session.push_dense_stage_trace("qk_norm_rope", &layer_tensors.q_norm_weight, elapsed);
             }
 
-            if use_gpu_attention_block {
+            if use_gpu_attention_block && !kv_appended_on_gpu {
                 gpu_first_session.append_gpu_kv(layer_idx, &k, &v)?;
             }
 

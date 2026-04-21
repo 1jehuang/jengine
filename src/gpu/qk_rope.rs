@@ -174,7 +174,7 @@ impl CachedGpuQkRopeRunner {
         Ok((Self { _shared_context: context, device, queue, query_len, key_len, head_dim, descriptor_set_layout, pipeline_layout, shader_module, pipeline, descriptor_pool, _descriptor_set: descriptor_set, command_pool, command_buffer, fence, q_buffer, k_buffer, q_weight_buffer, k_weight_buffer, cos_buffer, sin_buffer, q_out_buffer, k_out_buffer }, compile_started.elapsed()))
     }
 
-    pub fn run_with_output(
+    pub fn run_resident(
         &mut self,
         q: &[f32],
         k: &[f32],
@@ -182,7 +182,7 @@ impl CachedGpuQkRopeRunner {
         k_weight: &[f32],
         cos: &[f32],
         sin: &[f32],
-    ) -> Result<((Vec<f32>, Vec<f32>), GpuQkRopeReport), GpuQkRopeError> {
+    ) -> Result<GpuQkRopeReport, GpuQkRopeError> {
         if q.len() != self.query_len || k.len() != self.key_len || q_weight.len() != self.head_dim || k_weight.len() != self.head_dim || cos.len() != self.head_dim || sin.len() != self.head_dim {
             return Err(GpuQkRopeError::Shape("qk rope input shapes must match runner dimensions".to_string()));
         }
@@ -195,11 +195,30 @@ impl CachedGpuQkRopeRunner {
         write_f32_buffer(&self.sin_buffer, sin)?;
         let upload_duration = upload_started.elapsed();
         let gpu_duration = self.submit_and_wait()?;
+        Ok(GpuQkRopeReport { query_len: self.query_len, key_len: self.key_len, compile_duration: Duration::ZERO, upload_duration, gpu_duration, download_duration: Duration::ZERO })
+    }
+
+    pub fn run_with_output(
+        &mut self,
+        q: &[f32],
+        k: &[f32],
+        q_weight: &[f32],
+        k_weight: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<((Vec<f32>, Vec<f32>), GpuQkRopeReport), GpuQkRopeError> {
+        let mut report = self.run_resident(q, k, q_weight, k_weight, cos, sin)?;
         let download_started = Instant::now();
         let q_out = read_f32_buffer(&self.q_out_buffer, self.query_len)?;
         let k_out = read_f32_buffer(&self.k_out_buffer, self.key_len)?;
-        let download_duration = download_started.elapsed();
-        Ok(((q_out, k_out), GpuQkRopeReport { query_len: self.query_len, key_len: self.key_len, compile_duration: Duration::ZERO, upload_duration, gpu_duration, download_duration }))
+        report.download_duration = download_started.elapsed();
+        Ok(((q_out, k_out), report))
+    }
+
+    pub fn read_query_output(&self) -> Result<(Vec<f32>, Duration), GpuQkRopeError> {
+        let download_started = Instant::now();
+        let q_out = read_f32_buffer(&self.q_out_buffer, self.query_len)?;
+        Ok((q_out, download_started.elapsed()))
     }
 
     pub fn query_resident_output(&self) -> GpuResidentBuffer {

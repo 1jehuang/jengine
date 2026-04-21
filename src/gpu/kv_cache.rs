@@ -3,6 +3,7 @@ use std::sync::Arc;
 use ash::{Device, Instance, vk};
 
 use crate::gpu::packed_matvec::SharedGpuPackedContext;
+use crate::gpu::resident_buffer::GpuResidentBuffer;
 
 #[derive(Debug)]
 pub enum GpuKvCacheError {
@@ -32,6 +33,9 @@ impl From<vk::Result> for GpuKvCacheError {
 pub struct GpuKvCache {
     _shared_context: Arc<SharedGpuPackedContext>,
     device: Device,
+    queue: vk::Queue,
+    command_pool: vk::CommandPool,
+    fence: vk::Fence,
     tokens_capacity: usize,
     kv_width: usize,
     len_tokens: usize,
@@ -52,6 +56,8 @@ impl GpuKvCache {
         }
         let instance = context.instance.clone();
         let device = context.device.clone();
+        let queue = context.queue;
+        let queue_family_index = context.queue_family_index;
         let physical_device = context.physical_device;
         let bytes = (tokens_capacity * kv_width * std::mem::size_of::<f32>()) as u64;
         let key_buffer = create_host_visible_buffer(
@@ -70,9 +76,17 @@ impl GpuKvCache {
         )?;
         zero_buffer(&key_buffer, bytes as usize)?;
         zero_buffer(&value_buffer, bytes as usize)?;
+        let command_pool_ci = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let command_pool = unsafe { device.create_command_pool(&command_pool_ci, None)? };
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
         Ok(Self {
             _shared_context: context,
             device,
+            queue,
+            command_pool,
+            fence,
             tokens_capacity,
             kv_width,
             len_tokens: 0,
@@ -98,6 +112,37 @@ impl GpuKvCache {
         }
         let offset_bytes = self.len_tokens * self.kv_width * std::mem::size_of::<f32>();
         write_f32_buffer_at(&self.key_buffer, offset_bytes, key)?;
+        write_f32_buffer_at(&self.value_buffer, offset_bytes, value)?;
+        self.len_tokens += 1;
+        Ok(())
+    }
+
+    pub fn append_key_from_tensor_and_value_host(
+        &mut self,
+        key: &GpuResidentBuffer,
+        value: &[f32],
+    ) -> Result<(), GpuKvCacheError> {
+        if key.len != self.kv_width || value.len() != self.kv_width {
+            return Err(GpuKvCacheError::Shape(format!(
+                "kv append expects key/value width {} but got {}/{}",
+                self.kv_width,
+                key.len,
+                value.len()
+            )));
+        }
+        if self.len_tokens >= self.tokens_capacity {
+            return Err(GpuKvCacheError::Shape(format!(
+                "kv cache capacity {} exceeded",
+                self.tokens_capacity
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, &key.shared_context) {
+            return Err(GpuKvCacheError::Shape(
+                "resident key append requires matching Vulkan context".to_string(),
+            ));
+        }
+        let offset_bytes = self.len_tokens * self.kv_width * std::mem::size_of::<f32>();
+        self.copy_into_key_slot(key.buffer, key.buffer_size, offset_bytes)?;
         write_f32_buffer_at(&self.value_buffer, offset_bytes, value)?;
         self.len_tokens += 1;
         Ok(())
@@ -134,11 +179,56 @@ impl GpuKvCache {
     pub fn snapshot_values(&self) -> Result<Vec<f32>, GpuKvCacheError> {
         read_f32_prefix(&self.value_buffer, self.len_tokens * self.kv_width)
     }
+
+    fn copy_into_key_slot(
+        &self,
+        source_buffer: vk::Buffer,
+        source_buffer_size: u64,
+        offset_bytes: usize,
+    ) -> Result<(), GpuKvCacheError> {
+        let byte_len = self.kv_width * std::mem::size_of::<f32>();
+        let end = offset_bytes + byte_len;
+        if byte_len as u64 > source_buffer_size || end as u64 > self.key_buffer.size {
+            return Err(GpuKvCacheError::Shape(format!(
+                "kv key copy [{}..{}) exceeds source {} or destination {}",
+                offset_bytes, end, source_buffer_size, self.key_buffer.size
+            )));
+        }
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let copy_command = unsafe { self.device.allocate_command_buffers(&alloc)?[0] };
+        unsafe {
+            self.device
+                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
+            let region = [vk::BufferCopy::default()
+                .src_offset(0)
+                .dst_offset(offset_bytes as u64)
+                .size(byte_len as u64)];
+            self.device
+                .cmd_copy_buffer(copy_command, source_buffer, self.key_buffer.buffer, &region);
+            self.device.end_command_buffer(copy_command)?;
+            self.device.reset_fences(&[self.fence])?;
+        }
+        let submit_info =
+            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.device
+                .free_command_buffers(self.command_pool, &[copy_command]);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for GpuKvCache {
     fn drop(&mut self) {
         unsafe {
+            self.device.destroy_fence(self.fence, None);
+            self.device.destroy_command_pool(self.command_pool, None);
             destroy_buffer(&self.device, self.key_buffer);
             destroy_buffer(&self.device, self.value_buffer);
         }
