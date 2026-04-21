@@ -728,6 +728,19 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
         self.inner.gpu_first_session.full_last_layer_block.is_some()
     }
 
+    pub(crate) fn embedding_lookup_output(
+        &mut self,
+        token_id: usize,
+    ) -> Result<Option<Vec<f32>>, ReferenceError> {
+        let Some(runner) = self.inner.gpu_first_session.embedding_lookup_runner.as_mut() else {
+            return Ok(None);
+        };
+        let (output, _) = runner.borrow_mut().run_with_output(token_id).map_err(|error| {
+            ReferenceError::Decode(format!("gpu embedding lookup failed: {error}"))
+        })?;
+        Ok(Some(output))
+    }
+
     pub fn finish_metrics(
         self,
         enabled_projections: String,
@@ -9054,16 +9067,10 @@ mod tests {
         let PackedDecodeSession::GpuFirst(mut session) = session else {
             panic!("gpu-first session should be selected when gpu embedding is enabled");
         };
-        let runner = session
-            .inner
-            .gpu_first_session
-            .embedding_lookup_runner
-            .as_mut()
+        let gpu_hidden = session
+            .embedding_lookup_output(2)
+            .expect("gpu embedding lookup should succeed")
             .expect("embedding runner should be created");
-        let (gpu_hidden, _) = runner
-            .borrow_mut()
-            .run_with_output(2)
-            .expect("gpu embedding lookup should succeed");
         assert_eq!(gpu_hidden, reference_hidden);
     }
 
