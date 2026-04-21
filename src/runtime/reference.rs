@@ -917,7 +917,7 @@ struct GpuFirstRunnerCache<'a> {
     embedding_lookup_runner: Option<CachedGpuEmbeddingLookupRunner>,
     input_norm_runner: Option<CachedGpuWeightedRmsNormRunner>,
     qk_rope_runner: Option<CachedGpuQkRopeRunner>,
-    raw_f32_projection_runners: HashMap<String, CachedGpuPackedMatvecRunner>,
+    raw_f32_projection_runners: HashMap<String, CachedProjectionGpuRunner>,
     gpu_kv_caches: HashMap<usize, GpuKvCache>,
     attention_blocks: HashMap<usize, CachedAttentionBlockGpuRunner>,
     mlp_blocks: HashMap<usize, CachedMlpBlockGpuRunner>,
@@ -1159,32 +1159,16 @@ impl<'a> GpuFirstRunnerCache<'a> {
         &mut self,
         cache_key: &str,
         packed: &PackedProjectionCache,
-    ) -> Result<(Duration, &mut CachedGpuPackedMatvecRunner), ReferenceError> {
-        let compile_duration = if self.raw_f32_projection_runners.contains_key(cache_key) {
-            Duration::ZERO
-        } else {
-            let context = self.get_or_create_shared_context()?;
-            let (runner, compile_duration) =
-                CachedGpuPackedMatvecRunner::new_with_context_and_input_mode(
-                    context,
-                    &packed.code_words,
-                    &packed.scales,
-                    packed.group_size,
-                    packed.rows,
-                    packed.cols,
-                    PackedRunnerInputMode::RawF32,
-                )
-                .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-            self.raw_f32_projection_runners
-                .insert(cache_key.to_string(), runner);
-            compile_duration
-        };
-        Ok((
-            compile_duration,
-            self.raw_f32_projection_runners
-                .get_mut(cache_key)
-                .expect("raw-f32 projection runner should exist after creation"),
-        ))
+    ) -> Result<(Duration, CachedProjectionGpuRunner), ReferenceError> {
+        if let Some(runner) = self.raw_f32_projection_runners.get(cache_key).cloned() {
+            return Ok((Duration::ZERO, runner));
+        }
+        let (runner, compile_duration, _weight_upload_duration, _gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu_raw_f32(cache_key, packed)?;
+        self.raw_f32_projection_runners
+            .insert(cache_key.to_string(), runner.clone());
+        Ok((compile_duration, runner))
     }
 
     fn ensure_raw_f32_single_projection_runner(
@@ -1193,7 +1177,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         tensor_name: &str,
         rows: usize,
         cols: usize,
-    ) -> Result<(Duration, &mut CachedGpuPackedMatvecRunner), ReferenceError> {
+    ) -> Result<(Duration, CachedProjectionGpuRunner), ReferenceError> {
         let (packed, _, _) = self.model.get_or_create_projection_cache(tensor_name, rows, cols)?;
         self.ensure_raw_f32_projection_runner(cache_key, &packed)
     }
@@ -1278,9 +1262,11 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let (qkv_compile_duration, qkv_runner) =
             self.ensure_raw_f32_projection_runner(&cache_key, &packed)?;
         let qkv_report = qkv_runner
+            .borrow_mut()
             .run_resident_from_f32_tensor(&norm_context)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let (combined, qkv_download_duration) = qkv_runner
+            .borrow()
             .read_output()
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let qkv_report = crate::gpu::packed_matvec::GpuPackedMatvecReport {
@@ -1356,13 +1342,14 @@ impl<'a> GpuFirstRunnerCache<'a> {
             hidden_size,
         )?;
         let q_report = q_runner
+            .borrow_mut()
             .run_resident_from_f32_tensor(&norm_context)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let q_tensor = GpuResidentBuffer::new(
-            q_runner.shared_context().clone(),
-            q_runner.output_buffer_handle(),
+            q_runner.borrow().shared_context().clone(),
+            q_runner.borrow().output_buffer_handle(),
             hidden_size,
-            q_runner.output_buffer_size(),
+            q_runner.borrow().output_buffer_size(),
         );
 
         let (k_compile_duration, k_runner) = self.ensure_raw_f32_single_projection_runner(
@@ -1372,13 +1359,14 @@ impl<'a> GpuFirstRunnerCache<'a> {
             hidden_size,
         )?;
         let k_report = k_runner
+            .borrow_mut()
             .run_resident_from_f32_tensor(&norm_context)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let k_tensor = GpuResidentBuffer::new(
-            k_runner.shared_context().clone(),
-            k_runner.output_buffer_handle(),
+            k_runner.borrow().shared_context().clone(),
+            k_runner.borrow().output_buffer_handle(),
             kv_rows,
-            k_runner.output_buffer_size(),
+            k_runner.borrow().output_buffer_size(),
         );
 
         let (v_compile_duration, v_runner) = self.ensure_raw_f32_single_projection_runner(
@@ -1388,13 +1376,14 @@ impl<'a> GpuFirstRunnerCache<'a> {
             hidden_size,
         )?;
         let v_report = v_runner
+            .borrow_mut()
             .run_resident_from_f32_tensor(&norm_context)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let v_tensor = GpuResidentBuffer::new(
-            v_runner.shared_context().clone(),
-            v_runner.output_buffer_handle(),
+            v_runner.borrow().shared_context().clone(),
+            v_runner.borrow().output_buffer_handle(),
             kv_rows,
-            v_runner.output_buffer_size(),
+            v_runner.borrow().output_buffer_size(),
         );
 
         let qkv_report = crate::gpu::packed_matvec::GpuPackedMatvecReport {
@@ -1565,9 +1554,11 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let (qkv_compile_duration, qkv_runner) =
             self.ensure_raw_f32_projection_runner(&cache_key, &packed)?;
         let qkv_report = qkv_runner
+            .borrow_mut()
             .run_resident_from_f32_tensor(&norm_context)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let (combined, qkv_download_duration) = qkv_runner
+            .borrow()
             .read_output()
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let qkv_report = crate::gpu::packed_matvec::GpuPackedMatvecReport {
@@ -1635,13 +1626,14 @@ impl<'a> GpuFirstRunnerCache<'a> {
             hidden_size,
         )?;
         let q_report = q_runner
+            .borrow_mut()
             .run_resident_from_f32_tensor(&norm_context)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let q_tensor = GpuResidentBuffer::new(
-            q_runner.shared_context().clone(),
-            q_runner.output_buffer_handle(),
+            q_runner.borrow().shared_context().clone(),
+            q_runner.borrow().output_buffer_handle(),
             hidden_size,
-            q_runner.output_buffer_size(),
+            q_runner.borrow().output_buffer_size(),
         );
 
         let (k_compile_duration, k_runner) = self.ensure_raw_f32_single_projection_runner(
@@ -1651,13 +1643,14 @@ impl<'a> GpuFirstRunnerCache<'a> {
             hidden_size,
         )?;
         let k_report = k_runner
+            .borrow_mut()
             .run_resident_from_f32_tensor(&norm_context)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let k_tensor = GpuResidentBuffer::new(
-            k_runner.shared_context().clone(),
-            k_runner.output_buffer_handle(),
+            k_runner.borrow().shared_context().clone(),
+            k_runner.borrow().output_buffer_handle(),
             kv_rows,
-            k_runner.output_buffer_size(),
+            k_runner.borrow().output_buffer_size(),
         );
 
         let (v_compile_duration, v_runner) = self.ensure_raw_f32_single_projection_runner(
@@ -1667,13 +1660,14 @@ impl<'a> GpuFirstRunnerCache<'a> {
             hidden_size,
         )?;
         let v_report = v_runner
+            .borrow_mut()
             .run_resident_from_f32_tensor(&norm_context)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let v_tensor = GpuResidentBuffer::new(
-            v_runner.shared_context().clone(),
-            v_runner.output_buffer_handle(),
+            v_runner.borrow().shared_context().clone(),
+            v_runner.borrow().output_buffer_handle(),
             kv_rows,
-            v_runner.output_buffer_size(),
+            v_runner.borrow().output_buffer_size(),
         );
 
         let qkv_report = crate::gpu::packed_matvec::GpuPackedMatvecReport {
