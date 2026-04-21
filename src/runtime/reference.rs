@@ -1284,26 +1284,8 @@ impl<'a> GpuFirstRunnerCache<'a> {
         }
     }
 
-    fn read_hidden_output(
-        &mut self,
-        state: ResidentHiddenState,
-    ) -> Result<(Vec<f32>, Duration), ReferenceError> {
-        match state {
-            ResidentHiddenState::Mlp { layer_idx } => self
-                .mlp_blocks
-                .get_mut(&layer_idx)
-                .ok_or_else(|| {
-                    ReferenceError::Decode(format!(
-                        "gpu-first mlp block output missing for layer {layer_idx}"
-                    ))
-                })?
-                .read_output()
-                .map_err(|error| ReferenceError::Decode(error.to_string())),
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
-    fn run_layer_input_norm_qkv_to_host_from_hidden_resident(
+    fn run_layer_input_norm_qkv_from_hidden_resident(
         &mut self,
         state: ResidentHiddenState,
         layer_idx: usize,
@@ -1314,13 +1296,12 @@ impl<'a> GpuFirstRunnerCache<'a> {
         kv_rows: usize,
     ) -> Result<
         (
-            Vec<f32>,
+            GpuResidentBuffer,
             Vec<f32>,
             Vec<f32>,
             Vec<f32>,
             GpuWeightedRmsNormReport,
             crate::gpu::packed_matvec::GpuPackedMatvecReport,
-            Duration,
             Duration,
         ),
         ReferenceError,
@@ -1365,19 +1346,17 @@ impl<'a> GpuFirstRunnerCache<'a> {
             download_duration: qkv_download_duration,
             ..qkv_report
         };
-        let (hidden, hidden_download_duration) = self.read_hidden_output(state)?;
         let (q, tail) = combined.split_at(self.model.config.hidden_size);
         let (k, v) = tail.split_at(kv_rows);
 
         Ok((
-            hidden,
+            hidden_resident,
             q.to_vec(),
             k.to_vec(),
             v.to_vec(),
             norm_report,
             qkv_report,
             norm_compile_duration + qkv_compile_duration,
-            hidden_download_duration,
         ))
     }
 
@@ -1737,6 +1716,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         seq_len: usize,
         q: Option<&[f32]>,
         query_resident: Option<&GpuResidentBuffer>,
+        residual_resident: Option<&GpuResidentBuffer>,
         keys: &[f32],
         values: &[f32],
         residual: &[f32],
@@ -1750,9 +1730,25 @@ impl<'a> GpuFirstRunnerCache<'a> {
             let (key_tensor, value_tensor) = kv_tensors
                 .as_ref()
                 .expect("gpu kv tensors should exist when resident query is provided");
-            attention_block
-                .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
-                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+            if let Some(residual_resident) = residual_resident {
+                attention_block
+                    .run_with_resident_query_kv_and_residual(
+                        query_resident,
+                        key_tensor,
+                        value_tensor,
+                        residual_resident,
+                    )
+                    .map_err(|error| ReferenceError::Decode(error.to_string()))?
+            } else {
+                attention_block
+                    .run_with_resident_query_and_kv(
+                        query_resident,
+                        key_tensor,
+                        value_tensor,
+                        residual,
+                    )
+                    .map_err(|error| ReferenceError::Decode(error.to_string()))?
+            }
         } else if let Some((
             key_buffer,
             key_len,
@@ -6221,17 +6217,15 @@ impl ReferenceModel {
                 self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
             let resident_hidden_entry_qkv =
                 if layer_idx > 0 && use_attention_qkv && resident_hidden_state.is_some() {
-                    Some(
-                        gpu_first_session.run_layer_input_norm_qkv_to_host_from_hidden_resident(
-                            resident_hidden_state.expect("resident hidden state should exist"),
-                            layer_idx,
-                            &input_norm_weight,
-                            &layer_tensors.q_proj_weight,
-                            &layer_tensors.k_proj_weight,
-                            &layer_tensors.v_proj_weight,
-                            self.config.num_key_value_heads * self.config.head_dim,
-                        )?,
-                    )
+                    Some(gpu_first_session.run_layer_input_norm_qkv_from_hidden_resident(
+                        resident_hidden_state.expect("resident hidden state should exist"),
+                        layer_idx,
+                        &input_norm_weight,
+                        &layer_tensors.q_proj_weight,
+                        &layer_tensors.k_proj_weight,
+                        &layer_tensors.v_proj_weight,
+                        self.config.num_key_value_heads * self.config.head_dim,
+                    )?)
                 } else {
                     None
                 };
@@ -6300,33 +6294,28 @@ impl ReferenceModel {
                     + qkv_report.download_duration;
                 vec![0.0; self.config.hidden_size]
             } else if let Some((
-                gpu_hidden,
+                _hidden_resident,
                 _q,
                 _k,
                 _v,
                 norm_report,
                 qkv_report,
                 compile_duration,
-                hidden_download_duration,
             )) = resident_hidden_entry_qkv.as_ref()
             {
-                hidden = gpu_hidden.clone();
                 session.metrics.compile_duration += *compile_duration;
                 session.metrics.activation_upload_duration +=
                     norm_report.upload_duration + qkv_report.upload_duration;
                 session.metrics.upload_duration +=
                     norm_report.upload_duration + qkv_report.upload_duration;
                 session.metrics.gpu_duration += norm_report.gpu_duration + qkv_report.gpu_duration;
-                session.metrics.download_duration += *hidden_download_duration
-                    + norm_report.download_duration
-                    + qkv_report.download_duration;
+                session.metrics.download_duration +=
+                    norm_report.download_duration + qkv_report.download_duration;
                 session.metrics.activation_upload_bytes +=
                     self.config.hidden_size * std::mem::size_of::<f32>();
                 session.metrics.upload_bytes +=
                     self.config.hidden_size * std::mem::size_of::<f32>();
-                session.metrics.download_bytes += self.config.hidden_size
-                    * std::mem::size_of::<f32>()
-                    + (self.config.hidden_size
+                session.metrics.download_bytes += (self.config.hidden_size
                         + 2 * (self.config.num_key_value_heads * self.config.head_dim))
                         * std::mem::size_of::<f32>();
                 metrics.norm_duration += norm_report.upload_duration
@@ -6385,6 +6374,9 @@ impl ReferenceModel {
                 hidden_states
             };
             let residual = hidden.clone();
+            let residual_resident = resident_hidden_entry_qkv
+                .as_ref()
+                .map(|(hidden_resident, ..)| hidden_resident.clone());
 
             let started_at = Instant::now();
             let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
@@ -6649,6 +6641,7 @@ impl ReferenceModel {
                         position + 1,
                         Some(&q),
                         q_resident.as_ref(),
+                        residual_resident.as_ref(),
                         &layer_cache.keys,
                         &layer_cache.values,
                         &residual,
