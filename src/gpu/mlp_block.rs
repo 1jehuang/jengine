@@ -46,6 +46,7 @@ pub struct CachedGpuMlpBlockRunner {
     down_runner: CachedGpuPackedMatvecRunner,
     residual_seed_runner: CachedGpuVectorAddRunner,
     add_runner: CachedGpuVectorAddRunner,
+    submit_fence: ash::vk::Fence,
 }
 
 impl CachedGpuMlpBlockRunner {
@@ -86,8 +87,14 @@ impl CachedGpuMlpBlockRunner {
         let (residual_seed_runner, residual_compile) =
             CachedGpuVectorAddRunner::new_with_context(context.clone(), hidden)
                 .map_err(map_vector_add_error)?;
-        let (add_runner, add_compile) = CachedGpuVectorAddRunner::new_with_context(context, hidden)
+        let (add_runner, add_compile) = CachedGpuVectorAddRunner::new_with_context(context.clone(), hidden)
             .map_err(map_vector_add_error)?;
+        let submit_fence = unsafe {
+            context
+                .device
+                .create_fence(&ash::vk::FenceCreateInfo::default(), None)
+        }
+        .map_err(|error| GpuMlpBlockError(format!("vulkan fence creation failed: {error:?}")))?;
         Ok(Self {
             hidden,
             intermediate,
@@ -103,6 +110,7 @@ impl CachedGpuMlpBlockRunner {
             down_runner,
             residual_seed_runner,
             add_runner,
+            submit_fence,
         })
     }
 
@@ -189,9 +197,8 @@ impl CachedGpuMlpBlockRunner {
                 "mlp block resident inputs must match hidden size".to_string(),
             ));
         }
-        let post_norm_report = self
-            .post_norm_runner
-            .run_resident_from_f32_buffer(
+        self.post_norm_runner
+            .prepare_resident_from_f32_buffer(
                 source_context,
                 source_buffer,
                 source_len,
@@ -199,36 +206,32 @@ impl CachedGpuMlpBlockRunner {
                 post_norm_weight,
             )
             .map_err(map_weighted_rms_norm_error)?;
-        let pair_report = self
-            .pair_runner
-            .run_resident_from_f32_buffer(
+        self.pair_runner
+            .prepare_resident_from_f32_buffer(
                 self.post_norm_runner.shared_context(),
                 self.post_norm_runner.output_buffer_handle(),
                 self.hidden,
                 self.post_norm_runner.output_buffer_size(),
             )
             .map_err(map_packed_matvec_error)?;
-        let swiglu_pack_report = self
-            .swiglu_pack_runner
-            .run_with_output_from_buffer(
+        self.swiglu_pack_runner
+            .prepare_with_output_from_buffer(
                 self.pair_runner.shared_context(),
                 self.pair_runner.output_buffer_handle(),
                 self.intermediate * 2,
                 self.pair_runner.output_buffer_size(),
             )
             .map_err(map_swiglu_pack_error)?;
-        let down_report = self
-            .down_runner
-            .run_resident_from_packed_buffer(
+        self.down_runner
+            .prepare_resident_from_packed_buffer(
                 self.swiglu_pack_runner.shared_context(),
                 self.swiglu_pack_runner.output_buffer_handle(),
                 self.swiglu_pack_runner.packed_len(),
                 self.swiglu_pack_runner.output_buffer_size(),
             )
             .map_err(map_packed_matvec_error)?;
-        let add_report = self
-            .add_runner
-            .run_resident_from_buffers(
+        self.add_runner
+            .prepare_resident_from_buffers(
                 self.down_runner.shared_context(),
                 self.down_runner.output_buffer_handle(),
                 self.hidden,
@@ -238,15 +241,48 @@ impl CachedGpuMlpBlockRunner {
                 source_buffer_size,
             )
             .map_err(map_vector_add_error)?;
+        let command_buffers = [
+            self.post_norm_runner.command_buffer_handle(),
+            self.pair_runner.command_buffer_handle(),
+            self.swiglu_pack_runner.command_buffer_handle(),
+            self.down_runner.command_buffer_handle(),
+            self.add_runner.command_buffer_handle(),
+        ];
+        let submit_info = [ash::vk::SubmitInfo::default().command_buffers(&command_buffers)];
+        let gpu_started = std::time::Instant::now();
+        unsafe {
+            self.post_norm_runner
+                .shared_context()
+                .device
+                .reset_fences(&[self.submit_fence])
+        }
+        .map_err(|error| GpuMlpBlockError(format!("vulkan fence reset failed: {error:?}")))?;
+        unsafe {
+            self.post_norm_runner.shared_context().device.queue_submit(
+                self.post_norm_runner.shared_context().queue,
+                &submit_info,
+                self.submit_fence,
+            )
+        }
+        .map_err(|error| GpuMlpBlockError(format!("vulkan queue submit failed: {error:?}")))?;
+        unsafe {
+            self.post_norm_runner.shared_context().device.wait_for_fences(
+                &[self.submit_fence],
+                true,
+                u64::MAX,
+            )
+        }
+        .map_err(|error| GpuMlpBlockError(format!("vulkan fence wait failed: {error:?}")))?;
+        let total_gpu_duration = gpu_started.elapsed();
         Ok(GpuMlpBlockReport {
             hidden: self.hidden,
             intermediate: self.intermediate,
             compile_duration: self.compile_duration,
-            post_norm_gpu_duration: post_norm_report.gpu_duration,
-            pair_gpu_duration: pair_report.gpu_duration,
-            swiglu_pack_gpu_duration: swiglu_pack_report.gpu_duration,
-            down_gpu_duration: down_report.gpu_duration,
-            residual_add_gpu_duration: add_report.gpu_duration,
+            post_norm_gpu_duration: total_gpu_duration,
+            pair_gpu_duration: Duration::ZERO,
+            swiglu_pack_gpu_duration: Duration::ZERO,
+            down_gpu_duration: Duration::ZERO,
+            residual_add_gpu_duration: Duration::ZERO,
         })
     }
 
@@ -295,6 +331,17 @@ impl CachedGpuMlpBlockRunner {
 
     pub fn read_output(&self) -> Result<(Vec<f32>, Duration), GpuMlpBlockError> {
         self.add_runner.read_output().map_err(map_vector_add_error)
+    }
+}
+
+impl Drop for CachedGpuMlpBlockRunner {
+    fn drop(&mut self) {
+        unsafe {
+            self.post_norm_runner
+                .shared_context()
+                .device
+                .destroy_fence(self.submit_fence, None);
+        }
     }
 }
 
