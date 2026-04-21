@@ -475,20 +475,17 @@ impl CachedGpuAttentionSingleQueryRunner {
                 query.len, key.len, value.len, self.query_len, self.kv_len, self.kv_len
             )));
         }
-        let query_copy_duration = self.copy_query_from_buffer(
+        let copy_duration = self.copy_query_and_kv_from_buffers(
             &query.shared_context,
             query.buffer,
             query.len,
             query.buffer_size,
-        )?;
-        let kv_copy_duration = self.copy_kv_from_buffers(
-            &key.shared_context,
             key.buffer,
             key.buffer_size,
             value.buffer,
             value.buffer_size,
         )?;
-        let upload_duration = query_copy_duration + kv_copy_duration;
+        let upload_duration = copy_duration;
         let gpu_duration = self.submit_and_wait()?;
         Ok(GpuAttentionSingleQueryReport {
             query_len: self.query_len,
@@ -530,29 +527,44 @@ impl CachedGpuAttentionSingleQueryRunner {
         Ok(gpu_started.elapsed())
     }
 
-    fn copy_query_from_buffer(
+    fn copy_query_and_kv_from_buffers(
         &self,
         source_context: &Arc<SharedGpuPackedContext>,
-        source_buffer: vk::Buffer,
-        source_len: usize,
-        source_buffer_size: u64,
+        query_buffer: vk::Buffer,
+        query_len: usize,
+        query_buffer_size: u64,
+        key_buffer: vk::Buffer,
+        key_buffer_size: u64,
+        value_buffer: vk::Buffer,
+        value_buffer_size: u64,
     ) -> Result<Duration, GpuAttentionSingleQueryError> {
-        if source_len != self.query_len {
+        if query_len != self.query_len {
             return Err(GpuAttentionSingleQueryError::Shape(format!(
                 "source len {} does not match query len {}",
-                source_len, self.query_len
+                query_len, self.query_len
             )));
         }
         if !Arc::ptr_eq(&self._shared_context, source_context) {
             return Err(GpuAttentionSingleQueryError::Shape(
-                "resident query chaining requires matching Vulkan context".to_string(),
+                "resident query/KV chaining requires matching Vulkan context".to_string(),
             ));
         }
-        let byte_len = self.query_len * std::mem::size_of::<f32>();
-        if byte_len as u64 > source_buffer_size || byte_len as u64 > self.query_buffer.size {
+        let query_byte_len = self.query_len * std::mem::size_of::<f32>();
+        if query_byte_len as u64 > query_buffer_size || query_byte_len as u64 > self.query_buffer.size {
             return Err(GpuAttentionSingleQueryError::Shape(format!(
                 "query copy {} bytes exceeds source {} or destination {}",
-                byte_len, source_buffer_size, self.query_buffer.size
+                query_byte_len, query_buffer_size, self.query_buffer.size
+            )));
+        }
+        let kv_byte_len = self.kv_len * std::mem::size_of::<f32>();
+        if kv_byte_len as u64 > key_buffer_size
+            || kv_byte_len as u64 > value_buffer_size
+            || kv_byte_len as u64 > self.keys_buffer.size
+            || kv_byte_len as u64 > self.values_buffer.size
+        {
+            return Err(GpuAttentionSingleQueryError::Shape(format!(
+                "kv copy {} bytes exceeds source or destination buffer sizes",
+                kv_byte_len
             )));
         }
         let alloc = vk::CommandBufferAllocateInfo::default()
@@ -563,12 +575,21 @@ impl CachedGpuAttentionSingleQueryRunner {
         unsafe {
             self.device
                 .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
-            let region = [vk::BufferCopy::default().size(byte_len as u64)];
+            let query_region = [vk::BufferCopy::default().size(query_byte_len as u64)];
             self.device.cmd_copy_buffer(
                 copy_command,
-                source_buffer,
+                query_buffer,
                 self.query_buffer.buffer,
-                &region,
+                &query_region,
+            );
+            let kv_region = [vk::BufferCopy::default().size(kv_byte_len as u64)];
+            self.device
+                .cmd_copy_buffer(copy_command, key_buffer, self.keys_buffer.buffer, &kv_region);
+            self.device.cmd_copy_buffer(
+                copy_command,
+                value_buffer,
+                self.values_buffer.buffer,
+                &kv_region,
             );
             self.device.end_command_buffer(copy_command)?;
             self.device.reset_fences(&[self.fence])?;
