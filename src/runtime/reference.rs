@@ -1998,6 +1998,19 @@ struct PackedGpuSession<'a> {
     scratch: PackedDecodeScratch,
 }
 
+struct PackedDecodeStageSelection {
+    use_gpu_attention_block: bool,
+    use_gpu_attention_mlp_block: bool,
+    use_gpu_attention_only: bool,
+    use_gpu_full_last_layer_block: bool,
+    use_gpu_full_last_layer: bool,
+    use_gpu_mlp_entry: bool,
+    use_gpu_mlp_only: bool,
+    use_gpu_mlp_tail: bool,
+    use_gpu_swiglu_block: bool,
+    use_gpu_tail: bool,
+}
+
 impl<'a> PackedGpuSession<'a> {
     fn new(model: &'a ReferenceModel) -> Self {
         Self {
@@ -7654,6 +7667,55 @@ impl ReferenceModel {
         Ok((logits, compile, upload, gpu, download))
     }
 
+    fn select_packed_decode_stages(
+        &self,
+        layer_idx: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        use_attention_full: bool,
+        use_mlp_full: bool,
+        argmax_only: bool,
+    ) -> PackedDecodeStageSelection {
+        let is_last_layer = layer_idx + 1 == self.config.num_hidden_layers;
+        let use_gpu_attention_block =
+            use_attention_qkv && use_attention_full && packed_use_gpu_attention_block();
+        let use_gpu_attention_mlp_block =
+            use_gpu_attention_block && use_mlp_gu && use_mlp_full && packed_use_gpu_swiglu_block();
+        let use_gpu_attention_only = use_gpu_attention_block && !use_gpu_attention_mlp_block;
+        let use_gpu_full_last_layer_block = use_gpu_attention_mlp_block
+            && argmax_only
+            && packed_use_gpu_full_last_layer()
+            && is_last_layer;
+        let use_gpu_full_last_layer = use_mlp_gu
+            && use_mlp_full
+            && argmax_only
+            && packed_use_gpu_full_last_layer()
+            && is_last_layer;
+        let use_gpu_mlp_entry = use_mlp_gu && use_mlp_full && packed_use_gpu_mlp_entry();
+        let use_gpu_mlp_only =
+            use_mlp_gu && use_mlp_full && packed_use_gpu_swiglu_block() && !use_gpu_attention_mlp_block;
+        let use_gpu_mlp_tail =
+            use_gpu_mlp_only && argmax_only && packed_use_gpu_tail() && is_last_layer;
+        let use_gpu_swiglu_block = use_mlp_gu && use_mlp_full && packed_use_gpu_swiglu_block();
+        let use_gpu_tail = use_gpu_swiglu_block
+            && packed_use_gpu_tail()
+            && packed_use_gpu_final_norm()
+            && argmax_only
+            && is_last_layer;
+        PackedDecodeStageSelection {
+            use_gpu_attention_block,
+            use_gpu_attention_mlp_block,
+            use_gpu_attention_only,
+            use_gpu_full_last_layer_block,
+            use_gpu_full_last_layer,
+            use_gpu_mlp_entry,
+            use_gpu_mlp_only,
+            use_gpu_mlp_tail,
+            use_gpu_swiglu_block,
+            use_gpu_tail,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward_step_packed_decode(
         &self,
@@ -7694,12 +7756,14 @@ impl ReferenceModel {
             .take(self.config.num_hidden_layers)
         {
             let layer_tensors = &self.layer_tensors[layer_idx];
-            let use_gpu_attention_block =
-                use_attention_qkv && use_attention_full && packed_use_gpu_attention_block();
-            let use_gpu_attention_mlp_block = use_gpu_attention_block
-                && use_mlp_gu
-                && use_mlp_full
-                && packed_use_gpu_swiglu_block();
+            let stage_selection = self.select_packed_decode_stages(
+                layer_idx,
+                use_attention_qkv,
+                use_mlp_gu,
+                use_attention_full,
+                use_mlp_full,
+                argmax_only,
+            );
 
             let input_norm_weight =
                 self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
@@ -7708,7 +7772,7 @@ impl ReferenceModel {
                 resident_hidden_state,
                 layer_idx,
                 use_attention_qkv,
-                use_gpu_attention_block,
+                stage_selection.use_gpu_attention_block,
                 &input_norm_weight,
                 layer_tensors,
             )?;
@@ -7717,7 +7781,7 @@ impl ReferenceModel {
                 resident_hidden_state,
                 layer_idx,
                 use_attention_qkv,
-                use_gpu_attention_block,
+                stage_selection.use_gpu_attention_block,
                 &input_norm_weight,
                 layer_tensors,
             )?;
@@ -7728,7 +7792,7 @@ impl ReferenceModel {
                 layer_idx,
                 token_id,
                 use_attention_qkv,
-                use_gpu_attention_block,
+                stage_selection.use_gpu_attention_block,
                 &input_norm_weight,
                 layer_tensors,
             )?;
@@ -7809,7 +7873,7 @@ impl ReferenceModel {
             let k_norm_weight = self.load_vector_f32_resolved(&layer_tensors.k_norm_weight)?;
             let mut q_resident: Option<GpuResidentBuffer> = None;
             let mut kv_appended_on_gpu = false;
-            if use_gpu_attention_block {
+            if stage_selection.use_gpu_attention_block {
                 (q_resident, kv_appended_on_gpu) = self.prepare_gpu_attention_query_and_kv(
                     gpu_first_session,
                     layer_idx,
@@ -7841,12 +7905,11 @@ impl ReferenceModel {
                 );
             }
 
-            if use_gpu_attention_block && !kv_appended_on_gpu {
+            if stage_selection.use_gpu_attention_block && !kv_appended_on_gpu {
                 gpu_first_session.append_gpu_kv(layer_idx, &k, &v)?;
             }
 
-            let use_gpu_attention_only = use_gpu_attention_block && !use_gpu_attention_mlp_block;
-            if use_gpu_attention_only {
+            if stage_selection.use_gpu_attention_only {
                 let use_gpu_attention_tail = argmax_only
                     && packed_use_gpu_tail()
                     && layer_idx + 1 == self.config.num_hidden_layers;
@@ -7884,16 +7947,12 @@ impl ReferenceModel {
                 }
             }
 
-            if !use_gpu_attention_block {
+            if !stage_selection.use_gpu_attention_block {
                 layer_cache.keys.extend_from_slice(&k);
                 layer_cache.values.extend_from_slice(&v);
             }
 
-            let use_gpu_full_last_layer_block = use_gpu_attention_mlp_block
-                && argmax_only
-                && packed_use_gpu_full_last_layer()
-                && layer_idx + 1 == self.config.num_hidden_layers;
-            if use_gpu_full_last_layer_block {
+            if stage_selection.use_gpu_full_last_layer_block {
                 let next_token = self.run_gpu_full_last_layer_argmax(
                     gpu_first_session,
                     layer_idx,
@@ -7914,7 +7973,7 @@ impl ReferenceModel {
                 }
                 return Ok(PackedDecodeStepResult::NextToken(next_token));
             }
-            if use_gpu_attention_mlp_block {
+            if stage_selection.use_gpu_attention_mlp_block {
                 self.run_gpu_attention_mlp_resident_handoff(
                     gpu_first_session,
                     layer_idx,
@@ -7937,7 +7996,7 @@ impl ReferenceModel {
                 continue;
             }
 
-            if !use_gpu_attention_only {
+            if !stage_selection.use_gpu_attention_only {
                 hidden = self.apply_dense_attention_fallback(
                     session,
                     layer_tensors,
@@ -7958,12 +8017,7 @@ impl ReferenceModel {
             }
 
             let residual = hidden.clone();
-            let use_gpu_full_last_layer = use_mlp_gu
-                && use_mlp_full
-                && argmax_only
-                && packed_use_gpu_full_last_layer()
-                && layer_idx + 1 == self.config.num_hidden_layers;
-            if use_gpu_full_last_layer {
+            if stage_selection.use_gpu_full_last_layer {
                 let post_norm_weight =
                     self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
                 let post_norm_started = Instant::now();
@@ -8020,17 +8074,8 @@ impl ReferenceModel {
             }
             let post_norm_weight =
                 self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
-            let use_gpu_mlp_entry = use_mlp_gu && use_mlp_full && packed_use_gpu_mlp_entry();
-            let use_gpu_mlp_only = use_mlp_gu
-                && use_mlp_full
-                && packed_use_gpu_swiglu_block()
-                && !use_gpu_attention_mlp_block;
-            let use_gpu_mlp_tail = use_gpu_mlp_only
-                && argmax_only
-                && packed_use_gpu_tail()
-                && layer_idx + 1 == self.config.num_hidden_layers;
-            if use_gpu_mlp_only {
-                if use_gpu_mlp_tail {
+            if stage_selection.use_gpu_mlp_only {
+                if stage_selection.use_gpu_mlp_tail {
                     let next_token = self.run_gpu_mlp_only_tail_argmax(
                         gpu_first_session,
                         layer_idx,
@@ -8060,19 +8105,13 @@ impl ReferenceModel {
                 layer_tensors,
                 &residual,
                 &post_norm_weight,
-                use_gpu_mlp_entry,
+                stage_selection.use_gpu_mlp_entry,
                 &mut hidden_states,
                 metrics,
                 non_offloaded_dense_duration,
             )?;
 
             let started_at = Instant::now();
-            let use_gpu_swiglu_block = use_mlp_gu && use_mlp_full && packed_use_gpu_swiglu_block();
-            let use_gpu_tail = use_gpu_swiglu_block
-                && packed_use_gpu_tail()
-                && packed_use_gpu_final_norm()
-                && argmax_only
-                && layer_idx + 1 == self.config.num_hidden_layers;
             let (
                 down,
                 gpu_hidden_after_mlp,
@@ -8080,14 +8119,14 @@ impl ReferenceModel {
                 down_elapsed,
                 gpu_residual_elapsed,
                 dense_tail_started_at,
-            ) = if use_gpu_swiglu_block {
+            ) = if stage_selection.use_gpu_swiglu_block {
                 self.run_gpu_swiglu_block_execution(
                     session,
                     layer_tensors,
                     &mut pair_from_gpu_norm,
                     &hidden_states,
                     &residual,
-                    use_gpu_tail,
+                    stage_selection.use_gpu_tail,
                     mlp_stage_metrics,
                 )?
             } else {
@@ -8111,7 +8150,7 @@ impl ReferenceModel {
                 &mut final_hidden_gpu,
                 &mut resident_hidden_state,
                 use_mlp_full,
-                use_gpu_swiglu_block,
+                stage_selection.use_gpu_swiglu_block,
                 gpu_residual_elapsed,
             );
             mlp_stage_metrics.residual_duration += residual_elapsed;
@@ -8119,8 +8158,8 @@ impl ReferenceModel {
             metrics.mlp_duration += elapsed;
             if use_mlp_gu {
                 if use_mlp_full {
-                    if use_gpu_swiglu_block {
-                        if !use_gpu_tail {
+                    if stage_selection.use_gpu_swiglu_block {
+                        if !stage_selection.use_gpu_tail {
                             *non_offloaded_dense_duration += residual_elapsed;
                         }
                     } else {
