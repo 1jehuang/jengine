@@ -4629,6 +4629,50 @@ impl ReferenceModel {
         Ok((Some(q_resident), true))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn apply_cpu_qk_norm_rope(
+        &self,
+        q: &mut Vec<f32>,
+        k: &mut Vec<f32>,
+        q_norm_weight: &[f32],
+        k_norm_weight: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        layer_tensors: &LayerTensorNames,
+        metrics: &mut DecodeMetrics,
+        non_offloaded_dense_duration: &mut Duration,
+        session: &mut PackedGpuSession<'_>,
+        started_at: Instant,
+    ) {
+        apply_head_rms_norm_weighted(
+            q,
+            self.config.num_attention_heads,
+            self.config.head_dim,
+            q_norm_weight,
+            self.config.rms_norm_eps as f32,
+        );
+        apply_head_rms_norm_weighted(
+            k,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            k_norm_weight,
+            self.config.rms_norm_eps as f32,
+        );
+        apply_rotary_single(
+            q,
+            k,
+            cos,
+            sin,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+        );
+        let elapsed = started_at.elapsed();
+        metrics.norm_duration += elapsed;
+        *non_offloaded_dense_duration += elapsed;
+        session.push_dense_stage_trace("qk_norm_rope", &layer_tensors.q_norm_weight, elapsed);
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -7009,36 +7053,18 @@ impl ReferenceModel {
                     session,
                 )?;
             } else {
-                apply_head_rms_norm_weighted(
+                self.apply_cpu_qk_norm_rope(
                     &mut q,
-                    self.config.num_attention_heads,
-                    self.config.head_dim,
+                    &mut k,
                     &q_norm_weight,
-                    self.config.rms_norm_eps as f32,
-                );
-                apply_head_rms_norm_weighted(
-                    &mut k,
-                    self.config.num_key_value_heads,
-                    self.config.head_dim,
                     &k_norm_weight,
-                    self.config.rms_norm_eps as f32,
-                );
-                apply_rotary_single(
-                    &mut q,
-                    &mut k,
                     &cos,
                     &sin,
-                    self.config.num_attention_heads,
-                    self.config.num_key_value_heads,
-                    self.config.head_dim,
-                );
-                let elapsed = started_at.elapsed();
-                metrics.norm_duration += elapsed;
-                *non_offloaded_dense_duration += elapsed;
-                session.push_dense_stage_trace(
-                    "qk_norm_rope",
-                    &layer_tensors.q_norm_weight,
-                    elapsed,
+                    layer_tensors,
+                    metrics,
+                    non_offloaded_dense_duration,
+                    session,
+                    started_at,
                 );
             }
 
