@@ -4673,6 +4673,55 @@ impl ReferenceModel {
         session.push_dense_stage_trace("qk_norm_rope", &layer_tensors.q_norm_weight, elapsed);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run_gpu_attention_only_tail_argmax(
+        &self,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+        layer_idx: usize,
+        position: usize,
+        q: &[f32],
+        q_resident: Option<&GpuResidentBuffer>,
+        residual_resident: Option<&GpuResidentBuffer>,
+        layer_cache: &LayerCache,
+        residual: &[f32],
+        attention_stage_metrics: &mut PackedAttentionStageMetrics,
+        metrics: &mut DecodeMetrics,
+        session: &mut PackedGpuSession<'_>,
+    ) -> Result<usize, ReferenceError> {
+        let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
+        let (next_token, attention_report, tail_report, compile_duration) = gpu_first_session
+            .run_attention_layer_to_tail_argmax(
+                layer_idx,
+                position + 1,
+                Some(q),
+                q_resident,
+                residual_resident,
+                layer_cache.keys(),
+                layer_cache.values(),
+                residual,
+                &final_norm_weight,
+            )?;
+        attention_stage_metrics.query_duration += attention_report.attention_gpu_duration;
+        attention_stage_metrics.oproj_duration += attention_report.oproj_gpu_duration;
+        attention_stage_metrics.residual_duration += attention_report.residual_add_gpu_duration;
+        metrics.attention_duration += attention_report.attention_gpu_duration
+            + attention_report.oproj_gpu_duration
+            + attention_report.residual_add_gpu_duration;
+        metrics.norm_duration += tail_report.final_norm_gpu_duration;
+        metrics.logits_duration += tail_report.pack_gpu_duration
+            + tail_report.logits_gpu_duration
+            + tail_report.logits_download_duration;
+        session.metrics.compile_duration += compile_duration;
+        session.metrics.gpu_duration += attention_report.attention_gpu_duration
+            + attention_report.oproj_gpu_duration
+            + attention_report.residual_add_gpu_duration
+            + tail_report.final_norm_gpu_duration
+            + tail_report.pack_gpu_duration
+            + tail_report.logits_gpu_duration;
+        session.metrics.download_duration += tail_report.logits_download_duration;
+        Ok(next_token)
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -7078,39 +7127,19 @@ impl ReferenceModel {
                     && packed_use_gpu_tail()
                     && layer_idx + 1 == self.config.num_hidden_layers;
                 if use_gpu_attention_tail {
-                    let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
-                    let (next_token, attention_report, tail_report, compile_duration) =
-                        gpu_first_session.run_attention_layer_to_tail_argmax(
-                            layer_idx,
-                            position + 1,
-                            Some(&q),
-                            q_resident.as_ref(),
-                            residual_resident.as_ref(),
-                            layer_cache.keys(),
-                            layer_cache.values(),
-                            &residual,
-                            &final_norm_weight,
-                        )?;
-                    attention_stage_metrics.query_duration +=
-                        attention_report.attention_gpu_duration;
-                    attention_stage_metrics.oproj_duration += attention_report.oproj_gpu_duration;
-                    attention_stage_metrics.residual_duration +=
-                        attention_report.residual_add_gpu_duration;
-                    metrics.attention_duration += attention_report.attention_gpu_duration
-                        + attention_report.oproj_gpu_duration
-                        + attention_report.residual_add_gpu_duration;
-                    metrics.norm_duration += tail_report.final_norm_gpu_duration;
-                    metrics.logits_duration += tail_report.pack_gpu_duration
-                        + tail_report.logits_gpu_duration
-                        + tail_report.logits_download_duration;
-                    session.metrics.compile_duration += compile_duration;
-                    session.metrics.gpu_duration += attention_report.attention_gpu_duration
-                        + attention_report.oproj_gpu_duration
-                        + attention_report.residual_add_gpu_duration
-                        + tail_report.final_norm_gpu_duration
-                        + tail_report.pack_gpu_duration
-                        + tail_report.logits_gpu_duration;
-                    session.metrics.download_duration += tail_report.logits_download_duration;
+                    let next_token = self.run_gpu_attention_only_tail_argmax(
+                        gpu_first_session,
+                        layer_idx,
+                        position,
+                        &q,
+                        q_resident.as_ref(),
+                        residual_resident.as_ref(),
+                        layer_cache,
+                        &residual,
+                        attention_stage_metrics,
+                        metrics,
+                        session,
+                    )?;
                     if reusable_qkv_scratch {
                         session.restore_qkv_scratch(q, k, v);
                     }
