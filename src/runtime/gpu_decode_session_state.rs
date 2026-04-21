@@ -25,4 +25,29 @@ impl LayerCache {
             values: Vec::new(),
         }
     }
+
+    pub fn append(&mut self, keys: &[f32], values: &[f32]) {
+        self.keys.extend_from_slice(keys);
+        self.values.extend_from_slice(values);
+    }
+
+    pub fn keys(&self) -> &[f32] {
+        &self.keys
+    }
+
+    pub fn values(&self) -> &[f32] {
+        &self.values
+    }
+
+    pub fn cpu_kv_is_empty(&self) -> bool {
+        self.keys.is_empty() && self.values.is_empty()
+    }
+
+    pub fn keys_capacity(&self) -> usize {
+        self.keys.capacity()
+    }
+
+    pub fn values_capacity(&self) -> usize {
+        self.values.capacity()
+    }
 }

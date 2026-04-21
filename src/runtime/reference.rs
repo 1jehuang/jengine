@@ -6536,12 +6536,11 @@ impl ReferenceModel {
             metrics.norm_duration += started_at.elapsed();
 
             let started_at = Instant::now();
-            layer_cache.keys.extend_from_slice(&k);
-            layer_cache.values.extend_from_slice(&v);
+            layer_cache.append(&k, &v);
             let attn = attention_single_query(
                 &q,
-                &layer_cache.keys,
-                &layer_cache.values,
+                layer_cache.keys(),
+                layer_cache.values(),
                 position + 1,
                 self.config.num_attention_heads,
                 self.config.num_key_value_heads,
@@ -6702,12 +6701,11 @@ impl ReferenceModel {
             metrics.norm_duration += started_at.elapsed();
 
             let started_at = Instant::now();
-            layer_cache.keys.extend_from_slice(&k);
-            layer_cache.values.extend_from_slice(&v);
+            layer_cache.append(&k, &v);
             let attn = attention_single_query(
                 &q,
-                &layer_cache.keys,
-                &layer_cache.values,
+                layer_cache.keys(),
+                layer_cache.values(),
                 position + 1,
                 self.config.num_attention_heads,
                 self.config.num_key_value_heads,
@@ -7315,8 +7313,8 @@ impl ReferenceModel {
                             Some(&q),
                             q_resident.as_ref(),
                             residual_resident.as_ref(),
-                            &layer_cache.keys,
-                            &layer_cache.values,
+                            layer_cache.keys(),
+                            layer_cache.values(),
                             &residual,
                             &final_norm_weight,
                         )?;
@@ -7351,8 +7349,8 @@ impl ReferenceModel {
                             position + 1,
                             Some(&q),
                             q_resident.as_ref(),
-                            &layer_cache.keys,
-                            &layer_cache.values,
+                            layer_cache.keys(),
+                            layer_cache.values(),
                             &residual,
                         )?;
                     hidden = next_hidden;
@@ -7392,8 +7390,8 @@ impl ReferenceModel {
                         Some(&q),
                         q_resident.as_ref(),
                         residual_resident.as_ref(),
-                        &layer_cache.keys,
-                        &layer_cache.values,
+                        layer_cache.keys(),
+                        layer_cache.values(),
                         &residual,
                         &post_norm_weight,
                         &final_norm_weight,
@@ -7449,8 +7447,8 @@ impl ReferenceModel {
                         Some(&q),
                         q_resident.as_ref(),
                         residual_resident.as_ref(),
-                        &layer_cache.keys,
-                        &layer_cache.values,
+                        layer_cache.keys(),
+                        layer_cache.values(),
                         &residual,
                         &post_norm_weight,
                     )?;
@@ -7491,8 +7489,8 @@ impl ReferenceModel {
                 let attn_started_at = Instant::now();
                 let attn = attention_single_query(
                     &q,
-                    &layer_cache.keys,
-                    &layer_cache.values,
+                    layer_cache.keys(),
+                    layer_cache.values(),
                     position + 1,
                     self.config.num_attention_heads,
                     self.config.num_key_value_heads,
@@ -8149,12 +8147,11 @@ impl ReferenceModel {
             metrics.norm_duration += started_at.elapsed();
 
             let started_at = Instant::now();
-            layer_cache.keys.extend_from_slice(&k);
-            layer_cache.values.extend_from_slice(&v);
+            layer_cache.append(&k, &v);
             let attn = attention_single_query(
                 &q,
-                &layer_cache.keys,
-                &layer_cache.values,
+                layer_cache.keys(),
+                layer_cache.values(),
                 position + 1,
                 self.config.num_attention_heads,
                 self.config.num_key_value_heads,
@@ -9484,20 +9481,20 @@ mod tests {
         };
         for (layer_idx, layer_cache) in session.inner.cache.iter().enumerate().take(2) {
             assert!(
-                layer_cache.keys.is_empty(),
+                layer_cache.cpu_kv_is_empty(),
                 "layer {layer_idx} cpu key cache should stay empty"
             );
             assert!(
-                layer_cache.values.is_empty(),
+                layer_cache.cpu_kv_is_empty(),
                 "layer {layer_idx} cpu value cache should stay empty"
             );
             assert_eq!(
-                layer_cache.keys.capacity(),
+                layer_cache.keys_capacity(),
                 0,
                 "layer {layer_idx} cpu key cache should not be preallocated"
             );
             assert_eq!(
-                layer_cache.values.capacity(),
+                layer_cache.values_capacity(),
                 0,
                 "layer {layer_idx} cpu value cache should not be preallocated"
             );
@@ -9590,10 +9587,9 @@ mod tests {
                 .contains_key(&expected_v_key)
         );
         for (layer_idx, layer_cache) in session.inner.cache.iter().enumerate().take(2) {
-            assert!(layer_cache.keys.is_empty());
-            assert!(layer_cache.values.is_empty());
-            assert_eq!(layer_cache.keys.capacity(), 0);
-            assert_eq!(layer_cache.values.capacity(), 0);
+            assert!(layer_cache.cpu_kv_is_empty());
+            assert_eq!(layer_cache.keys_capacity(), 0);
+            assert_eq!(layer_cache.values_capacity(), 0);
             assert_eq!(
                 session
                     .inner
@@ -9646,20 +9642,20 @@ mod tests {
         };
         for (layer_idx, layer_cache) in session.inner.cache.iter().enumerate().take(2) {
             assert!(
-                layer_cache.keys.is_empty(),
+                layer_cache.cpu_kv_is_empty(),
                 "layer {layer_idx} cpu key cache should stay empty"
             );
             assert!(
-                layer_cache.values.is_empty(),
+                layer_cache.cpu_kv_is_empty(),
                 "layer {layer_idx} cpu value cache should stay empty"
             );
             assert_eq!(
-                layer_cache.keys.capacity(),
+                layer_cache.keys_capacity(),
                 0,
                 "layer {layer_idx} cpu key cache should not be preallocated"
             );
             assert_eq!(
-                layer_cache.values.capacity(),
+                layer_cache.values_capacity(),
                 0,
                 "layer {layer_idx} cpu value cache should not be preallocated"
             );
