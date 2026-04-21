@@ -2,8 +2,9 @@ use crate::runtime::decode_plan::PackedDecodePlan;
 use crate::runtime::gpu_decode_env::{gpu_first_use_attention_full, gpu_first_use_mlp_full};
 use crate::runtime::gpu_decode_metrics::PackedDecodeMetrics;
 use crate::runtime::reference::{
-    GpuFirstPackedDecodeSession, PersistentPackedDecodeSession, ReferenceError, ReferenceModel,
+    GpuFirstPackedDecodeSession, PersistentPackedDecodeSession, ReferenceModel,
 };
+use crate::runtime::reference_error::ReferenceError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuDecodeSessionMode {

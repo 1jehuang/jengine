@@ -13,5 +13,6 @@ pub mod gpu_decode_state;
 pub mod packed;
 pub mod packed_model;
 pub mod reference;
+pub mod reference_error;
 pub mod repack;
 pub mod weights;

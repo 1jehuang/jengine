@@ -21,7 +21,7 @@ use crate::gpu::vector_add::CachedGpuVectorAddRunner;
 use crate::gpu::weighted_rms_norm::{CachedGpuWeightedRmsNormRunner, GpuWeightedRmsNormReport};
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
-use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
+use crate::runtime::assets::{BonsaiAssetPaths};
 use crate::runtime::decode_plan::PackedDecodePlan;
 use crate::runtime::decode_report::MemoryReport;
 use crate::runtime::gpu_decode_env::{
@@ -51,73 +51,16 @@ use crate::runtime::gpu_decode_session_state::{
     LayerCache, PackedDecodeStepResult, allocate_layer_cache_vec,
 };
 use crate::runtime::gpu_decode_state::{GpuKvBinding, GpuTailResult, GpuTailStepReport, ResidentHiddenState};
-use crate::runtime::packed_model::{PackedModelError, PackedModelStore};
+use crate::runtime::packed_model::PackedModelStore;
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
-use crate::runtime::weights::{WeightError, WeightStore};
+use crate::runtime::reference_error::ReferenceError;
+use crate::runtime::weights::WeightStore;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-#[derive(Debug)]
-pub enum ReferenceError {
-    Asset(AssetError),
-    Io(std::io::Error),
-    Json(serde_json::Error),
-    Tokenizer(crate::model::tokenizer::TokenizerLoadError),
-    Weight(WeightError),
-    PackedModel(PackedModelError),
-    Decode(String),
-}
-
-impl std::fmt::Display for ReferenceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Asset(error) => write!(f, "asset error: {error}"),
-            Self::Io(error) => write!(f, "I/O error: {error}"),
-            Self::Json(error) => write!(f, "JSON error: {error}"),
-            Self::Tokenizer(error) => write!(f, "tokenizer error: {error}"),
-            Self::Weight(error) => write!(f, "weight error: {error}"),
-            Self::PackedModel(error) => write!(f, "packed model error: {error}"),
-            Self::Decode(message) => write!(f, "decode error: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for ReferenceError {}
-
-impl From<AssetError> for ReferenceError {
-    fn from(value: AssetError) -> Self {
-        Self::Asset(value)
-    }
-}
-impl From<std::io::Error> for ReferenceError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
-    }
-}
-impl From<serde_json::Error> for ReferenceError {
-    fn from(value: serde_json::Error) -> Self {
-        Self::Json(value)
-    }
-}
-impl From<crate::model::tokenizer::TokenizerLoadError> for ReferenceError {
-    fn from(value: crate::model::tokenizer::TokenizerLoadError) -> Self {
-        Self::Tokenizer(value)
-    }
-}
-impl From<WeightError> for ReferenceError {
-    fn from(value: WeightError) -> Self {
-        Self::Weight(value)
-    }
-}
-impl From<PackedModelError> for ReferenceError {
-    fn from(value: PackedModelError) -> Self {
-        Self::PackedModel(value)
-    }
-}
 
 type CachedProjectionGpuRunner = Rc<RefCell<CachedGpuPackedMatvecRunner>>;
 type CachedEmbeddingLookupGpuRunner = Rc<RefCell<CachedGpuEmbeddingLookupRunner>>;
