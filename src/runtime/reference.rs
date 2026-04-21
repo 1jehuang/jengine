@@ -4114,27 +4114,7 @@ pub struct ReferenceModel {
 
 impl ReferenceModel {
     fn packed_enabled_label(use_attention_qkv: bool, use_mlp_gu: bool) -> String {
-        let plan = PackedDecodePlan::from_env(use_attention_qkv, use_mlp_gu, false);
-        let mut enabled = String::new();
-        if plan.use_attention_qkv {
-            enabled.push_str("qkv");
-            if plan.use_attention_full {
-                enabled.push_str("+o");
-            }
-        }
-        if plan.use_mlp_gu {
-            if !enabled.is_empty() {
-                enabled.push('+');
-            }
-            enabled.push_str("gu");
-            if plan.use_mlp_full {
-                enabled.push_str("+d");
-            }
-        }
-        if enabled.is_empty() {
-            enabled.push_str("dense");
-        }
-        enabled
+        PackedDecodePlan::from_env(use_attention_qkv, use_mlp_gu, false).enabled_label()
     }
 
     fn packed_use_mlp_full() -> bool {

@@ -47,4 +47,27 @@ impl PackedDecodePlan {
             gpu_first_session,
         }
     }
+
+    pub fn enabled_label(self) -> String {
+        let mut enabled = String::new();
+        if self.use_attention_qkv {
+            enabled.push_str("qkv");
+            if self.use_attention_full {
+                enabled.push_str("+o");
+            }
+        }
+        if self.use_mlp_gu {
+            if !enabled.is_empty() {
+                enabled.push('+');
+            }
+            enabled.push_str("gu");
+            if self.use_mlp_full {
+                enabled.push_str("+d");
+            }
+        }
+        if enabled.is_empty() {
+            enabled.push_str("dense");
+        }
+        enabled
+    }
 }
