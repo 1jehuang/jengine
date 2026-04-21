@@ -5343,6 +5343,40 @@ impl ReferenceModel {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn finish_packed_decode_step_result(
+        &self,
+        argmax_only: bool,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+        session: &mut PackedGpuSession<'_>,
+        hidden: &[f32],
+        final_hidden_gpu: Option<&ResidentGpuVectorAdd>,
+        metrics: &mut DecodeMetrics,
+        non_offloaded_dense_duration: &mut Duration,
+    ) -> Result<PackedDecodeStepResult, ReferenceError> {
+        if argmax_only {
+            let next_token = self.finish_argmax_tail_result(
+                gpu_first_session,
+                session,
+                hidden,
+                final_hidden_gpu,
+                metrics,
+                non_offloaded_dense_duration,
+            )?;
+            Ok(PackedDecodeStepResult::NextToken(next_token))
+        } else {
+            let logits = self.finish_logits_tail_result(
+                gpu_first_session,
+                session,
+                hidden,
+                final_hidden_gpu,
+                metrics,
+                non_offloaded_dense_duration,
+            )?;
+            Ok(PackedDecodeStepResult::Logits(logits))
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn finish_logits_tail_result(
         &self,
         gpu_first_session: &mut GpuFirstRunnerCache<'_>,
@@ -8100,28 +8134,15 @@ impl ReferenceModel {
             }
         }
 
-        let result = if argmax_only {
-            let next_token = self.finish_argmax_tail_result(
-                gpu_first_session,
-                session,
-                &hidden,
-                final_hidden_gpu.as_ref(),
-                metrics,
-                non_offloaded_dense_duration,
-            )?;
-            PackedDecodeStepResult::NextToken(next_token)
-        } else {
-            let logits = self.finish_logits_tail_result(
-                gpu_first_session,
-                session,
-                &hidden,
-                final_hidden_gpu.as_ref(),
-                metrics,
-                non_offloaded_dense_duration,
-            )?;
-            PackedDecodeStepResult::Logits(logits)
-        };
-        Ok(result)
+        self.finish_packed_decode_step_result(
+            argmax_only,
+            gpu_first_session,
+            session,
+            &hidden,
+            final_hidden_gpu.as_ref(),
+            metrics,
+            non_offloaded_dense_duration,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
