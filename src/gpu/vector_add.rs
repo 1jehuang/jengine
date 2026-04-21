@@ -372,17 +372,16 @@ impl CachedGpuVectorAddRunner {
                 self.len
             )));
         }
-        let copy_duration = self.copy_left_from_buffer(
+        let upload_started = Instant::now();
+        self.copy_left_from_buffer(
             source_context,
             source_buffer,
             source_len,
             source_buffer_size,
         )?;
-        let upload_started = Instant::now();
         write_f32_buffer(&self.right_buffer, right)?;
-        let host_upload_duration = upload_started.elapsed();
-        let upload_duration = copy_duration + host_upload_duration;
-        let gpu_duration = self.submit_and_wait()?;
+        let upload_duration = upload_started.elapsed();
+        let gpu_duration = self.submit_copy_and_compute_and_wait()?;
         Ok(GpuVectorAddReport {
             len: self.len,
             compile_duration: Duration::ZERO,
@@ -405,7 +404,8 @@ impl CachedGpuVectorAddRunner {
         right_len: usize,
         right_buffer_size: u64,
     ) -> Result<GpuVectorAddReport, GpuVectorAddError> {
-        let copy_duration = self.copy_buffers_to_inputs(
+        let upload_started = Instant::now();
+        self.copy_buffers_to_inputs(
             source_context,
             left_buffer,
             left_len,
@@ -418,8 +418,8 @@ impl CachedGpuVectorAddRunner {
             self.right_buffer.buffer,
             self.right_buffer.size,
         )?;
-        let upload_duration = copy_duration;
-        let gpu_duration = self.submit_and_wait()?;
+        let upload_duration = upload_started.elapsed();
+        let gpu_duration = self.submit_copy_and_compute_and_wait()?;
         Ok(GpuVectorAddReport {
             len: self.len,
             compile_duration: Duration::ZERO,
@@ -445,13 +445,26 @@ impl CachedGpuVectorAddRunner {
         Ok(gpu_started.elapsed())
     }
 
+    fn submit_copy_and_compute_and_wait(&self) -> Result<Duration, GpuVectorAddError> {
+        unsafe { self.device.reset_fences(&[self.fence])? };
+        let command_buffers = [self.copy_command_buffer, self.command_buffer];
+        let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+        let gpu_started = Instant::now();
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        Ok(gpu_started.elapsed())
+    }
+
     fn copy_left_from_buffer(
         &self,
         source_context: &Arc<SharedGpuPackedContext>,
         source_buffer: vk::Buffer,
         source_len: usize,
         source_buffer_size: u64,
-    ) -> Result<Duration, GpuVectorAddError> {
+    ) -> Result<(), GpuVectorAddError> {
         self.copy_buffer_to_input(
             source_context,
             source_buffer,
@@ -470,7 +483,7 @@ impl CachedGpuVectorAddRunner {
         source_buffer_size: u64,
         destination_buffer: vk::Buffer,
         destination_buffer_size: u64,
-    ) -> Result<Duration, GpuVectorAddError> {
+    ) -> Result<(), GpuVectorAddError> {
         if source_len != self.len {
             return Err(GpuVectorAddError::Shape(format!(
                 "source len {} does not match destination len {}",
@@ -498,18 +511,26 @@ impl CachedGpuVectorAddRunner {
             let region = [vk::BufferCopy::default().size(byte_len as u64)];
             self.device
                 .cmd_copy_buffer(copy_command, source_buffer, destination_buffer, &region);
+            let barrier = [vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(destination_buffer)
+                .offset(0)
+                .size(byte_len as u64)];
+            self.device.cmd_pipeline_barrier(
+                copy_command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barrier,
+                &[],
+            );
             self.device.end_command_buffer(copy_command)?;
-            self.device.reset_fences(&[self.fence])?;
         }
-        let submit_info =
-            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
-        let started = Instant::now();
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &submit_info, self.fence)?;
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
-        Ok(started.elapsed())
+        Ok(())
     }
 
     fn copy_buffers_to_inputs(
@@ -525,7 +546,7 @@ impl CachedGpuVectorAddRunner {
         right_source_buffer_size: u64,
         right_destination_buffer: vk::Buffer,
         right_destination_buffer_size: u64,
-    ) -> Result<Duration, GpuVectorAddError> {
+    ) -> Result<(), GpuVectorAddError> {
         if left_source_len != self.len || right_source_len != self.len {
             return Err(GpuVectorAddError::Shape(format!(
                 "source lens {}/{} do not match destination len {}",
@@ -567,18 +588,36 @@ impl CachedGpuVectorAddRunner {
                 right_destination_buffer,
                 &region,
             );
+            let barriers = [
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(left_destination_buffer)
+                    .offset(0)
+                    .size(byte_len as u64),
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(right_destination_buffer)
+                    .offset(0)
+                    .size(byte_len as u64),
+            ];
+            self.device.cmd_pipeline_barrier(
+                copy_command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barriers,
+                &[],
+            );
             self.device.end_command_buffer(copy_command)?;
-            self.device.reset_fences(&[self.fence])?;
         }
-        let submit_info =
-            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
-        let started = Instant::now();
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &submit_info, self.fence)?;
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
-        Ok(started.elapsed())
+        Ok(())
     }
 
     pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> {
