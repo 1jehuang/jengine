@@ -24,6 +24,7 @@ use crate::gpu::weighted_rms_norm::{CachedGpuWeightedRmsNormRunner, GpuWeightedR
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
+use crate::runtime::decode_plan::PackedDecodePlan;
 use crate::runtime::packed_model::{PackedModelError, PackedModelStore};
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
 use crate::runtime::weights::{WeightError, WeightStore};
@@ -4144,21 +4145,20 @@ pub struct ReferenceModel {
 
 impl ReferenceModel {
     fn packed_enabled_label(use_attention_qkv: bool, use_mlp_gu: bool) -> String {
-        let use_attention_full = use_attention_qkv && Self::packed_use_attention_full();
-        let use_mlp_full = use_mlp_gu && Self::packed_use_mlp_full();
+        let plan = PackedDecodePlan::from_env(use_attention_qkv, use_mlp_gu, false);
         let mut enabled = String::new();
-        if use_attention_qkv {
+        if plan.use_attention_qkv {
             enabled.push_str("qkv");
-            if use_attention_full {
+            if plan.use_attention_full {
                 enabled.push_str("+o");
             }
         }
-        if use_mlp_gu {
+        if plan.use_mlp_gu {
             if !enabled.is_empty() {
                 enabled.push('+');
             }
             enabled.push_str("gu");
-            if use_mlp_full {
+            if plan.use_mlp_full {
                 enabled.push_str("+d");
             }
         }
@@ -4438,6 +4438,7 @@ impl ReferenceModel {
         if self.packed_model.is_none() {
             return Ok(());
         }
+        let plan = PackedDecodePlan::from_env(use_attention_qkv, use_mlp_gu, false);
         let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
         for layer_tensors in &self.layer_tensors {
             let _ = self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
@@ -4487,7 +4488,7 @@ impl ReferenceModel {
                     self.config.hidden_size,
                 )?;
                 let _ = self.get_or_create_projection_gpu(&pair_key, &packed)?;
-                if Self::packed_use_gpu_mlp_entry() || Self::packed_use_gpu_full_last_layer() {
+                if plan.gpu_mlp_entry || plan.gpu_full_last_layer {
                     let _ = self.get_or_create_projection_gpu_raw_f32(&pair_key, &packed)?;
                 }
                 if use_mlp_full {
@@ -4498,7 +4499,7 @@ impl ReferenceModel {
                     )?;
                     let _ = self
                         .get_or_create_projection_gpu(&layer_tensors.down_proj_weight, &packed)?;
-                    if Self::packed_use_gpu_swiglu_block() {
+                    if plan.gpu_swiglu_block {
                         let _ = self.get_or_create_swiglu_pack_f16_pairs_gpu()?;
                     }
                 }
@@ -4506,7 +4507,7 @@ impl ReferenceModel {
         }
         let _ = self.load_vector_f32_resolved("model.norm.weight")?;
         if use_mlp_gu {
-            if Self::packed_use_gpu_mlp_entry() || Self::packed_use_gpu_full_last_layer() {
+            if plan.gpu_mlp_entry || plan.gpu_full_last_layer {
                 let pair_key = format!(
                     "concat::{}||{}",
                     self.layer_tensors[0].gate_proj_weight, self.layer_tensors[0].up_proj_weight
@@ -4521,15 +4522,15 @@ impl ReferenceModel {
                 )?;
                 let _ = self.get_or_create_projection_gpu_raw_f32(&pair_key, &packed)?;
             }
-            if Self::packed_use_gpu_swiglu_block() || Self::packed_use_gpu_full_last_layer() {
+            if plan.gpu_swiglu_block || plan.gpu_full_last_layer {
                 let _ = self.get_or_create_swiglu_pack_f16_pairs_gpu()?;
                 let _ = self.get_or_create_pack_f16_pairs_gpu(self.config.intermediate_size)?;
             }
         }
-        if Self::packed_use_gpu_final_norm() || Self::packed_use_gpu_full_last_layer() {
+        if plan.gpu_final_norm || plan.gpu_full_last_layer {
             let _ = self.get_or_create_final_norm_gpu()?;
             let _ = self.get_or_create_pack_f16_pairs_gpu(self.config.hidden_size)?;
-            if Self::packed_use_gpu_tail() || Self::packed_use_gpu_full_last_layer() {
+            if plan.gpu_tail || plan.gpu_full_last_layer {
                 let _ = self.get_or_create_vector_add_gpu(self.config.hidden_size)?;
             }
         }
@@ -4538,7 +4539,7 @@ impl ReferenceModel {
             self.config.vocab_size,
             self.config.hidden_size,
         )?;
-        if Self::packed_use_gpu_first_session() {
+        if plan.gpu_first_session {
             let mut gpu_first_cache = GpuFirstRunnerCache::new(self, expected_tokens.max(1));
             gpu_first_cache.prewarm_decode_path(use_attention_qkv, use_mlp_gu)?;
         }
@@ -4552,7 +4553,8 @@ impl ReferenceModel {
         use_mlp_gu: bool,
         argmax_only: bool,
     ) -> PackedDecodeSession<'_> {
-        if Self::packed_use_gpu_first_session() {
+        let plan = PackedDecodePlan::from_env(use_attention_qkv, use_mlp_gu, argmax_only);
+        if plan.gpu_first_session {
             PackedDecodeSession::GpuFirst(GpuFirstPackedDecodeSession::new(
                 self,
                 expected_tokens,
