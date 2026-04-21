@@ -1479,6 +1479,52 @@ impl<'a> GpuFirstRunnerCache<'a> {
         ))
     }
 
+    fn run_attention_layer_to_tail_argmax(
+        &mut self,
+        layer_idx: usize,
+        seq_len: usize,
+        q: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        residual: &[f32],
+        final_norm_weight: &[f32],
+    ) -> Result<(usize, GpuAttentionBlockReport, GpuTailBlockReport, Duration), ReferenceError> {
+        let kv_state = self.gpu_kv_state(layer_idx);
+        let (attention_compile_duration, attention_block) =
+            self.ensure_attention_block(layer_idx, seq_len)?;
+        let attention_report = if let Some((key_buffer, key_len, key_buffer_size, value_buffer, value_len, value_buffer_size)) =
+            kv_state
+        {
+            attention_block
+                .run_with_resident_kv(
+                    q,
+                    key_buffer,
+                    key_len,
+                    key_buffer_size,
+                    value_buffer,
+                    value_len,
+                    value_buffer_size,
+                    residual,
+                )
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+        } else {
+            attention_block
+                .run_resident(q, keys, values, residual)
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+        };
+        let attention_output = attention_block.resident_output();
+        let (tail_compile_duration, tail_block) = self.ensure_tail_block()?;
+        let tail_report = tail_block
+            .run_argmax_from_resident_tensor(&attention_output, final_norm_weight)
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        Ok((
+            tail_report.argmax_index,
+            attention_report,
+            tail_report,
+            attention_compile_duration + tail_compile_duration,
+        ))
+    }
+
     fn run_mlp_layer_to_host(
         &mut self,
         layer_idx: usize,
@@ -5866,28 +5912,65 @@ impl ReferenceModel {
 
             let use_gpu_attention_only = use_gpu_attention_block && !use_gpu_attention_mlp_block;
             if use_gpu_attention_only {
-                let (next_hidden, attention_report, compile_duration, download_duration) =
-                    gpu_first_session.run_attention_layer_to_host(
-                        layer_idx,
-                        position + 1,
-                        &q,
-                        &layer_cache.keys,
-                        &layer_cache.values,
-                        &residual,
-                    )?;
-                hidden = next_hidden;
-                attention_stage_metrics.query_duration += attention_report.attention_gpu_duration;
-                attention_stage_metrics.oproj_duration += attention_report.oproj_gpu_duration;
-                attention_stage_metrics.residual_duration +=
-                    attention_report.residual_add_gpu_duration;
-                metrics.attention_duration += attention_report.attention_gpu_duration
-                    + attention_report.oproj_gpu_duration
-                    + attention_report.residual_add_gpu_duration;
-                session.metrics.compile_duration += compile_duration;
-                session.metrics.gpu_duration += attention_report.attention_gpu_duration
-                    + attention_report.oproj_gpu_duration
-                    + attention_report.residual_add_gpu_duration;
-                session.metrics.download_duration += download_duration;
+                let use_gpu_attention_tail = argmax_only
+                    && Self::packed_use_gpu_tail()
+                    && layer_idx + 1 == self.config.num_hidden_layers;
+                if use_gpu_attention_tail {
+                    let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
+                    let (next_token, attention_report, tail_report, compile_duration) =
+                        gpu_first_session.run_attention_layer_to_tail_argmax(
+                            layer_idx,
+                            position + 1,
+                            &q,
+                            &layer_cache.keys,
+                            &layer_cache.values,
+                            &residual,
+                            &final_norm_weight,
+                        )?;
+                    attention_stage_metrics.query_duration += attention_report.attention_gpu_duration;
+                    attention_stage_metrics.oproj_duration += attention_report.oproj_gpu_duration;
+                    attention_stage_metrics.residual_duration +=
+                        attention_report.residual_add_gpu_duration;
+                    metrics.attention_duration += attention_report.attention_gpu_duration
+                        + attention_report.oproj_gpu_duration
+                        + attention_report.residual_add_gpu_duration;
+                    metrics.norm_duration += tail_report.final_norm_gpu_duration;
+                    metrics.logits_duration += tail_report.pack_gpu_duration
+                        + tail_report.logits_gpu_duration
+                        + tail_report.logits_download_duration;
+                    session.metrics.compile_duration += compile_duration;
+                    session.metrics.gpu_duration += attention_report.attention_gpu_duration
+                        + attention_report.oproj_gpu_duration
+                        + attention_report.residual_add_gpu_duration
+                        + tail_report.final_norm_gpu_duration
+                        + tail_report.pack_gpu_duration
+                        + tail_report.logits_gpu_duration;
+                    session.metrics.download_duration += tail_report.logits_download_duration;
+                    return Ok(PackedDecodeStepResult::NextToken(next_token));
+                } else {
+                    let (next_hidden, attention_report, compile_duration, download_duration) =
+                        gpu_first_session.run_attention_layer_to_host(
+                            layer_idx,
+                            position + 1,
+                            &q,
+                            &layer_cache.keys,
+                            &layer_cache.values,
+                            &residual,
+                        )?;
+                    hidden = next_hidden;
+                    attention_stage_metrics.query_duration += attention_report.attention_gpu_duration;
+                    attention_stage_metrics.oproj_duration += attention_report.oproj_gpu_duration;
+                    attention_stage_metrics.residual_duration +=
+                        attention_report.residual_add_gpu_duration;
+                    metrics.attention_duration += attention_report.attention_gpu_duration
+                        + attention_report.oproj_gpu_duration
+                        + attention_report.residual_add_gpu_duration;
+                    session.metrics.compile_duration += compile_duration;
+                    session.metrics.gpu_duration += attention_report.attention_gpu_duration
+                        + attention_report.oproj_gpu_duration
+                        + attention_report.residual_add_gpu_duration;
+                    session.metrics.download_duration += download_duration;
+                }
             }
 
             if !use_gpu_attention_block {
@@ -7446,6 +7529,35 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when gpu tail is enabled");
         };
+        assert!(session.inner.gpu_first_session.tail_block.is_some());
+    }
+
+    #[test]
+    fn runs_gpu_attention_tail_path_without_gpu_mlp_block() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let _guard = lock_env();
+        let _env = ScopedEnvVars::set(&[
+            ("JENGINE_PACKED_ATTENTION_FULL", "1"),
+            ("JENGINE_GPU_ATTENTION_BLOCK", "1"),
+            ("JENGINE_GPU_TAIL", "1"),
+        ]);
+
+        let mut session = model.begin_packed_decode_session(2, true, true, true);
+        let _ = session
+            .push_prompt_token(2)
+            .expect("gpu attention tail token should decode");
+
+        let PackedDecodeSession::GpuFirst(session) = session else {
+            panic!("gpu-first session should be selected when gpu attention tail is enabled");
+        };
+        assert!(session.inner.gpu_first_session.attention_blocks.contains_key(&(0, 1)));
         assert!(session.inner.gpu_first_session.tail_block.is_some());
     }
 
