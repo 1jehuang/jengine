@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::cpu::primitives::argmax;
 use crate::gpu::pack_f16_pairs::{CachedGpuPackF16PairsRunner, GpuPackF16PairsError};
 use crate::gpu::packed_matvec::{
     CachedGpuPackedMatvecRunner, GpuPackedMatvecError, PackedRunnerInputMode,
@@ -245,15 +246,21 @@ impl CachedGpuFullLastLayerRunner {
                 self.final_norm_runner.output_buffer_size(),
             )
             .map_err(map_pack_f16_pairs_error)?;
-        let (argmax_index, logits_report) = self
+        let logits_report = self
             .logits_runner
-            .run_with_argmax_from_packed_buffer(
+            .run_resident_from_packed_buffer(
                 self.pack_runner.shared_context(),
                 self.pack_runner.output_buffer_handle(),
                 self.pack_runner.packed_len(),
                 self.pack_runner.output_buffer_size(),
             )
             .map_err(map_packed_matvec_error)?;
+        let (logits, logits_download_duration) = self
+            .logits_runner
+            .read_output()
+            .map_err(map_packed_matvec_error)?;
+        let argmax_index = argmax(&logits)
+            .ok_or_else(|| GpuFullLastLayerError("full last-layer logits were empty".to_string()))?;
 
         Ok(GpuFullLastLayerReport {
             hidden: self.hidden,
@@ -268,7 +275,7 @@ impl CachedGpuFullLastLayerRunner {
             final_norm_gpu_duration: final_norm_report.gpu_duration,
             pack_gpu_duration: pack_report.gpu_duration,
             logits_gpu_duration: logits_report.gpu_duration,
-            logits_download_duration: logits_report.download_duration,
+            logits_download_duration,
             argmax_index,
         })
     }
@@ -417,15 +424,21 @@ impl CachedGpuFullLastLayerRunner {
         }
         .map_err(|error| GpuFullLastLayerError(format!("vulkan fence wait failed: {error:?}")))?;
         let total_gpu_duration = gpu_started.elapsed();
-        let (argmax_index, logits_report) = self
+        let logits_report = self
             .logits_runner
-            .run_with_argmax_from_packed_buffer(
+            .run_resident_from_packed_buffer(
                 self.pack_runner.shared_context(),
                 self.pack_runner.output_buffer_handle(),
                 self.pack_runner.packed_len(),
                 self.pack_runner.output_buffer_size(),
             )
             .map_err(map_packed_matvec_error)?;
+        let (logits, logits_download_duration) = self
+            .logits_runner
+            .read_output()
+            .map_err(map_packed_matvec_error)?;
+        let argmax_index = argmax(&logits)
+            .ok_or_else(|| GpuFullLastLayerError("full last-layer logits were empty".to_string()))?;
 
         Ok(GpuFullLastLayerReport {
             hidden: self.hidden,
@@ -440,7 +453,7 @@ impl CachedGpuFullLastLayerRunner {
             final_norm_gpu_duration: Duration::ZERO,
             pack_gpu_duration: Duration::ZERO,
             logits_gpu_duration: Duration::ZERO,
-            logits_download_duration: logits_report.download_duration,
+            logits_download_duration,
             argmax_index,
         })
     }
