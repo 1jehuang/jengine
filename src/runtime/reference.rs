@@ -1,3 +1,4 @@
+use ash::vk;
 use crate::cpu::block::{YarnRope, build_yarn_rope, rope_cos_sin};
 use crate::cpu::primitives::{argmax, swiglu};
 use crate::gpu::pack_f16_pairs::CachedGpuPackF16PairsRunner;
@@ -5,6 +6,7 @@ use crate::gpu::packed_matvec::{
     CachedGpuPackedMatvecRunner, SharedGpuPackedContext, run_packed_ternary_matvec_with_output,
 };
 use crate::gpu::swiglu_combined::CachedGpuSwigluCombinedRunner;
+use crate::gpu::swiglu_pack_f16_pairs::CachedGpuSwigluPackF16PairsRunner;
 use crate::gpu::weighted_rms_norm::CachedGpuWeightedRmsNormRunner;
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
@@ -298,6 +300,10 @@ type CachedPackF16PairsGpuRunner = Rc<RefCell<CachedGpuPackF16PairsRunner>>;
 type CachedPackF16PairsGpuCacheEntry = (CachedPackF16PairsGpuRunner, Duration, bool);
 type CachedSwigluCombinedGpuRunner = Rc<RefCell<CachedGpuSwigluCombinedRunner>>;
 type CachedSwigluCombinedGpuCacheEntry = (CachedSwigluCombinedGpuRunner, Duration, bool);
+#[allow(dead_code)]
+type CachedSwigluPackF16PairsGpuRunner = Rc<RefCell<CachedGpuSwigluPackF16PairsRunner>>;
+#[allow(dead_code)]
+type CachedSwigluPackF16PairsGpuCacheEntry = (CachedSwigluPackF16PairsGpuRunner, Duration, bool);
 type ProjectionTripletOutputs = (Vec<f32>, Vec<f32>, Vec<f32>);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -751,9 +757,22 @@ struct ResidentGpuFinalNorm {
     gpu_cache_hit: bool,
 }
 
+#[allow(dead_code)]
+enum ResidentPackedActivationKeepalive {
+    PackF16(CachedPackF16PairsGpuRunner),
+    SwigluPackF16(CachedSwigluPackF16PairsGpuRunner),
+}
+
 struct ResidentGpuPackedActivation {
-    runner: CachedPackF16PairsGpuRunner,
-    report: crate::gpu::pack_f16_pairs::GpuPackF16PairsReport,
+    #[allow(dead_code)]
+    keepalive: ResidentPackedActivationKeepalive,
+    shared_context: Arc<SharedGpuPackedContext>,
+    buffer: vk::Buffer,
+    buffer_size: u64,
+    packed_len: usize,
+    logical_len: usize,
+    upload_duration: Duration,
+    gpu_duration: Duration,
     compile_duration: Duration,
     gpu_cache_hit: bool,
 }
@@ -815,10 +834,10 @@ impl<'a> PackedGpuSession<'a> {
             .runner
             .borrow_mut()
             .run_resident_from_packed_buffer(
-                activation.runner.borrow().shared_context(),
-                activation.runner.borrow().output_buffer_handle(),
-                activation.runner.borrow().packed_len(),
-                activation.runner.borrow().output_buffer_size(),
+                &activation.shared_context,
+                activation.buffer,
+                activation.packed_len,
+                activation.buffer_size,
             )
             .map_err(|error| {
                 ReferenceError::Decode(format!(
@@ -834,12 +853,12 @@ impl<'a> PackedGpuSession<'a> {
         report.download_duration = logits_download_duration;
 
         self.metrics.compile_duration += activation.compile_duration;
-        self.metrics.upload_duration += activation.report.upload_duration;
-        self.metrics.gpu_duration += activation.report.gpu_duration;
+        self.metrics.upload_duration += activation.upload_duration;
+        self.metrics.gpu_duration += activation.gpu_duration;
         self.metrics.dispatch_count += 1;
         self.metrics.gpu_cache_hits += usize::from(activation.gpu_cache_hit);
-        self.metrics.activation_upload_bytes += cols * std::mem::size_of::<f32>();
-        self.metrics.upload_bytes += cols * std::mem::size_of::<f32>();
+        self.metrics.activation_upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
         self.dispatch_trace.push(PackedDispatchTrace {
             index: self.dispatch_trace.len() + 1,
             operation: "resident".to_string(),
@@ -850,15 +869,15 @@ impl<'a> PackedGpuSession<'a> {
             cols,
             pack_cache_hit: false,
             gpu_cache_hit: activation.gpu_cache_hit,
-            cpu_ms: (activation.compile_duration + activation.report.upload_duration).as_secs_f64()
+            cpu_ms: (activation.compile_duration + activation.upload_duration).as_secs_f64()
                 * 1_000.0,
             compile_ms: activation.compile_duration.as_secs_f64() * 1_000.0,
             weight_upload_ms: 0.0,
-            activation_upload_ms: activation.report.upload_duration.as_secs_f64() * 1_000.0,
-            gpu_ms: activation.report.gpu_duration.as_secs_f64() * 1_000.0,
+            activation_upload_ms: activation.upload_duration.as_secs_f64() * 1_000.0,
+            gpu_ms: activation.gpu_duration.as_secs_f64() * 1_000.0,
             download_ms: 0.0,
             weight_upload_bytes: 0,
-            activation_upload_bytes: cols * std::mem::size_of::<f32>(),
+            activation_upload_bytes: activation.logical_len * std::mem::size_of::<f32>(),
             download_bytes: 0,
         });
 
@@ -1114,8 +1133,14 @@ impl<'a> PackedGpuSession<'a> {
             download_bytes: 0,
         });
         Ok(ResidentGpuPackedActivation {
-            runner,
-            report,
+            keepalive: ResidentPackedActivationKeepalive::PackF16(runner.clone()),
+            shared_context: runner.borrow().shared_context().clone(),
+            buffer: runner.borrow().output_buffer_handle(),
+            buffer_size: runner.borrow().output_buffer_size(),
+            packed_len: runner.borrow().packed_len(),
+            logical_len: final_norm.runner.borrow().len(),
+            upload_duration: report.upload_duration,
+            gpu_duration: report.gpu_duration,
             compile_duration,
             gpu_cache_hit,
         })
@@ -1248,8 +1273,14 @@ impl<'a> PackedGpuSession<'a> {
             download_bytes: 0,
         });
         Ok(ResidentGpuPackedActivation {
-            runner,
-            report,
+            keepalive: ResidentPackedActivationKeepalive::PackF16(runner.clone()),
+            shared_context: runner.borrow().shared_context().clone(),
+            buffer: runner.borrow().output_buffer_handle(),
+            buffer_size: runner.borrow().output_buffer_size(),
+            packed_len: runner.borrow().packed_len(),
+            logical_len: swiglu.runner.borrow().len(),
+            upload_duration: report.upload_duration,
+            gpu_duration: report.gpu_duration,
             compile_duration,
             gpu_cache_hit,
         })
@@ -1267,10 +1298,10 @@ impl<'a> PackedGpuSession<'a> {
             .runner
             .borrow_mut()
             .run_resident_from_packed_buffer(
-                activation.runner.borrow().shared_context(),
-                activation.runner.borrow().output_buffer_handle(),
-                activation.runner.borrow().packed_len(),
-                activation.runner.borrow().output_buffer_size(),
+                &activation.shared_context,
+                activation.buffer,
+                activation.packed_len,
+                activation.buffer_size,
             )
             .map_err(|error| {
                 ReferenceError::Decode(format!(
