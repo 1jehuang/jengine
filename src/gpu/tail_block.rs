@@ -6,6 +6,7 @@ use crate::gpu::pack_f16_pairs::{CachedGpuPackF16PairsRunner, GpuPackF16PairsErr
 use crate::gpu::packed_matvec::{
     CachedGpuPackedMatvecRunner, GpuPackedMatvecError, SharedGpuPackedContext,
 };
+use crate::gpu::resident_buffer::GpuResidentBuffer;
 use crate::gpu::weighted_rms_norm::{
     CachedGpuWeightedRmsNormRunner, GpuWeightedRmsNormError,
 };
@@ -173,6 +174,20 @@ impl CachedGpuTailBlockRunner {
             logits_download_duration,
             argmax_index,
         })
+    }
+
+    pub fn run_argmax_from_resident_tensor(
+        &mut self,
+        source: &GpuResidentBuffer,
+        final_norm_weight: &[f32],
+    ) -> Result<GpuTailBlockReport, GpuTailBlockError> {
+        self.run_argmax_from_resident_hidden(
+            &source.shared_context,
+            source.buffer,
+            source.len,
+            source.buffer_size,
+            final_norm_weight,
+        )
     }
 
     pub fn compile_duration(&self) -> Duration {

@@ -6,6 +6,7 @@ use crate::gpu::packed_matvec::{
     CachedGpuPackedMatvecRunner, GpuPackedMatvecError, PackedRunnerInputMode,
     SharedGpuPackedContext,
 };
+use crate::gpu::resident_buffer::GpuResidentBuffer;
 use crate::gpu::swiglu_pack_f16_pairs::{
     CachedGpuSwigluPackF16PairsRunner, GpuSwigluPackF16PairsError,
 };
@@ -265,6 +266,22 @@ impl CachedGpuFullLastLayerRunner {
             logits_download_duration,
             argmax_index,
         })
+    }
+
+    pub fn run_argmax_from_resident_tensor(
+        &mut self,
+        source: &GpuResidentBuffer,
+        post_norm_weight: &[f32],
+        final_norm_weight: &[f32],
+    ) -> Result<GpuFullLastLayerReport, GpuFullLastLayerError> {
+        self.run_argmax_from_resident_residual(
+            &source.shared_context,
+            source.buffer,
+            source.len,
+            source.buffer_size,
+            post_norm_weight,
+            final_norm_weight,
+        )
     }
 
     pub fn compile_duration(&self) -> Duration {

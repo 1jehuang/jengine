@@ -16,6 +16,7 @@ use crate::gpu::swiglu_combined::CachedGpuSwigluCombinedRunner;
 use crate::gpu::swiglu_pack_f16_pairs::CachedGpuSwigluPackF16PairsRunner;
 use crate::gpu::tail_block::{CachedGpuTailBlockRunner, GpuTailBlockReport};
 use crate::gpu::vector_add::CachedGpuVectorAddRunner;
+use crate::gpu::resident_buffer::GpuResidentBuffer;
 use crate::gpu::weighted_rms_norm::{
     CachedGpuWeightedRmsNormRunner, GpuWeightedRmsNormReport,
 };
@@ -1529,22 +1530,12 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .run_resident(q, keys, values, residual)
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         };
-        let attention_context = attention_block.shared_context().clone();
-        let attention_output = attention_block.output_buffer_handle();
-        let attention_output_size = attention_block.output_buffer_size();
-        let attention_hidden = attention_block.hidden();
+        let attention_output = attention_block.resident_output();
 
         let (full_last_layer_compile_duration, full_last_layer_block) =
             self.ensure_full_last_layer_block()?;
         let full_last_layer_report = full_last_layer_block
-            .run_argmax_from_resident_residual(
-                &attention_context,
-                attention_output,
-                attention_hidden,
-                attention_output_size,
-                post_norm_weight,
-                final_norm_weight,
-            )
+            .run_argmax_from_resident_tensor(&attention_output, post_norm_weight, final_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         Ok((
             full_last_layer_report.argmax_index,
@@ -1556,21 +1547,12 @@ impl<'a> GpuFirstRunnerCache<'a> {
 
     fn run_tail_argmax_from_resident_hidden(
         &mut self,
-        source_context: &Arc<SharedGpuPackedContext>,
-        source_buffer: vk::Buffer,
-        source_len: usize,
-        source_buffer_size: u64,
+        source: &GpuResidentBuffer,
         final_norm_weight: &[f32],
     ) -> Result<(usize, GpuTailBlockReport, Duration), ReferenceError> {
         let (compile_duration, tail_block) = self.ensure_tail_block()?;
         let report = tail_block
-            .run_argmax_from_resident_hidden(
-                source_context,
-                source_buffer,
-                source_len,
-                source_buffer_size,
-                final_norm_weight,
-            )
+            .run_argmax_from_resident_tensor(source, final_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         Ok((report.argmax_index, report, compile_duration))
     }
@@ -6334,12 +6316,15 @@ impl ReferenceModel {
             let norm_started = Instant::now();
             let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
             let next_token = if let Some(hidden_gpu) = final_hidden_gpu {
+                let hidden_gpu_output = GpuResidentBuffer::new(
+                    hidden_gpu.runner.borrow().shared_context().clone(),
+                    hidden_gpu.runner.borrow().output_buffer_handle(),
+                    hidden_gpu.runner.borrow().len(),
+                    hidden_gpu.runner.borrow().output_buffer_size(),
+                );
                 let (next_token, tail_report, compile_duration) =
                     gpu_first_session.run_tail_argmax_from_resident_hidden(
-                        hidden_gpu.runner.borrow().shared_context(),
-                        hidden_gpu.runner.borrow().output_buffer_handle(),
-                        hidden_gpu.runner.borrow().len(),
-                        hidden_gpu.runner.borrow().output_buffer_size(),
+                        &hidden_gpu_output,
                         &final_norm_weight,
                     )?;
                 metrics.norm_duration += norm_started.elapsed();
