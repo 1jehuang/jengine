@@ -1,3 +1,4 @@
+pub mod attention_single_query;
 pub mod fp16_matvec;
 pub mod pack_f16_pairs;
 pub mod packed_matvec;

@@ -1,0 +1,76 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer QueryBuffer {
+    float query_data[];
+};
+
+layout(std430, binding = 1) readonly buffer KeysBuffer {
+    float keys_data[];
+};
+
+layout(std430, binding = 2) readonly buffer ValuesBuffer {
+    float values_data[];
+};
+
+layout(std430, binding = 3) writeonly buffer OutputBuffer {
+    float output_data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint seq_len;
+    uint num_query_heads;
+    uint num_key_value_heads;
+    uint head_dim;
+} pc;
+
+void main() {
+    uint head = gl_GlobalInvocationID.x;
+    if (head >= pc.num_query_heads) {
+        return;
+    }
+
+    uint n_rep = pc.num_query_heads / pc.num_key_value_heads;
+    uint kv_head = head / n_rep;
+    uint q_offset = head * pc.head_dim;
+    float scale = inversesqrt(float(pc.head_dim));
+
+    float max_logit = -3.402823466e+38;
+    for (uint position = 0u; position < pc.seq_len; ++position) {
+        uint k_offset = (position * pc.num_key_value_heads + kv_head) * pc.head_dim;
+        float dot = 0.0;
+        for (uint i = 0u; i < pc.head_dim; ++i) {
+            dot += query_data[q_offset + i] * keys_data[k_offset + i];
+        }
+        float logit = dot * scale;
+        max_logit = max(max_logit, logit);
+    }
+
+    float denom = 0.0;
+    for (uint position = 0u; position < pc.seq_len; ++position) {
+        uint k_offset = (position * pc.num_key_value_heads + kv_head) * pc.head_dim;
+        float dot = 0.0;
+        for (uint i = 0u; i < pc.head_dim; ++i) {
+            dot += query_data[q_offset + i] * keys_data[k_offset + i];
+        }
+        float logit = dot * scale;
+        denom += exp(logit - max_logit);
+    }
+
+    for (uint i = 0u; i < pc.head_dim; ++i) {
+        float sum = 0.0;
+        for (uint position = 0u; position < pc.seq_len; ++position) {
+            uint k_offset = (position * pc.num_key_value_heads + kv_head) * pc.head_dim;
+            float dot = 0.0;
+            for (uint j = 0u; j < pc.head_dim; ++j) {
+                dot += query_data[q_offset + j] * keys_data[k_offset + j];
+            }
+            float logit = dot * scale;
+            float prob = exp(logit - max_logit) / denom;
+            uint v_offset = (position * pc.num_key_value_heads + kv_head) * pc.head_dim;
+            sum += prob * values_data[v_offset + i];
+        }
+        output_data[q_offset + i] = sum;
+    }
+}
