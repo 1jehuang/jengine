@@ -4,6 +4,7 @@ use crate::gpu::attention_block::{CachedGpuAttentionBlockRunner, GpuAttentionBlo
 use crate::gpu::full_last_layer_block::{
     CachedGpuFullLastLayerRunner, GpuFullLastLayerReport, PackedLinearSpec,
 };
+use crate::gpu::kv_cache::GpuKvCache;
 use crate::gpu::mlp_block::{CachedGpuMlpBlockRunner, GpuMlpBlockReport};
 use crate::gpu::pack_f16_pairs::CachedGpuPackF16PairsRunner;
 use crate::gpu::packed_matvec::{
@@ -859,7 +860,9 @@ struct PackedMlpStageMetrics {
 
 struct GpuFirstRunnerCache<'a> {
     model: &'a ReferenceModel,
+    kv_capacity_tokens: usize,
     shared_context: Option<Arc<SharedGpuPackedContext>>,
+    gpu_kv_caches: HashMap<usize, GpuKvCache>,
     attention_blocks: HashMap<(usize, usize), CachedGpuAttentionBlockRunner>,
     mlp_blocks: HashMap<usize, CachedGpuMlpBlockRunner>,
     full_last_layer_block: Option<CachedGpuFullLastLayerRunner>,
@@ -867,10 +870,12 @@ struct GpuFirstRunnerCache<'a> {
 }
 
 impl<'a> GpuFirstRunnerCache<'a> {
-    fn new(model: &'a ReferenceModel, _expected_tokens: usize) -> Self {
+    fn new(model: &'a ReferenceModel, expected_tokens: usize) -> Self {
         Self {
             model,
+            kv_capacity_tokens: expected_tokens,
             shared_context: None,
+            gpu_kv_caches: HashMap::new(),
             attention_blocks: HashMap::new(),
             mlp_blocks: HashMap::new(),
             full_last_layer_block: None,
@@ -887,6 +892,39 @@ impl<'a> GpuFirstRunnerCache<'a> {
         })?;
         self.shared_context = Some(context.clone());
         Ok(context)
+    }
+
+    fn ensure_gpu_kv_cache(&mut self, layer_idx: usize) -> Result<&mut GpuKvCache, ReferenceError> {
+        if !self.gpu_kv_caches.contains_key(&layer_idx) {
+            let context = self.get_or_create_shared_context()?;
+            let kv_width = self.model.config.num_key_value_heads * self.model.config.head_dim;
+            let cache = GpuKvCache::new_with_context(context, self.kv_capacity_tokens, kv_width)
+                .map_err(|error| {
+                    ReferenceError::Decode(format!(
+                        "gpu-first kv cache init failed for layer {layer_idx}: {error}"
+                    ))
+                })?;
+            self.gpu_kv_caches.insert(layer_idx, cache);
+        }
+        Ok(self
+            .gpu_kv_caches
+            .get_mut(&layer_idx)
+            .expect("gpu kv cache should exist after creation"))
+    }
+
+    fn append_gpu_kv(
+        &mut self,
+        layer_idx: usize,
+        key: &[f32],
+        value: &[f32],
+    ) -> Result<(), ReferenceError> {
+        self.ensure_gpu_kv_cache(layer_idx)?
+            .append(key, value)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu-first kv append failed for layer {layer_idx}: {error}"
+                ))
+            })
     }
 
     fn packed_linear_spec(
@@ -5368,6 +5406,10 @@ impl ReferenceModel {
             *non_offloaded_dense_duration += elapsed;
             session.push_dense_stage_trace("qk_norm_rope", &layer_tensors.q_norm_weight, elapsed);
 
+            if Self::packed_use_gpu_attention_block() {
+                gpu_first_session.append_gpu_kv(layer_idx, &k, &v)?;
+            }
+
             layer_cache.keys.extend_from_slice(&k);
             layer_cache.values.extend_from_slice(&v);
 
@@ -6255,7 +6297,7 @@ fn attention_single_query(
 
 #[cfg(test)]
 mod tests {
-    use super::{PackedDecodeStepResult, ReferenceModel};
+    use super::{PackedDecodeSession, PackedDecodeStepResult, ReferenceModel};
     use crate::runtime::packed_model::write_packed_model_artifact;
     use half::f16;
     use safetensors::tensor::{Dtype, TensorView, serialize};
@@ -6601,6 +6643,43 @@ mod tests {
         let _env = ScopedEnvVars::set(&[("JENGINE_GPU_ATTENTION_BLOCK", "1")]);
         let gpu_first = model.begin_packed_decode_session(2, true, true, true);
         assert!(gpu_first.is_gpu_first());
+    }
+
+    #[test]
+    fn populates_gpu_kv_cache_when_gpu_first_attention_is_enabled() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let _guard = lock_env();
+        let _env = ScopedEnvVars::set(&[("JENGINE_GPU_ATTENTION_BLOCK", "1")]);
+
+        let mut session = model.begin_packed_decode_session(2, true, true, true);
+        let _ = session
+            .push_prompt_token(2)
+            .expect("gpu-first prompt token should decode");
+
+        let PackedDecodeSession::GpuFirst(session) = session else {
+            panic!("gpu-first session should be selected when attention flag is enabled");
+        };
+        let kv_cache = session
+            .inner
+            .gpu_first_session
+            .gpu_kv_caches
+            .get(&0)
+            .expect("layer 0 gpu kv cache should exist");
+        assert_eq!(kv_cache.len_tokens(), 1);
+        assert_eq!(kv_cache.snapshot_keys().expect("kv keys should read back"), session.inner.cache[0].keys);
+        assert_eq!(
+            kv_cache
+                .snapshot_values()
+                .expect("kv values should read back"),
+            session.inner.cache[0].values
+        );
     }
 
     #[test]
