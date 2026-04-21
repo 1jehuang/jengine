@@ -4828,6 +4828,64 @@ impl ReferenceModel {
         Ok(next_token)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run_gpu_attention_mlp_resident_handoff(
+        &self,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+        layer_idx: usize,
+        position: usize,
+        q: &[f32],
+        q_resident: Option<&GpuResidentBuffer>,
+        residual_resident: Option<&GpuResidentBuffer>,
+        layer_cache: &LayerCache,
+        residual: &[f32],
+        layer_tensors: &LayerTensorNames,
+        attention_stage_metrics: &mut PackedAttentionStageMetrics,
+        mlp_stage_metrics: &mut PackedMlpStageMetrics,
+        metrics: &mut DecodeMetrics,
+        session: &mut PackedGpuSession<'_>,
+    ) -> Result<(), ReferenceError> {
+        let post_norm_weight =
+            self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
+        let (attention_report, mlp_report, compile_duration) =
+            gpu_first_session.run_attention_mlp_layer_resident(
+                layer_idx,
+                position + 1,
+                Some(q),
+                q_resident,
+                residual_resident,
+                layer_cache.keys(),
+                layer_cache.values(),
+                residual,
+                &post_norm_weight,
+            )?;
+        attention_stage_metrics.query_duration += attention_report.attention_gpu_duration;
+        attention_stage_metrics.oproj_duration += attention_report.oproj_gpu_duration;
+        attention_stage_metrics.residual_duration += attention_report.residual_add_gpu_duration;
+        metrics.attention_duration += attention_report.attention_gpu_duration
+            + attention_report.oproj_gpu_duration
+            + attention_report.residual_add_gpu_duration;
+        metrics.norm_duration += mlp_report.post_norm_gpu_duration;
+        mlp_stage_metrics.swiglu_duration += mlp_report.swiglu_pack_gpu_duration;
+        mlp_stage_metrics.down_duration += mlp_report.down_gpu_duration;
+        mlp_stage_metrics.residual_duration += mlp_report.residual_add_gpu_duration;
+        metrics.mlp_duration += mlp_report.post_norm_gpu_duration
+            + mlp_report.pair_gpu_duration
+            + mlp_report.swiglu_pack_gpu_duration
+            + mlp_report.down_gpu_duration
+            + mlp_report.residual_add_gpu_duration;
+        session.metrics.compile_duration += compile_duration;
+        session.metrics.gpu_duration += attention_report.attention_gpu_duration
+            + attention_report.oproj_gpu_duration
+            + attention_report.residual_add_gpu_duration
+            + mlp_report.post_norm_gpu_duration
+            + mlp_report.pair_gpu_duration
+            + mlp_report.swiglu_pack_gpu_duration
+            + mlp_report.down_gpu_duration
+            + mlp_report.residual_add_gpu_duration;
+        Ok(())
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -7297,46 +7355,22 @@ impl ReferenceModel {
                 return Ok(PackedDecodeStepResult::NextToken(next_token));
             }
             if use_gpu_attention_mlp_block {
-                let post_norm_weight =
-                    self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
-                let (attention_report, mlp_report, compile_duration) = gpu_first_session
-                    .run_attention_mlp_layer_resident(
-                        layer_idx,
-                        position + 1,
-                        Some(&q),
-                        q_resident.as_ref(),
-                        residual_resident.as_ref(),
-                        layer_cache.keys(),
-                        layer_cache.values(),
-                        &residual,
-                        &post_norm_weight,
-                    )?;
+                self.run_gpu_attention_mlp_resident_handoff(
+                    gpu_first_session,
+                    layer_idx,
+                    position,
+                    &q,
+                    q_resident.as_ref(),
+                    residual_resident.as_ref(),
+                    layer_cache,
+                    &residual,
+                    layer_tensors,
+                    attention_stage_metrics,
+                    mlp_stage_metrics,
+                    metrics,
+                    session,
+                )?;
                 resident_hidden_state = Some(ResidentHiddenState::Mlp { layer_idx });
-                attention_stage_metrics.query_duration += attention_report.attention_gpu_duration;
-                attention_stage_metrics.oproj_duration += attention_report.oproj_gpu_duration;
-                attention_stage_metrics.residual_duration +=
-                    attention_report.residual_add_gpu_duration;
-                metrics.attention_duration += attention_report.attention_gpu_duration
-                    + attention_report.oproj_gpu_duration
-                    + attention_report.residual_add_gpu_duration;
-                metrics.norm_duration += mlp_report.post_norm_gpu_duration;
-                mlp_stage_metrics.swiglu_duration += mlp_report.swiglu_pack_gpu_duration;
-                mlp_stage_metrics.down_duration += mlp_report.down_gpu_duration;
-                mlp_stage_metrics.residual_duration += mlp_report.residual_add_gpu_duration;
-                metrics.mlp_duration += mlp_report.post_norm_gpu_duration
-                    + mlp_report.pair_gpu_duration
-                    + mlp_report.swiglu_pack_gpu_duration
-                    + mlp_report.down_gpu_duration
-                    + mlp_report.residual_add_gpu_duration;
-                session.metrics.compile_duration += compile_duration;
-                session.metrics.gpu_duration += attention_report.attention_gpu_duration
-                    + attention_report.oproj_gpu_duration
-                    + attention_report.residual_add_gpu_duration
-                    + mlp_report.post_norm_gpu_duration
-                    + mlp_report.pair_gpu_duration
-                    + mlp_report.swiglu_pack_gpu_duration
-                    + mlp_report.down_gpu_duration
-                    + mlp_report.residual_add_gpu_duration;
                 if reusable_qkv_scratch {
                     session.restore_qkv_scratch(q, k, v);
                 }
