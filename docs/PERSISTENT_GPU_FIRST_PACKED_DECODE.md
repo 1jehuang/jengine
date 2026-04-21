@@ -67,6 +67,37 @@ Interpretation:
 - this makes the next blockers much clearer: CPU-visible dense glue, downloads, and dispatch count still dominate total token time
 - the path is now much closer to the current strong packed baseline, but it still needs further architectural reduction in downloads and non-offloaded dense work to become clearly better
 
+#### Warmed `JENGINE_GPU_ATTENTION_BLOCK=1 JENGINE_GPU_SWIGLU_BLOCK=1`
+
+This broader GPU-first block path is still not viable.
+
+Fresh prompt-inclusive measurements are catastrophic:
+
+- total: about `32.9 s` to `35.0 s`
+- `compile_ms`: about `31.1 s` to `33.0 s`
+- `dispatch_count=58`
+
+Interpretation:
+
+- this branch is still dominated by huge one-time runner creation or compile/setup work that current prewarm does not eliminate
+- so the immediate redesign effort should continue prioritizing the full-last-layer / tail-style GPU-first branch rather than the broader attention+swiglu block branch
+
+### Current next blockers after compile removal
+
+With the full-last-layer hot compile mostly removed, the remaining prominent costs are now:
+
+- `logits_argmax`
+- CPU `attention_core`
+- CPU `mlp_swiglu`
+- residual-add glue
+- total dispatch count
+
+So the next architectural focus should be:
+
+1. reduce logits-side download / argmax cost
+2. keep moving dense CPU glue off the host path
+3. collapse dispatch count once the GPU-first branch is stable
+
 
 ## Current architecture
 
