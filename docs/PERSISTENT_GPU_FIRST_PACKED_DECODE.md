@@ -100,11 +100,15 @@ So the next architectural focus should be:
 
 ### Hotspot summarizer helper
 
-A helper script now exists to summarize per-stage hotspots from `profile_packed_decode` JSON output:
+Helpers now exist to both capture the branch matrix and summarize hotspot breakdowns:
 
+- `scripts/profile_gpu_first_matrix.sh`
 - `scripts/summarize_packed_profile_hotspots.py <profile.json> [top_n]`
+- `scripts/profile_gpu_first_matrix_with_hotspots.sh [root] [artifact_dir] [prompt] [tokens] [out_dir] [top_n]`
 
-Using it on the latest matrix checkpoint makes the blocker hierarchy much clearer.
+The combined helper runs the branch matrix capture and writes a `hotspots.txt` file next to the generated JSON profiles.
+
+Using the summarizer on the latest matrix checkpoint makes the blocker hierarchy much clearer.
 
 #### Strong packed baseline hotspot summary
 
