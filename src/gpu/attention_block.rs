@@ -102,9 +102,8 @@ impl CachedGpuAttentionBlockRunner {
         let zeros = vec![0.0f32; self.hidden];
         let attention_report = self
             .attention_runner
-            .run_with_output(query, keys, values, None)
-            .map_err(map_attention_error)?
-            .1;
+            .run_resident(query, keys, values)
+            .map_err(map_attention_error)?;
         let oproj_report = self
             .o_proj_runner
             .run_resident_from_f32_buffer(
@@ -116,7 +115,7 @@ impl CachedGpuAttentionBlockRunner {
             .map_err(map_packed_matvec_error)?;
         let _ = self
             .residual_seed_runner
-            .run_with_output(residual, &zeros, None)
+            .run_resident(residual, &zeros)
             .map_err(map_vector_add_error)?;
         let add_report = self
             .add_runner

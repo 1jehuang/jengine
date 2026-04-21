@@ -1,5 +1,10 @@
 use crate::cpu::block::{YarnRope, build_yarn_rope, rope_cos_sin};
 use crate::cpu::primitives::{argmax, swiglu};
+use crate::gpu::attention_block::{CachedGpuAttentionBlockRunner, GpuAttentionBlockReport};
+use crate::gpu::full_last_layer_block::{
+    CachedGpuFullLastLayerRunner, GpuFullLastLayerReport, PackedLinearSpec,
+};
+use crate::gpu::mlp_block::{CachedGpuMlpBlockRunner, GpuMlpBlockReport};
 use crate::gpu::pack_f16_pairs::CachedGpuPackF16PairsRunner;
 use crate::gpu::packed_matvec::{
     CachedGpuPackedMatvecRunner, PackedRunnerInputMode, SharedGpuPackedContext,
@@ -7,6 +12,7 @@ use crate::gpu::packed_matvec::{
 };
 use crate::gpu::swiglu_combined::CachedGpuSwigluCombinedRunner;
 use crate::gpu::swiglu_pack_f16_pairs::CachedGpuSwigluPackF16PairsRunner;
+use crate::gpu::tail_block::{CachedGpuTailBlockRunner, GpuTailBlockReport};
 use crate::gpu::vector_add::CachedGpuVectorAddRunner;
 use crate::gpu::weighted_rms_norm::CachedGpuWeightedRmsNormRunner;
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
@@ -536,6 +542,7 @@ pub struct PersistentPackedDecodeSession<'a> {
     model: &'a ReferenceModel,
     cache: Vec<LayerCache>,
     gpu_session: PackedGpuSession<'a>,
+    gpu_first_session: GpuFirstRunnerCache<'a>,
     metrics: DecodeMetrics,
     attention_stage_metrics: PackedAttentionStageMetrics,
     mlp_stage_metrics: PackedMlpStageMetrics,
@@ -560,6 +567,7 @@ impl<'a> PersistentPackedDecodeSession<'a> {
             model,
             cache: model.allocate_layer_cache_vec(expected_tokens),
             gpu_session: PackedGpuSession::new(model),
+            gpu_first_session: GpuFirstRunnerCache::new(model, expected_tokens),
             metrics: DecodeMetrics {
                 prompt_tokens: 0,
                 generated_tokens: 0,
@@ -609,6 +617,7 @@ impl<'a> PersistentPackedDecodeSession<'a> {
             &mut self.mlp_stage_metrics,
             &mut self.non_offloaded_dense_duration,
             &mut self.gpu_session,
+            &mut self.gpu_first_session,
             self.use_attention_qkv,
             self.use_mlp_gu,
             self.use_attention_full,
@@ -706,6 +715,344 @@ struct PackedMlpStageMetrics {
     swiglu_duration: Duration,
     down_duration: Duration,
     residual_duration: Duration,
+}
+
+struct GpuFirstRunnerCache<'a> {
+    model: &'a ReferenceModel,
+    attention_blocks: HashMap<(usize, usize), CachedGpuAttentionBlockRunner>,
+    mlp_blocks: HashMap<usize, CachedGpuMlpBlockRunner>,
+    full_last_layer_block: Option<CachedGpuFullLastLayerRunner>,
+    tail_block: Option<CachedGpuTailBlockRunner>,
+}
+
+impl<'a> GpuFirstRunnerCache<'a> {
+    fn new(model: &'a ReferenceModel, _expected_tokens: usize) -> Self {
+        Self {
+            model,
+            attention_blocks: HashMap::new(),
+            mlp_blocks: HashMap::new(),
+            full_last_layer_block: None,
+            tail_block: None,
+        }
+    }
+
+    fn packed_linear_spec(
+        &self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<PackedLinearSpec, ReferenceError> {
+        let (packed, _, _) = self.model.get_or_create_projection_cache(tensor_name, rows, cols)?;
+        Ok(PackedLinearSpec {
+            code_words: packed.code_words.clone(),
+            scales: packed.scales.clone(),
+            group_size: packed.group_size,
+            rows: packed.rows,
+            cols: packed.cols,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn packed_pair_linear_spec(
+        &self,
+        cache_key: &str,
+        first_name: &str,
+        first_rows: usize,
+        second_name: &str,
+        second_rows: usize,
+        cols: usize,
+    ) -> Result<PackedLinearSpec, ReferenceError> {
+        let (packed, _, _) = self.model.get_or_create_projection_pair_cache(
+            cache_key,
+            first_name,
+            first_rows,
+            second_name,
+            second_rows,
+            cols,
+        )?;
+        Ok(PackedLinearSpec {
+            code_words: packed.code_words.clone(),
+            scales: packed.scales.clone(),
+            group_size: packed.group_size,
+            rows: packed.rows,
+            cols: packed.cols,
+        })
+    }
+
+    fn ensure_attention_block(
+        &mut self,
+        layer_idx: usize,
+        seq_len: usize,
+    ) -> Result<(Duration, &mut CachedGpuAttentionBlockRunner), ReferenceError> {
+        let cache_key = (layer_idx, seq_len);
+        let compile_duration = if self.attention_blocks.contains_key(&cache_key) {
+            Duration::ZERO
+        } else {
+            let layer_tensors = &self.model.layer_tensors[layer_idx];
+            let o_proj_spec = self.packed_linear_spec(
+                &layer_tensors.o_proj_weight,
+                self.model.config.hidden_size,
+                self.model.config.hidden_size,
+            )?;
+            let context = self.model.get_or_create_packed_gpu_context()?;
+            let runner = CachedGpuAttentionBlockRunner::new_with_context(
+                context,
+                seq_len,
+                self.model.config.num_attention_heads,
+                self.model.config.num_key_value_heads,
+                self.model.config.head_dim,
+                &o_proj_spec,
+            )
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+            let compile_duration = runner.compile_duration();
+            self.attention_blocks.insert(cache_key, runner);
+            compile_duration
+        };
+        Ok((
+            compile_duration,
+            self.attention_blocks
+                .get_mut(&cache_key)
+                .expect("attention block runner should exist after creation"),
+        ))
+    }
+
+    fn ensure_mlp_block(
+        &mut self,
+        layer_idx: usize,
+    ) -> Result<(Duration, &mut CachedGpuMlpBlockRunner), ReferenceError> {
+        let compile_duration = if self.mlp_blocks.contains_key(&layer_idx) {
+            Duration::ZERO
+        } else {
+            let layer_tensors = &self.model.layer_tensors[layer_idx];
+            let pair_cache_key = format!(
+                "gpu_first::layer::{layer_idx}::mlp_pair::{}+{}",
+                layer_tensors.gate_proj_weight, layer_tensors.up_proj_weight
+            );
+            let pair_spec = self.packed_pair_linear_spec(
+                &pair_cache_key,
+                &layer_tensors.gate_proj_weight,
+                self.model.config.intermediate_size,
+                &layer_tensors.up_proj_weight,
+                self.model.config.intermediate_size,
+                self.model.config.hidden_size,
+            )?;
+            let down_spec = self.packed_linear_spec(
+                &layer_tensors.down_proj_weight,
+                self.model.config.hidden_size,
+                self.model.config.intermediate_size,
+            )?;
+            let context = self.model.get_or_create_packed_gpu_context()?;
+            let runner = CachedGpuMlpBlockRunner::new_with_context(
+                context,
+                self.model.config.hidden_size,
+                self.model.config.intermediate_size,
+                self.model.config.rms_norm_eps as f32,
+                &pair_spec,
+                &down_spec,
+            )
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+            let compile_duration = runner.compile_duration();
+            self.mlp_blocks.insert(layer_idx, runner);
+            compile_duration
+        };
+        Ok((
+            compile_duration,
+            self.mlp_blocks
+                .get_mut(&layer_idx)
+                .expect("mlp block runner should exist after creation"),
+        ))
+    }
+
+    fn ensure_tail_block(&mut self) -> Result<(Duration, &mut CachedGpuTailBlockRunner), ReferenceError> {
+        let compile_duration = if self.tail_block.is_some() {
+            Duration::ZERO
+        } else {
+            let logits_spec = self.packed_linear_spec(
+                "model.embed_tokens.weight",
+                self.model.config.vocab_size,
+                self.model.config.hidden_size,
+            )?;
+            let context = self.model.get_or_create_packed_gpu_context()?;
+            let runner = CachedGpuTailBlockRunner::new_with_context(
+                context,
+                self.model.config.hidden_size,
+                self.model.config.vocab_size,
+                self.model.config.rms_norm_eps as f32,
+                &logits_spec,
+            )
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+            let compile_duration = runner.compile_duration();
+            self.tail_block = Some(runner);
+            compile_duration
+        };
+        Ok((
+            compile_duration,
+            self.tail_block
+                .as_mut()
+                .expect("tail block runner should exist after creation"),
+        ))
+    }
+
+    fn ensure_full_last_layer_block(
+        &mut self,
+    ) -> Result<(Duration, &mut CachedGpuFullLastLayerRunner), ReferenceError> {
+        let compile_duration = if self.full_last_layer_block.is_some() {
+            Duration::ZERO
+        } else {
+            let layer_idx = self.model.config.num_hidden_layers - 1;
+            let layer_tensors = &self.model.layer_tensors[layer_idx];
+            let pair_cache_key = format!(
+                "gpu_first::last_layer::mlp_pair::{}+{}",
+                layer_tensors.gate_proj_weight, layer_tensors.up_proj_weight
+            );
+            let pair_spec = self.packed_pair_linear_spec(
+                &pair_cache_key,
+                &layer_tensors.gate_proj_weight,
+                self.model.config.intermediate_size,
+                &layer_tensors.up_proj_weight,
+                self.model.config.intermediate_size,
+                self.model.config.hidden_size,
+            )?;
+            let down_spec = self.packed_linear_spec(
+                &layer_tensors.down_proj_weight,
+                self.model.config.hidden_size,
+                self.model.config.intermediate_size,
+            )?;
+            let logits_spec = self.packed_linear_spec(
+                "model.embed_tokens.weight",
+                self.model.config.vocab_size,
+                self.model.config.hidden_size,
+            )?;
+            let context = self.model.get_or_create_packed_gpu_context()?;
+            let runner = CachedGpuFullLastLayerRunner::new_with_context(
+                context,
+                self.model.config.hidden_size,
+                self.model.config.intermediate_size,
+                self.model.config.vocab_size,
+                self.model.config.rms_norm_eps as f32,
+                &pair_spec,
+                &down_spec,
+                &logits_spec,
+            )
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+            let compile_duration = runner.compile_duration();
+            self.full_last_layer_block = Some(runner);
+            compile_duration
+        };
+        Ok((
+            compile_duration,
+            self.full_last_layer_block
+                .as_mut()
+                .expect("full last-layer runner should exist after creation"),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_attention_mlp_layer_to_host(
+        &mut self,
+        layer_idx: usize,
+        seq_len: usize,
+        q: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        residual: &[f32],
+        post_norm_weight: &[f32],
+    ) -> Result<(Vec<f32>, GpuAttentionBlockReport, GpuMlpBlockReport, Duration, Duration), ReferenceError> {
+        let (attention_compile_duration, attention_block) =
+            self.ensure_attention_block(layer_idx, seq_len)?;
+        let attention_report = attention_block
+            .run_resident(q, keys, values, residual)
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let attention_context = attention_block.shared_context().clone();
+        let attention_output = attention_block.output_buffer_handle();
+        let attention_output_size = attention_block.output_buffer_size();
+        let attention_hidden = attention_block.hidden();
+
+        let (mlp_compile_duration, mlp_block) = self.ensure_mlp_block(layer_idx)?;
+        let mlp_report = mlp_block
+            .run_from_resident_residual(
+                &attention_context,
+                attention_output,
+                attention_hidden,
+                attention_output_size,
+                post_norm_weight,
+            )
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let (hidden, download_duration) = mlp_block
+            .read_output()
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+
+        Ok((
+            hidden,
+            attention_report,
+            mlp_report,
+            attention_compile_duration + mlp_compile_duration,
+            download_duration,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_attention_to_full_last_layer_argmax(
+        &mut self,
+        layer_idx: usize,
+        seq_len: usize,
+        q: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        residual: &[f32],
+        post_norm_weight: &[f32],
+        final_norm_weight: &[f32],
+    ) -> Result<(usize, GpuAttentionBlockReport, GpuFullLastLayerReport, Duration), ReferenceError> {
+        let (attention_compile_duration, attention_block) =
+            self.ensure_attention_block(layer_idx, seq_len)?;
+        let attention_report = attention_block
+            .run_resident(q, keys, values, residual)
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let attention_context = attention_block.shared_context().clone();
+        let attention_output = attention_block.output_buffer_handle();
+        let attention_output_size = attention_block.output_buffer_size();
+        let attention_hidden = attention_block.hidden();
+
+        let (full_last_layer_compile_duration, full_last_layer_block) =
+            self.ensure_full_last_layer_block()?;
+        let full_last_layer_report = full_last_layer_block
+            .run_argmax_from_resident_residual(
+                &attention_context,
+                attention_output,
+                attention_hidden,
+                attention_output_size,
+                post_norm_weight,
+                final_norm_weight,
+            )
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        Ok((
+            full_last_layer_report.argmax_index,
+            attention_report,
+            full_last_layer_report,
+            attention_compile_duration + full_last_layer_compile_duration,
+        ))
+    }
+
+    fn run_tail_argmax_from_resident_hidden(
+        &mut self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: vk::Buffer,
+        source_len: usize,
+        source_buffer_size: u64,
+        final_norm_weight: &[f32],
+    ) -> Result<(usize, GpuTailBlockReport, Duration), ReferenceError> {
+        let (compile_duration, tail_block) = self.ensure_tail_block()?;
+        let report = tail_block
+            .run_argmax_from_resident_hidden(
+                source_context,
+                source_buffer,
+                source_len,
+                source_buffer_size,
+                final_norm_weight,
+            )
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        Ok((report.argmax_index, report, compile_duration))
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -2101,6 +2448,10 @@ impl ReferenceModel {
 
     fn packed_use_gpu_swiglu_block() -> bool {
         std::env::var_os("JENGINE_GPU_SWIGLU_BLOCK").is_some()
+    }
+
+    fn packed_use_gpu_attention_block() -> bool {
+        std::env::var_os("JENGINE_GPU_ATTENTION_BLOCK").is_some()
     }
 
     fn packed_use_gpu_mlp_entry() -> bool {
@@ -4278,6 +4629,7 @@ impl ReferenceModel {
         };
         let mut cache = self.allocate_layer_cache_vec(prompt_ids.len());
         let mut session = PackedGpuSession::new(self);
+        let mut gpu_first_session = GpuFirstRunnerCache::new(self, prompt_ids.len());
         let mut non_offloaded_dense_duration = Duration::ZERO;
         let mut attention_stage_metrics = PackedAttentionStageMetrics::default();
         let mut mlp_stage_metrics = PackedMlpStageMetrics::default();
@@ -4294,6 +4646,7 @@ impl ReferenceModel {
                 &mut mlp_stage_metrics,
                 &mut non_offloaded_dense_duration,
                 &mut session,
+                &mut gpu_first_session,
                 use_attention_qkv,
                 use_mlp_gu,
                 use_attention_full,
@@ -4750,6 +5103,7 @@ impl ReferenceModel {
         mlp_stage_metrics: &mut PackedMlpStageMetrics,
         non_offloaded_dense_duration: &mut Duration,
         session: &mut PackedGpuSession<'_>,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
         use_attention_qkv: bool,
         use_mlp_gu: bool,
         use_attention_full: bool,
@@ -4844,10 +5198,116 @@ impl ReferenceModel {
             *non_offloaded_dense_duration += elapsed;
             session.push_dense_stage_trace("qk_norm_rope", &layer_tensors.q_norm_weight, elapsed);
 
-            let started_at = Instant::now();
-            let attn_started_at = Instant::now();
             layer_cache.keys.extend_from_slice(&k);
             layer_cache.values.extend_from_slice(&v);
+
+            let use_gpu_attention_block = use_attention_qkv
+                && use_attention_full
+                && use_mlp_gu
+                && use_mlp_full
+                && Self::packed_use_gpu_attention_block();
+            let use_gpu_attention_mlp_block =
+                use_gpu_attention_block && Self::packed_use_gpu_swiglu_block();
+            let use_gpu_full_last_layer_block = use_gpu_attention_mlp_block
+                && argmax_only
+                && Self::packed_use_gpu_full_last_layer()
+                && layer_idx + 1 == self.config.num_hidden_layers;
+            if use_gpu_full_last_layer_block {
+                let post_norm_weight =
+                    self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
+                let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
+                let (next_token, attention_report, full_last_layer_report, compile_duration) =
+                    gpu_first_session.run_attention_to_full_last_layer_argmax(
+                        layer_idx,
+                        position + 1,
+                        &q,
+                        &layer_cache.keys,
+                        &layer_cache.values,
+                        &residual,
+                        &post_norm_weight,
+                        &final_norm_weight,
+                    )?;
+                attention_stage_metrics.query_duration += attention_report.attention_gpu_duration;
+                attention_stage_metrics.oproj_duration += attention_report.oproj_gpu_duration;
+                attention_stage_metrics.residual_duration +=
+                    attention_report.residual_add_gpu_duration;
+                metrics.attention_duration += attention_report.attention_gpu_duration
+                    + attention_report.oproj_gpu_duration
+                    + attention_report.residual_add_gpu_duration;
+                metrics.norm_duration += full_last_layer_report.post_norm_gpu_duration
+                    + full_last_layer_report.final_norm_gpu_duration;
+                mlp_stage_metrics.swiglu_duration += full_last_layer_report.swiglu_pack_gpu_duration;
+                mlp_stage_metrics.down_duration += full_last_layer_report.down_gpu_duration;
+                mlp_stage_metrics.residual_duration +=
+                    full_last_layer_report.residual_add_gpu_duration;
+                metrics.mlp_duration += full_last_layer_report.post_norm_gpu_duration
+                    + full_last_layer_report.pair_gpu_duration
+                    + full_last_layer_report.swiglu_pack_gpu_duration
+                    + full_last_layer_report.down_gpu_duration
+                    + full_last_layer_report.residual_add_gpu_duration;
+                metrics.logits_duration += full_last_layer_report.pack_gpu_duration
+                    + full_last_layer_report.logits_gpu_duration
+                    + full_last_layer_report.logits_download_duration;
+                session.metrics.compile_duration += compile_duration;
+                session.metrics.gpu_duration += attention_report.attention_gpu_duration
+                    + attention_report.oproj_gpu_duration
+                    + attention_report.residual_add_gpu_duration
+                    + full_last_layer_report.post_norm_gpu_duration
+                    + full_last_layer_report.pair_gpu_duration
+                    + full_last_layer_report.swiglu_pack_gpu_duration
+                    + full_last_layer_report.down_gpu_duration
+                    + full_last_layer_report.residual_add_gpu_duration
+                    + full_last_layer_report.final_norm_gpu_duration
+                    + full_last_layer_report.pack_gpu_duration
+                    + full_last_layer_report.logits_gpu_duration;
+                session.metrics.download_duration += full_last_layer_report.logits_download_duration;
+                return Ok(PackedDecodeStepResult::NextToken(next_token));
+            }
+            if use_gpu_attention_mlp_block {
+                let post_norm_weight =
+                    self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
+                let (next_hidden, attention_report, mlp_report, compile_duration, download_duration) =
+                    gpu_first_session.run_attention_mlp_layer_to_host(
+                        layer_idx,
+                        position + 1,
+                        &q,
+                        &layer_cache.keys,
+                        &layer_cache.values,
+                        &residual,
+                        &post_norm_weight,
+                    )?;
+                hidden = next_hidden;
+                attention_stage_metrics.query_duration += attention_report.attention_gpu_duration;
+                attention_stage_metrics.oproj_duration += attention_report.oproj_gpu_duration;
+                attention_stage_metrics.residual_duration +=
+                    attention_report.residual_add_gpu_duration;
+                metrics.attention_duration += attention_report.attention_gpu_duration
+                    + attention_report.oproj_gpu_duration
+                    + attention_report.residual_add_gpu_duration;
+                metrics.norm_duration += mlp_report.post_norm_gpu_duration;
+                mlp_stage_metrics.swiglu_duration += mlp_report.swiglu_pack_gpu_duration;
+                mlp_stage_metrics.down_duration += mlp_report.down_gpu_duration;
+                mlp_stage_metrics.residual_duration += mlp_report.residual_add_gpu_duration;
+                metrics.mlp_duration += mlp_report.post_norm_gpu_duration
+                    + mlp_report.pair_gpu_duration
+                    + mlp_report.swiglu_pack_gpu_duration
+                    + mlp_report.down_gpu_duration
+                    + mlp_report.residual_add_gpu_duration;
+                session.metrics.compile_duration += compile_duration;
+                session.metrics.gpu_duration += attention_report.attention_gpu_duration
+                    + attention_report.oproj_gpu_duration
+                    + attention_report.residual_add_gpu_duration
+                    + mlp_report.post_norm_gpu_duration
+                    + mlp_report.pair_gpu_duration
+                    + mlp_report.swiglu_pack_gpu_duration
+                    + mlp_report.down_gpu_duration
+                    + mlp_report.residual_add_gpu_duration;
+                session.metrics.download_duration += download_duration;
+                continue;
+            }
+
+            let started_at = Instant::now();
+            let attn_started_at = Instant::now();
             let attn = attention_single_query(
                 &q,
                 &layer_cache.keys,
@@ -5161,18 +5621,24 @@ impl ReferenceModel {
             let norm_started = Instant::now();
             let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
             let next_token = if let Some(hidden_gpu) = final_hidden_gpu {
-                let final_norm = session
-                    .run_final_norm_resident_from_vector_add(hidden_gpu, &final_norm_weight)?;
+                let (next_token, tail_report, compile_duration) =
+                    gpu_first_session.run_tail_argmax_from_resident_hidden(
+                        hidden_gpu.runner.borrow().shared_context(),
+                        hidden_gpu.runner.borrow().output_buffer_handle(),
+                        hidden_gpu.runner.borrow().len(),
+                        hidden_gpu.runner.borrow().output_buffer_size(),
+                        &final_norm_weight,
+                    )?;
                 metrics.norm_duration += norm_started.elapsed();
-                let logits_started = Instant::now();
-                let packed_activation = session.run_pack_f16_pairs_resident(final_norm)?;
-                let next_token = session.run_projection_argmax_from_packed_activation(
-                    "model.embed_tokens.weight",
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                    packed_activation,
-                )?;
-                metrics.logits_duration += logits_started.elapsed();
+                metrics.logits_duration += tail_report.pack_gpu_duration
+                    + tail_report.logits_gpu_duration
+                    + tail_report.logits_download_duration;
+                session.metrics.compile_duration += hidden_gpu.compile_duration + compile_duration;
+                session.metrics.gpu_duration += hidden_gpu.report.gpu_duration
+                    + tail_report.final_norm_gpu_duration
+                    + tail_report.pack_gpu_duration
+                    + tail_report.logits_gpu_duration;
+                session.metrics.download_duration += tail_report.logits_download_duration;
                 next_token
             } else if Self::packed_use_gpu_final_norm() {
                 let final_norm = session.run_final_norm_resident(&hidden, &final_norm_weight)?;
@@ -5625,6 +6091,7 @@ mod tests {
     use safetensors::tensor::{Dtype, TensorView, serialize};
     use std::collections::BTreeMap;
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
     use tokenizers::Tokenizer;
     use tokenizers::models::wordlevel::WordLevel;
@@ -5757,6 +6224,46 @@ mod tests {
         fs::write(root.join("model.safetensors"), bytes).expect("model should be written");
     }
 
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn set_env(key: &str, value: &str) {
+        unsafe { std::env::set_var(key, value) }
+    }
+
+    fn remove_env(key: &str) {
+        unsafe { std::env::remove_var(key) }
+    }
+
+    struct ScopedEnvVars(Vec<(&'static str, Option<String>)>);
+
+    impl ScopedEnvVars {
+        fn set(pairs: &[(&'static str, &'static str)]) -> Self {
+            let previous = pairs
+                .iter()
+                .map(|(key, value)| {
+                    let old = std::env::var(key).ok();
+                    set_env(key, value);
+                    (*key, old)
+                })
+                .collect();
+            Self(previous)
+        }
+    }
+
+    impl Drop for ScopedEnvVars {
+        fn drop(&mut self) {
+            for (key, value) in self.0.drain(..) {
+                match value {
+                    Some(old) => set_env(key, &old),
+                    None => remove_env(key),
+                }
+            }
+        }
+    }
+
     #[test]
     fn runs_end_to_end_greedy_decode_on_synthetic_model() {
         let dir = tempdir().expect("tempdir should be created");
@@ -5783,6 +6290,7 @@ mod tests {
         let model =
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed-first model should load");
+        let _guard = env_lock().lock().expect("env lock should be acquired");
         let result = model
             .generate_packed_greedy("tok2", 1, true, true)
             .expect("packed gpu decode should succeed");
@@ -5827,6 +6335,38 @@ mod tests {
     }
 
     #[test]
+    fn runs_end_to_end_gpu_block_decode_from_packed_artifact_on_synthetic_model() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+
+        let _guard = env_lock().lock().expect("env lock should be acquired");
+        let _env = ScopedEnvVars::set(&[
+            ("JENGINE_PACKED_ATTENTION_FULL", "1"),
+            ("JENGINE_PACKED_MLP_FULL", "1"),
+            ("JENGINE_GPU_ATTENTION_BLOCK", "1"),
+            ("JENGINE_GPU_SWIGLU_BLOCK", "1"),
+            ("JENGINE_GPU_FULL_LAST_LAYER", "1"),
+        ]);
+
+        let result = model
+            .generate_packed_greedy("tok2", 1, true, true)
+            .expect("gpu block packed decode should succeed");
+
+        assert_eq!(result.output_token_ids, vec![2, 2]);
+        assert_eq!(result.output_text, "tok2 tok2");
+        assert!(result.metrics.attention_duration > Duration::ZERO);
+        assert!(result.metrics.mlp_duration > Duration::ZERO);
+        assert!(result.metrics.logits_duration > Duration::ZERO);
+        assert!(!result.dispatch_trace.is_empty());
+    }
+
+    #[test]
     fn reuses_persistent_packed_decode_session_across_generation_loop() {
         let dir = tempdir().expect("tempdir should be created");
         write_synthetic_model(dir.path());
@@ -5836,6 +6376,7 @@ mod tests {
         let model =
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed-first model should load");
+        let _guard = env_lock().lock().expect("env lock should be acquired");
         let mut session = model.begin_packed_decode_session(2, true, true, true);
         let predicted = match session
             .push_prompt_token(2)
@@ -5958,6 +6499,7 @@ mod tests {
         let packed =
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed model should load");
+        let _guard = env_lock().lock().expect("env lock should be acquired");
 
         let attention = packed
             .compare_prefill_logits_against(&dense, "tok2", true, false)
@@ -5984,6 +6526,7 @@ mod tests {
         let packed =
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed model should load");
+        let _guard = env_lock().lock().expect("env lock should be acquired");
         let layers = packed.config.num_hidden_layers;
 
         let (_, attention) = packed
@@ -6011,6 +6554,7 @@ mod tests {
         let packed =
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed model should load");
+        let _guard = env_lock().lock().expect("env lock should be acquired");
         let prompt_ids = [2usize];
         let expected_dispatches = packed.config.num_hidden_layers * 2 + 1;
         let kv_rows = packed.config.num_key_value_heads * packed.config.head_dim;

@@ -202,7 +202,7 @@ impl CachedGpuFullLastLayerRunner {
             .map_err(map_packed_matvec_error)?;
         let _ = self
             .residual_seed_runner
-            .run_with_output(mlp_residual, &zeros, None)
+            .run_resident(mlp_residual, &zeros)
             .map_err(map_vector_add_error)?;
         let add_report = self
             .add_runner

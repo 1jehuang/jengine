@@ -380,6 +380,42 @@ impl CachedGpuAttentionSingleQueryRunner {
         ))
     }
 
+    pub fn run_resident(
+        &mut self,
+        query: &[f32],
+        keys: &[f32],
+        values: &[f32],
+    ) -> Result<GpuAttentionSingleQueryReport, GpuAttentionSingleQueryError> {
+        if query.len() != self.query_len || keys.len() != self.kv_len || values.len() != self.kv_len
+        {
+            return Err(GpuAttentionSingleQueryError::Shape(format!(
+                "query len {}, keys len {}, values len {} must match {}, {}, {}",
+                query.len(),
+                keys.len(),
+                values.len(),
+                self.query_len,
+                self.kv_len,
+                self.kv_len
+            )));
+        }
+        let upload_started = Instant::now();
+        write_f32_buffer(&self.query_buffer, query)?;
+        write_f32_buffer(&self.keys_buffer, keys)?;
+        write_f32_buffer(&self.values_buffer, values)?;
+        let upload_duration = upload_started.elapsed();
+        let gpu_duration = self.submit_and_wait()?;
+        Ok(GpuAttentionSingleQueryReport {
+            query_len: self.query_len,
+            seq_len: self.seq_len,
+            compile_duration: Duration::ZERO,
+            upload_duration,
+            gpu_duration,
+            download_duration: Duration::ZERO,
+            max_abs_diff: 0.0,
+            mean_abs_diff: 0.0,
+        })
+    }
+
     pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> {
         &self._shared_context
     }

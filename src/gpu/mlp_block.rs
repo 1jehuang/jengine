@@ -149,7 +149,7 @@ impl CachedGpuMlpBlockRunner {
             .map_err(map_packed_matvec_error)?;
         let _ = self
             .residual_seed_runner
-            .run_with_output(post_attention_hidden, &zeros, None)
+            .run_resident(post_attention_hidden, &zeros)
             .map_err(map_vector_add_error)?;
         let add_report = self
             .add_runner

@@ -323,6 +323,35 @@ impl CachedGpuVectorAddRunner {
         ))
     }
 
+    pub fn run_resident(
+        &mut self,
+        left: &[f32],
+        right: &[f32],
+    ) -> Result<GpuVectorAddReport, GpuVectorAddError> {
+        if left.len() != self.len || right.len() != self.len {
+            return Err(GpuVectorAddError::Shape(format!(
+                "left len {} and right len {} must both match {}",
+                left.len(),
+                right.len(),
+                self.len
+            )));
+        }
+        let upload_started = Instant::now();
+        write_f32_buffer(&self.left_buffer, left)?;
+        write_f32_buffer(&self.right_buffer, right)?;
+        let upload_duration = upload_started.elapsed();
+        let gpu_duration = self.submit_and_wait()?;
+        Ok(GpuVectorAddReport {
+            len: self.len,
+            compile_duration: Duration::ZERO,
+            upload_duration,
+            gpu_duration,
+            download_duration: Duration::ZERO,
+            max_abs_diff: 0.0,
+            mean_abs_diff: 0.0,
+        })
+    }
+
     pub fn run_resident_from_left_buffer_and_host(
         &mut self,
         source_context: &Arc<SharedGpuPackedContext>,
