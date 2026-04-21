@@ -1067,10 +1067,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let (hidden, embedding_report) = embedding_runner
             .run_with_output(token_id)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-        let embedding_context = embedding_runner.shared_context().clone();
-        let embedding_buffer = embedding_runner.output_buffer_handle();
-        let embedding_buffer_size = embedding_runner.output_buffer_size();
-        let hidden_len = embedding_runner.hidden();
+        let embedding_output = embedding_runner.resident_output();
 
         let cache_key = format!(
             "gpu_first::layer::{layer_idx}::qkv_triplet::{q_proj_name}||{k_proj_name}||{v_proj_name}"
@@ -1086,22 +1083,14 @@ impl<'a> GpuFirstRunnerCache<'a> {
             hidden_size,
         )?;
 
-        let (norm_compile_duration, norm_context, norm_buffer, norm_buffer_size, norm_report) = {
+        let (norm_compile_duration, norm_context, norm_report) = {
             let (norm_compile_duration, input_norm_runner) = self.ensure_input_norm_runner()?;
             let norm_report = input_norm_runner
-                .run_resident_from_f32_buffer(
-                    &embedding_context,
-                    embedding_buffer,
-                    hidden_len,
-                    embedding_buffer_size,
-                    input_norm_weight,
-                )
+                .run_resident_from_tensor(&embedding_output, input_norm_weight)
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?;
             (
                 norm_compile_duration,
-                input_norm_runner.shared_context().clone(),
-                input_norm_runner.output_buffer_handle(),
-                input_norm_runner.output_buffer_size(),
+                input_norm_runner.resident_output(),
                 norm_report,
             )
         };
@@ -1109,12 +1098,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let (qkv_compile_duration, qkv_runner) =
             self.ensure_raw_f32_projection_runner(&cache_key, &packed)?;
         let qkv_report = qkv_runner
-            .run_resident_from_f32_buffer(
-                &norm_context,
-                norm_buffer,
-                hidden_size,
-                norm_buffer_size,
-            )
+            .run_resident_from_f32_tensor(&norm_context)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let (combined, qkv_download_duration) = qkv_runner
             .read_output()

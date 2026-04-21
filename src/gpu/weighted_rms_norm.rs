@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::gpu::packed_matvec::SharedGpuPackedContext;
+use crate::gpu::resident_buffer::GpuResidentBuffer;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GpuWeightedRmsNormReport {
@@ -388,6 +389,29 @@ impl CachedGpuWeightedRmsNormRunner {
             max_abs_diff: 0.0,
             mean_abs_diff: 0.0,
         })
+    }
+
+    pub fn run_resident_from_tensor(
+        &mut self,
+        source: &GpuResidentBuffer,
+        weight: &[f32],
+    ) -> Result<GpuWeightedRmsNormReport, GpuWeightedRmsNormError> {
+        self.run_resident_from_f32_buffer(
+            &source.shared_context,
+            source.buffer,
+            source.len,
+            source.buffer_size,
+            weight,
+        )
+    }
+
+    pub fn resident_output(&self) -> GpuResidentBuffer {
+        GpuResidentBuffer::new(
+            self.shared_context().clone(),
+            self.output_buffer_handle(),
+            self.len(),
+            self.output_buffer_size(),
+        )
     }
 
     pub fn read_output(&self) -> Result<(Vec<f32>, Duration), GpuWeightedRmsNormError> {

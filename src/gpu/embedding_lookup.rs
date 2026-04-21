@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::gpu::packed_matvec::SharedGpuPackedContext;
+use crate::gpu::resident_buffer::GpuResidentBuffer;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GpuEmbeddingLookupReport {
@@ -313,6 +314,15 @@ impl CachedGpuEmbeddingLookupRunner {
 
     pub fn hidden(&self) -> usize {
         self.hidden
+    }
+
+    pub fn resident_output(&self) -> GpuResidentBuffer {
+        GpuResidentBuffer::new(
+            self.shared_context().clone(),
+            self.output_buffer_handle(),
+            self.hidden(),
+            self.output_buffer_size(),
+        )
     }
 
     fn submit_and_wait(&self) -> Result<Duration, GpuEmbeddingLookupError> {

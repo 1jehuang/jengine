@@ -1,3 +1,4 @@
+use crate::gpu::resident_buffer::GpuResidentBuffer;
 use ash::util::read_spv;
 use ash::{Device, Entry, Instance, vk};
 use half::f16;
@@ -771,6 +772,30 @@ impl CachedGpuPackedMatvecRunner {
             max_abs_diff: 0.0,
             mean_abs_diff: 0.0,
         })
+    }
+
+    pub fn run_resident_from_f32_tensor(
+        &mut self,
+        source: &GpuResidentBuffer,
+    ) -> Result<GpuPackedMatvecReport, GpuPackedMatvecError> {
+        self.run_resident_from_f32_buffer(
+            &source.shared_context,
+            source.buffer,
+            source.len,
+            source.buffer_size,
+        )
+    }
+
+    pub fn run_resident_from_packed_tensor(
+        &mut self,
+        source: &GpuResidentBuffer,
+    ) -> Result<GpuPackedMatvecReport, GpuPackedMatvecError> {
+        self.run_resident_from_packed_buffer(
+            &source.shared_context,
+            source.buffer,
+            source.len,
+            source.buffer_size,
+        )
     }
 
     pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> {
