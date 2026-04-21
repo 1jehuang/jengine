@@ -1270,13 +1270,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         Ok((compile_duration, runner))
     }
 
-    fn prewarm_decode_path(
-        &mut self,
-        use_attention_qkv: bool,
-        use_mlp_gu: bool,
-    ) -> Result<(), ReferenceError> {
-        let _ = self.get_or_create_shared_context()?;
-
+    fn prewarm_gpu_entry_runners(&mut self) -> Result<(), ReferenceError> {
         if packed_use_gpu_embedding()
             || packed_use_gpu_attention_block()
             || packed_use_gpu_tail()
@@ -1286,7 +1280,10 @@ impl<'a> GpuFirstRunnerCache<'a> {
             let _ = self.ensure_embedding_lookup_runner()?;
             let _ = self.ensure_input_norm_runner()?;
         }
+        Ok(())
+    }
 
+    fn prewarm_gpu_attention_runners(&mut self, use_attention_qkv: bool) -> Result<(), ReferenceError> {
         if use_attention_qkv
             && (packed_use_gpu_attention_block()
                 || packed_use_gpu_tail()
@@ -1296,13 +1293,16 @@ impl<'a> GpuFirstRunnerCache<'a> {
             for layer_idx in 0..self.model.config.num_hidden_layers {
                 let _ = self.ensure_gpu_kv_cache(layer_idx)?;
                 if packed_use_gpu_attention_block() {
-                    for seq_len in 1..=self.kv_capacity_tokens.max(1) {
+                    for _seq_len in 1..=self.kv_capacity_tokens.max(1) {
                         let _ = self.ensure_attention_block(layer_idx)?;
                     }
                 }
             }
         }
+        Ok(())
+    }
 
+    fn prewarm_gpu_mlp_runners(&mut self, use_mlp_gu: bool) -> Result<(), ReferenceError> {
         if use_mlp_gu
             && (packed_use_gpu_swiglu_block()
                 || packed_use_gpu_tail()
@@ -1312,18 +1312,35 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 let _ = self.ensure_mlp_block(layer_idx)?;
             }
         }
+        Ok(())
+    }
 
+    fn prewarm_gpu_tail_runners(&mut self) -> Result<(), ReferenceError> {
         if packed_use_gpu_tail() {
             let _ = self.ensure_tail_block()?;
         }
 
         if packed_use_gpu_full_last_layer() {
             let last_layer_idx = self.model.config.num_hidden_layers - 1;
-            for seq_len in 1..=self.kv_capacity_tokens.max(1) {
+            for _seq_len in 1..=self.kv_capacity_tokens.max(1) {
                 let _ = self.ensure_attention_block(last_layer_idx)?;
             }
             let _ = self.ensure_full_last_layer_block()?;
         }
+        Ok(())
+    }
+
+    fn prewarm_decode_path(
+        &mut self,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+    ) -> Result<(), ReferenceError> {
+        let _ = self.get_or_create_shared_context()?;
+
+        self.prewarm_gpu_entry_runners()?;
+        self.prewarm_gpu_attention_runners(use_attention_qkv)?;
+        self.prewarm_gpu_mlp_runners(use_mlp_gu)?;
+        self.prewarm_gpu_tail_runners()?;
 
         Ok(())
     }
