@@ -536,23 +536,6 @@ impl<'a> PersistentPackedDecodeSession<'a> {
         }
     }
 
-    pub(crate) fn new(
-        model: &'a ReferenceModel,
-        expected_tokens: usize,
-        use_attention_qkv: bool,
-        use_mlp_gu: bool,
-        argmax_only: bool,
-    ) -> Self {
-        Self::new_with_cpu_kv_preallocation(
-            model,
-            expected_tokens,
-            use_attention_qkv,
-            use_mlp_gu,
-            argmax_only,
-            true,
-        )
-    }
-
     pub(crate) fn set_full_modes(&mut self, use_attention_full: bool, use_mlp_full: bool) {
         self.use_attention_full = use_attention_full;
         self.use_mlp_full = use_mlp_full;

@@ -41,6 +41,25 @@ pub struct GpuDecodeEngine<'a> {
     plan: PackedDecodePlan,
 }
 
+impl<'a> PersistentPackedDecodeSession<'a> {
+    pub(crate) fn new(
+        model: &'a ReferenceModel,
+        expected_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        argmax_only: bool,
+    ) -> Self {
+        Self::new_with_cpu_kv_preallocation(
+            model,
+            expected_tokens,
+            use_attention_qkv,
+            use_mlp_gu,
+            argmax_only,
+            true,
+        )
+    }
+}
+
 impl<'a> GpuFirstPackedDecodeSession<'a> {
     pub(crate) fn new(
         model: &'a ReferenceModel,
