@@ -16,7 +16,9 @@ use crate::gpu::swiglu_combined::CachedGpuSwigluCombinedRunner;
 use crate::gpu::swiglu_pack_f16_pairs::CachedGpuSwigluPackF16PairsRunner;
 use crate::gpu::tail_block::{CachedGpuTailBlockRunner, GpuTailBlockReport};
 use crate::gpu::vector_add::CachedGpuVectorAddRunner;
-use crate::gpu::weighted_rms_norm::CachedGpuWeightedRmsNormRunner;
+use crate::gpu::weighted_rms_norm::{
+    CachedGpuWeightedRmsNormRunner, GpuWeightedRmsNormReport,
+};
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
@@ -864,6 +866,7 @@ struct GpuFirstRunnerCache<'a> {
     kv_capacity_tokens: usize,
     shared_context: Option<Arc<SharedGpuPackedContext>>,
     embedding_lookup_runner: Option<CachedGpuEmbeddingLookupRunner>,
+    input_norm_runner: Option<CachedGpuWeightedRmsNormRunner>,
     gpu_kv_caches: HashMap<usize, GpuKvCache>,
     attention_blocks: HashMap<(usize, usize), CachedGpuAttentionBlockRunner>,
     mlp_blocks: HashMap<usize, CachedGpuMlpBlockRunner>,
@@ -878,6 +881,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
             kv_capacity_tokens: expected_tokens,
             shared_context: None,
             embedding_lookup_runner: None,
+            input_norm_runner: None,
             gpu_kv_caches: HashMap::new(),
             attention_blocks: HashMap::new(),
             mlp_blocks: HashMap::new(),
@@ -977,15 +981,77 @@ impl<'a> GpuFirstRunnerCache<'a> {
         ))
     }
 
-    fn run_embedding_lookup_to_host(
+    fn ensure_input_norm_runner(
+        &mut self,
+    ) -> Result<(Duration, &mut CachedGpuWeightedRmsNormRunner), ReferenceError> {
+        let compile_duration = if self.input_norm_runner.is_some() {
+            Duration::ZERO
+        } else {
+            let context = self.get_or_create_shared_context()?;
+            let (runner, compile_duration) = CachedGpuWeightedRmsNormRunner::new_with_context(
+                context,
+                self.model.config.hidden_size,
+                self.model.config.rms_norm_eps as f32,
+            )
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+            self.input_norm_runner = Some(runner);
+            compile_duration
+        };
+        Ok((
+            compile_duration,
+            self.input_norm_runner
+                .as_mut()
+                .expect("input norm runner should exist after creation"),
+        ))
+    }
+
+    fn run_embedding_and_input_norm_to_host(
         &mut self,
         token_id: usize,
-    ) -> Result<(Vec<f32>, GpuEmbeddingLookupReport, Duration), ReferenceError> {
-        let (compile_duration, runner) = self.ensure_embedding_lookup_runner()?;
-        let (hidden, report) = runner
+        input_norm_weight: &[f32],
+    ) -> Result<
+        (
+            Vec<f32>,
+            Vec<f32>,
+            GpuEmbeddingLookupReport,
+            GpuWeightedRmsNormReport,
+            Duration,
+        ),
+        ReferenceError,
+    > {
+        let (embedding_compile_duration, embedding_runner) = self.ensure_embedding_lookup_runner()?;
+        let (hidden, embedding_report) = embedding_runner
             .run_with_output(token_id)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-        Ok((hidden, report, compile_duration))
+        let embedding_context = embedding_runner.shared_context().clone();
+        let embedding_buffer = embedding_runner.output_buffer_handle();
+        let embedding_buffer_size = embedding_runner.output_buffer_size();
+        let hidden_len = embedding_runner.hidden();
+
+        let (norm_compile_duration, input_norm_runner) = self.ensure_input_norm_runner()?;
+        let norm_report = input_norm_runner
+            .run_resident_from_f32_buffer(
+                &embedding_context,
+                embedding_buffer,
+                hidden_len,
+                embedding_buffer_size,
+                input_norm_weight,
+            )
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let (hidden_states, norm_download_duration) = input_norm_runner
+            .read_output()
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let norm_report = GpuWeightedRmsNormReport {
+            download_duration: norm_download_duration,
+            ..norm_report
+        };
+        Ok((
+            hidden,
+            hidden_states,
+            embedding_report,
+            norm_report,
+            embedding_compile_duration + norm_compile_duration,
+        ))
     }
 
     fn packed_linear_spec(
@@ -5422,23 +5488,15 @@ impl ReferenceModel {
     ) -> Result<PackedDecodeStepResult, ReferenceError> {
         let started_at = Instant::now();
         let mut hidden = if Self::packed_use_gpu_embedding() && Self::packed_use_gpu_first_session() {
-            let (hidden, report, compile_duration) =
-                gpu_first_session.run_embedding_lookup_to_host(token_id)?;
-            session.metrics.compile_duration += compile_duration;
-            session.metrics.activation_upload_duration += report.upload_duration;
-            session.metrics.upload_duration += report.upload_duration;
-            session.metrics.gpu_duration += report.gpu_duration;
-            session.metrics.download_duration += report.download_duration;
-            session.metrics.activation_upload_bytes += std::mem::size_of::<u32>();
-            session.metrics.upload_bytes += std::mem::size_of::<u32>();
-            session.metrics.download_bytes += self.config.hidden_size * std::mem::size_of::<f32>();
-            hidden
+            Vec::new()
         } else {
             self.embedding_lookup_resolved("model.embed_tokens.weight", token_id)?
         };
         let elapsed = started_at.elapsed();
-        metrics.embedding_duration += elapsed;
-        *non_offloaded_dense_duration += elapsed;
+        if !hidden.is_empty() {
+            metrics.embedding_duration += elapsed;
+            *non_offloaded_dense_duration += elapsed;
+        }
 
         let (cos, sin) = rope_cos_sin(&self.rope, &[position]);
         let mut final_hidden_gpu: Option<ResidentGpuVectorAdd> = None;
@@ -5450,19 +5508,54 @@ impl ReferenceModel {
         {
             let layer_tensors = &self.layer_tensors[layer_idx];
 
-            let started_at = Instant::now();
             let input_norm_weight =
                 self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
-            let mut hidden_states =
-                weighted_rms_norm(&hidden, &input_norm_weight, self.config.rms_norm_eps as f32);
-            let elapsed = started_at.elapsed();
-            metrics.norm_duration += elapsed;
-            *non_offloaded_dense_duration += elapsed;
-            session.push_dense_stage_trace(
-                "input_norm",
-                &layer_tensors.input_layernorm_weight,
-                elapsed,
-            );
+            let mut hidden_states = if layer_idx == 0
+                && Self::packed_use_gpu_embedding()
+                && Self::packed_use_gpu_first_session()
+            {
+                let started_at = Instant::now();
+                let (gpu_hidden, gpu_hidden_states, embedding_report, norm_report, compile_duration) =
+                    gpu_first_session.run_embedding_and_input_norm_to_host(
+                        token_id,
+                        &input_norm_weight,
+                    )?;
+                hidden = gpu_hidden;
+                session.metrics.compile_duration += compile_duration;
+                session.metrics.activation_upload_duration +=
+                    embedding_report.upload_duration + norm_report.upload_duration;
+                session.metrics.upload_duration +=
+                    embedding_report.upload_duration + norm_report.upload_duration;
+                session.metrics.gpu_duration += embedding_report.gpu_duration + norm_report.gpu_duration;
+                session.metrics.download_duration +=
+                    embedding_report.download_duration + norm_report.download_duration;
+                session.metrics.activation_upload_bytes += std::mem::size_of::<u32>()
+                    + self.config.hidden_size * std::mem::size_of::<f32>();
+                session.metrics.upload_bytes += std::mem::size_of::<u32>()
+                    + self.config.hidden_size * std::mem::size_of::<f32>();
+                session.metrics.download_bytes += self.config.hidden_size * std::mem::size_of::<f32>() * 2;
+                metrics.embedding_duration += started_at.elapsed();
+                metrics.norm_duration += norm_report.upload_duration
+                    + norm_report.gpu_duration
+                    + norm_report.download_duration;
+                gpu_hidden_states
+            } else {
+                let started_at = Instant::now();
+                let hidden_states = weighted_rms_norm(
+                    &hidden,
+                    &input_norm_weight,
+                    self.config.rms_norm_eps as f32,
+                );
+                let elapsed = started_at.elapsed();
+                metrics.norm_duration += elapsed;
+                *non_offloaded_dense_duration += elapsed;
+                session.push_dense_stage_trace(
+                    "input_norm",
+                    &layer_tensors.input_layernorm_weight,
+                    elapsed,
+                );
+                hidden_states
+            };
             let residual = hidden;
 
             let started_at = Instant::now();
