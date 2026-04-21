@@ -2522,6 +2522,7 @@ struct ResidentGpuFinalNorm {
 }
 
 struct ResidentGpuVectorAdd {
+    #[allow(dead_code)]
     runner: CachedVectorAddGpuRunner,
     tensor: GpuResidentBuffer,
     len: usize,
@@ -7740,14 +7741,8 @@ impl ReferenceModel {
             let norm_started = Instant::now();
             let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
             let next_token = if let Some(hidden_gpu) = final_hidden_gpu {
-                let hidden_gpu_output = GpuResidentBuffer::new(
-                    hidden_gpu.runner.borrow().shared_context().clone(),
-                    hidden_gpu.runner.borrow().output_buffer_handle(),
-                    hidden_gpu.runner.borrow().len(),
-                    hidden_gpu.runner.borrow().output_buffer_size(),
-                );
                 let (next_token, tail_report, compile_duration) = gpu_first_session
-                    .run_tail_argmax_from_resident_hidden(&hidden_gpu_output, &final_norm_weight)?;
+                    .run_tail_argmax_from_resident_hidden(&hidden_gpu.tensor, &final_norm_weight)?;
                 metrics.norm_duration += norm_started.elapsed();
                 metrics.logits_duration += tail_report.pack_gpu_duration
                     + tail_report.logits_gpu_duration
@@ -7807,14 +7802,8 @@ impl ReferenceModel {
             let norm_started = Instant::now();
             let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
             let logits = if let Some(hidden_gpu) = final_hidden_gpu {
-                let hidden_gpu_output = GpuResidentBuffer::new(
-                    hidden_gpu.runner.borrow().shared_context().clone(),
-                    hidden_gpu.runner.borrow().output_buffer_handle(),
-                    hidden_gpu.runner.borrow().len(),
-                    hidden_gpu.runner.borrow().output_buffer_size(),
-                );
                 let (logits, tail_report, compile_duration) = gpu_first_session
-                    .run_tail_logits_from_resident_hidden(&hidden_gpu_output, &final_norm_weight)?;
+                    .run_tail_logits_from_resident_hidden(&hidden_gpu.tensor, &final_norm_weight)?;
                 metrics.norm_duration += norm_started.elapsed();
                 metrics.logits_duration += tail_report.pack_gpu_duration
                     + tail_report.logits_gpu_duration
