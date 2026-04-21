@@ -9,8 +9,8 @@ use crate::runtime::gpu_decode_metrics::{
 use crate::runtime::gpu_decode_output::{PackedDecodeResult, PackedDispatchTrace};
 use crate::gpu::resident_buffer::GpuResidentBuffer;
 use crate::runtime::gpu_decode_projection_state::{
-    PackedProjectionCache, PreparedProjectionRunner, ResidentGpuPackedActivation,
-    ResidentPackedProjection,
+    PackedProjectionCache, PreparedProjectionRunner, ResidentGpuFinalNorm,
+    ResidentGpuPackedActivation, ResidentGpuVectorAdd, ResidentPackedProjection,
 };
 use crate::runtime::gpu_decode_scratch::PackedDecodeScratch;
 use crate::runtime::gpu_decode_session_state::{
@@ -434,6 +434,196 @@ impl<'a> PackedGpuSession<'a> {
             compile_duration,
             weight_upload_duration,
             pack_cache_hit,
+            gpu_cache_hit,
+        })
+    }
+
+    pub(crate) fn run_final_norm_resident(
+        &mut self,
+        input: &[f32],
+        weight: &[f32],
+    ) -> Result<ResidentGpuFinalNorm, ReferenceError> {
+        let (runner, compile_duration, gpu_cache_hit) =
+            self.model.get_or_create_final_norm_gpu()?;
+        let report = runner
+            .borrow_mut()
+            .run_resident(input, weight)
+            .map_err(|error| ReferenceError::Decode(format!("gpu final norm failed: {error}")))?;
+        let len = runner.borrow().len();
+        let tensor = runner.borrow().resident_output();
+        Ok(ResidentGpuFinalNorm {
+            tensor,
+            runner,
+            len,
+            report,
+            compile_duration,
+            gpu_cache_hit,
+        })
+    }
+
+    pub(crate) fn run_pack_f16_pairs_resident(
+        &mut self,
+        final_norm: ResidentGpuFinalNorm,
+    ) -> Result<ResidentGpuPackedActivation, ReferenceError> {
+        let (runner, compile_duration, gpu_cache_hit) =
+            self.model.get_or_create_pack_f16_pairs_gpu(final_norm.len)?;
+        let report = runner
+            .borrow_mut()
+            .run_resident_from_f32_buffer(
+                &final_norm.tensor.shared_context,
+                final_norm.tensor.buffer,
+                final_norm.len,
+                final_norm.tensor.buffer_size,
+            )
+            .map_err(|error| {
+                ReferenceError::Decode(format!("gpu pack f16 pairs failed: {error}"))
+            })?;
+        self.metrics.compile_duration += final_norm.compile_duration;
+        self.metrics.weight_upload_duration += final_norm.report.upload_duration;
+        self.metrics.upload_duration += final_norm.report.upload_duration;
+        self.metrics.gpu_duration += final_norm.report.gpu_duration;
+        self.metrics.dispatch_count += 1;
+        self.metrics.weight_upload_bytes += final_norm.len * std::mem::size_of::<f32>();
+        self.metrics.activation_upload_bytes += final_norm.len * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes += 2 * final_norm.len * std::mem::size_of::<f32>();
+        self.metrics.gpu_cache_hits += usize::from(final_norm.gpu_cache_hit);
+        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
+            self.dispatch_trace.len() + 1,
+            "gpu_dense",
+            "final_norm_gpu",
+            "model.norm.weight",
+            final_norm.len,
+            final_norm.len,
+            final_norm.gpu_cache_hit,
+            final_norm.compile_duration,
+            final_norm.report.upload_duration,
+            Duration::ZERO,
+            final_norm.report.gpu_duration,
+            final_norm.len * std::mem::size_of::<f32>(),
+            final_norm.len * std::mem::size_of::<f32>(),
+        ));
+        Ok(ResidentGpuPackedActivation {
+            keepalive: crate::runtime::gpu_decode_projection_state::ResidentGpuPackedActivationKeepalive::PackF16(runner.clone()),
+            tensor: GpuResidentBuffer::new(
+                runner.borrow().shared_context().clone(),
+                runner.borrow().output_buffer_handle(),
+                runner.borrow().packed_len(),
+                runner.borrow().output_buffer_size(),
+            ),
+            logical_len: final_norm.len,
+            upload_duration: report.upload_duration,
+            gpu_duration: report.gpu_duration,
+            compile_duration,
+            gpu_cache_hit,
+        })
+    }
+
+    pub(crate) fn run_vector_add_resident(
+        &mut self,
+        left: ResidentPackedProjection,
+        right: &[f32],
+    ) -> Result<ResidentGpuVectorAdd, ReferenceError> {
+        let weight_upload_bytes = usize::from(!left.prepared.gpu_cache_hit)
+            * (left.prepared.packed.code_words.len() * std::mem::size_of::<u32>()
+                + left.prepared.packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = left.cols.div_ceil(2) * std::mem::size_of::<u32>();
+        self.account_projection_report(
+            &left.prepared.packed,
+            left.cols,
+            left.prepared.weight_upload_duration,
+            left.prepared.gpu_cache_hit,
+            &left.report,
+            0,
+        );
+        self.push_dispatch_trace(
+            &left.tensor_name,
+            &left.operation,
+            left.rows,
+            left.cols,
+            left.prepared.pack_cache_hit,
+            left.prepared.gpu_cache_hit,
+            left.prepared.compile_duration,
+            left.prepared.weight_upload_duration,
+            left.report.upload_duration,
+            left.report.gpu_duration,
+            left.report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            0,
+        );
+
+        let (runner, compile_duration, gpu_cache_hit) =
+            self.model.get_or_create_vector_add_gpu(left.rows)?;
+        let report = runner
+            .borrow_mut()
+            .run_resident_from_left_buffer_and_host(
+                &left.tensor.shared_context,
+                left.tensor.buffer,
+                left.rows,
+                left.tensor.buffer_size,
+                right,
+            )
+            .map_err(|error| ReferenceError::Decode(format!("gpu vector add failed: {error}")))?;
+        let len = runner.borrow().len();
+        let tensor = runner.borrow().resident_output();
+        Ok(ResidentGpuVectorAdd {
+            tensor,
+            runner,
+            len,
+            report,
+            compile_duration,
+            gpu_cache_hit,
+        })
+    }
+
+    pub(crate) fn run_final_norm_resident_from_vector_add(
+        &mut self,
+        activation: ResidentGpuVectorAdd,
+        weight: &[f32],
+    ) -> Result<ResidentGpuFinalNorm, ReferenceError> {
+        self.metrics.compile_duration += activation.compile_duration;
+        self.metrics.upload_duration += activation.report.upload_duration;
+        self.metrics.gpu_duration += activation.report.gpu_duration;
+        self.metrics.dispatch_count += 1;
+        self.metrics.activation_upload_bytes += 2 * activation.len * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes += 2 * activation.len * std::mem::size_of::<f32>();
+        self.metrics.gpu_cache_hits += usize::from(activation.gpu_cache_hit);
+        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
+            self.dispatch_trace.len() + 1,
+            "gpu_dense",
+            "vector_add_gpu",
+            "vector_add",
+            activation.len,
+            activation.len,
+            activation.gpu_cache_hit,
+            activation.compile_duration,
+            Duration::ZERO,
+            activation.report.upload_duration,
+            activation.report.gpu_duration,
+            0,
+            2 * activation.len * std::mem::size_of::<f32>(),
+        ));
+
+        let (runner, compile_duration, gpu_cache_hit) =
+            self.model.get_or_create_final_norm_gpu()?;
+        let report = runner
+            .borrow_mut()
+            .run_resident_from_f32_buffer(
+                &activation.tensor.shared_context,
+                activation.tensor.buffer,
+                activation.len,
+                activation.tensor.buffer_size,
+                weight,
+            )
+            .map_err(|error| ReferenceError::Decode(format!("gpu final norm failed: {error}")))?;
+        let len = runner.borrow().len();
+        let tensor = runner.borrow().resident_output();
+        Ok(ResidentGpuFinalNorm {
+            tensor,
+            runner,
+            len,
+            report,
+            compile_duration,
             gpu_cache_hit,
         })
     }
