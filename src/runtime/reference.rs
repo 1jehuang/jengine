@@ -33,6 +33,7 @@ use crate::runtime::gpu_decode_projection_state::{
     ResidentGpuVectorAdd, ResidentPackedPairProjection, ResidentPackedProjection,
 };
 use crate::runtime::gpu_decode_scratch::PackedDecodeScratch;
+use crate::runtime::gpu_decode_session_state::{LayerCache, PackedDecodeStepResult};
 use crate::runtime::gpu_decode_state::{GpuKvBinding, GpuTailResult, GpuTailStepReport, ResidentHiddenState};
 use crate::runtime::packed_model::{PackedModelError, PackedModelStore};
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
@@ -257,35 +258,6 @@ pub struct DecodeResult {
     pub output_token_ids: Vec<usize>,
     pub output_text: String,
     pub metrics: DecodeMetrics,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum PackedDecodeStepResult {
-    Logits(Vec<f32>),
-    NextToken(usize),
-}
-
-#[derive(Debug, Clone)]
-struct LayerCache {
-    keys: Vec<f32>,
-    values: Vec<f32>,
-}
-
-impl LayerCache {
-    fn with_capacity(tokens: usize, kv_width: usize) -> Self {
-        let capacity = tokens * kv_width;
-        Self {
-            keys: Vec::with_capacity(capacity),
-            values: Vec::with_capacity(capacity),
-        }
-    }
-
-    fn without_preallocated_cpu_kv() -> Self {
-        Self {
-            keys: Vec::new(),
-            values: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
