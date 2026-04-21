@@ -1316,18 +1316,10 @@ impl CachedGpuPackedMatvecRunner {
         let argmax_index = if self.rows >= 16_384 {
             if self.can_use_fused_argmax() {
                 self.submit_fused_argmax_and_wait()?;
-                if self.fused_argmax_workgroups > 1 {
-                    argmax_reduced_pair_buffer(&self.argmax_final_output_buffer)
-                } else {
-                    argmax_reduced_f32_buffer(&self.argmax_output_buffer, 1)
-                }?
+                argmax_reduced_f32_buffer(&self.argmax_output_buffer, self.fused_argmax_workgroups)?
             } else {
                 self.submit_argmax_and_wait()?;
-                if self.argmax_workgroups > 1 {
-                    argmax_reduced_pair_buffer(&self.argmax_final_output_buffer)
-                } else {
-                    argmax_reduced_f32_buffer(&self.argmax_output_buffer, self.argmax_workgroups)
-                }?
+                argmax_reduced_f32_buffer(&self.argmax_output_buffer, self.argmax_workgroups)?
             }
         } else {
             argmax_f32_buffer(&self.output_buffer, self.rows)?
@@ -1375,11 +1367,10 @@ impl CachedGpuPackedMatvecRunner {
 
     fn read_fused_argmax_output(&self) -> Result<(usize, Duration), GpuPackedMatvecError> {
         let download_started = Instant::now();
-        let argmax_index = if self.fused_argmax_workgroups > 1 {
-            argmax_reduced_pair_buffer(&self.argmax_final_output_buffer)?
-        } else {
-            argmax_reduced_f32_buffer(&self.argmax_output_buffer, 1)?
-        };
+        let argmax_index = argmax_reduced_f32_buffer(
+            &self.argmax_output_buffer,
+            self.fused_argmax_workgroups,
+        )?;
         Ok((argmax_index, download_started.elapsed()))
     }
 
@@ -1440,11 +1431,7 @@ impl CachedGpuPackedMatvecRunner {
 
     fn submit_argmax_and_wait(&self) -> Result<Duration, GpuPackedMatvecError> {
         initialize_argmax_pair_buffer(&self.argmax_output_buffer, self.argmax_output_capacity)?;
-        let command_buffers: Vec<vk::CommandBuffer> = if self.argmax_workgroups > 1 {
-            vec![self.argmax_command_buffer, self.argmax_final_command_buffer]
-        } else {
-            vec![self.argmax_command_buffer]
-        };
+        let command_buffers = [self.argmax_command_buffer];
         let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
         unsafe {
             self.device.reset_fences(&[self.fence])?;
@@ -1460,11 +1447,7 @@ impl CachedGpuPackedMatvecRunner {
 
     fn submit_fused_argmax_and_wait(&self) -> Result<Duration, GpuPackedMatvecError> {
         initialize_argmax_pair_buffer(&self.argmax_output_buffer, self.argmax_output_capacity)?;
-        let command_buffers: Vec<vk::CommandBuffer> = if self.fused_argmax_workgroups > 1 {
-            vec![self.fused_argmax_command_buffer, self.argmax_final_command_buffer]
-        } else {
-            vec![self.fused_argmax_command_buffer]
-        };
+        let command_buffers = [self.fused_argmax_command_buffer];
         let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
         unsafe {
             self.device.reset_fences(&[self.fence])?;

@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cpu::primitives::argmax;
 use crate::gpu::full_last_layer_block::PackedLinearSpec;
 use crate::gpu::pack_f16_pairs::{CachedGpuPackF16PairsRunner, GpuPackF16PairsError};
 use crate::gpu::packed_matvec::{
@@ -118,21 +117,16 @@ impl CachedGpuTailBlockRunner {
                 self.final_norm_runner.output_buffer_size(),
             )
             .map_err(map_pack_f16_pairs_error)?;
-        let logits_report = self
+        let (argmax_index, logits_report) = self
             .logits_runner
-            .run_resident_from_packed_buffer(
+            .run_with_argmax_from_packed_buffer(
                 self.pack_runner.shared_context(),
                 self.pack_runner.output_buffer_handle(),
                 self.pack_runner.packed_len(),
                 self.pack_runner.output_buffer_size(),
             )
             .map_err(map_packed_matvec_error)?;
-        let (logits, logits_download_duration) = self
-            .logits_runner
-            .read_output()
-            .map_err(map_packed_matvec_error)?;
-        let argmax_index = argmax(&logits)
-            .ok_or_else(|| GpuTailBlockError("tail block logits were empty".to_string()))?;
+        let logits_download_duration = logits_report.download_duration;
         Ok(GpuTailBlockReport {
             hidden: self.hidden,
             vocab: self.vocab,
@@ -236,7 +230,6 @@ impl CachedGpuTailBlockRunner {
         let command_buffers = [
             self.final_norm_runner.command_buffer_handle(),
             self.pack_runner.command_buffer_handle(),
-            self.logits_runner.command_buffer_handle(),
         ];
         let submit_info = [ash::vk::SubmitInfo::default().command_buffers(&command_buffers)];
         let gpu_started = std::time::Instant::now();
@@ -264,28 +257,23 @@ impl CachedGpuTailBlockRunner {
         }
         .map_err(|error| GpuTailBlockError(format!("vulkan fence wait failed: {error:?}")))?;
         let total_gpu_duration = gpu_started.elapsed();
-        let logits_report = self
+        let (argmax_index, logits_report) = self
             .logits_runner
-            .run_resident_from_packed_buffer(
+            .run_with_argmax_from_packed_buffer(
                 self.pack_runner.shared_context(),
                 self.pack_runner.output_buffer_handle(),
                 self.pack_runner.packed_len(),
                 self.pack_runner.output_buffer_size(),
             )
             .map_err(map_packed_matvec_error)?;
-        let (logits, logits_download_duration) = self
-            .logits_runner
-            .read_output()
-            .map_err(map_packed_matvec_error)?;
-        let argmax_index = argmax(&logits)
-            .ok_or_else(|| GpuTailBlockError("tail block logits were empty".to_string()))?;
+        let logits_download_duration = logits_report.download_duration;
         Ok(GpuTailBlockReport {
             hidden: self.hidden,
             vocab: self.vocab,
             compile_duration: self.compile_duration,
             final_norm_gpu_duration: total_gpu_duration,
             pack_gpu_duration: Duration::ZERO,
-            logits_gpu_duration: Duration::ZERO,
+            logits_gpu_duration: logits_report.gpu_duration,
             logits_download_duration,
             argmax_index,
         })
