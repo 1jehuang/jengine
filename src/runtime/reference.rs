@@ -2534,10 +2534,7 @@ enum ResidentPackedActivationKeepalive {
 struct ResidentGpuPackedActivation {
     #[allow(dead_code)]
     keepalive: ResidentPackedActivationKeepalive,
-    shared_context: Arc<SharedGpuPackedContext>,
-    buffer: vk::Buffer,
-    buffer_size: u64,
-    packed_len: usize,
+    tensor: GpuResidentBuffer,
     logical_len: usize,
     upload_duration: Duration,
     gpu_duration: Duration,
@@ -2602,10 +2599,10 @@ impl<'a> PackedGpuSession<'a> {
             .runner
             .borrow_mut()
             .run_resident_from_packed_buffer(
-                &activation.shared_context,
-                activation.buffer,
-                activation.packed_len,
-                activation.buffer_size,
+                &activation.tensor.shared_context,
+                activation.tensor.buffer,
+                activation.tensor.len,
+                activation.tensor.buffer_size,
             )
             .map_err(|error| {
                 ReferenceError::Decode(format!(
@@ -2903,10 +2900,12 @@ impl<'a> PackedGpuSession<'a> {
         });
         Ok(ResidentGpuPackedActivation {
             keepalive: ResidentPackedActivationKeepalive::PackF16(runner.clone()),
-            shared_context: runner.borrow().shared_context().clone(),
-            buffer: runner.borrow().output_buffer_handle(),
-            buffer_size: runner.borrow().output_buffer_size(),
-            packed_len: runner.borrow().packed_len(),
+            tensor: GpuResidentBuffer::new(
+                runner.borrow().shared_context().clone(),
+                runner.borrow().output_buffer_handle(),
+                runner.borrow().packed_len(),
+                runner.borrow().output_buffer_size(),
+            ),
             logical_len: final_norm.runner.borrow().len(),
             upload_duration: report.upload_duration,
             gpu_duration: report.gpu_duration,
@@ -3076,10 +3075,12 @@ impl<'a> PackedGpuSession<'a> {
         });
         Ok(ResidentGpuPackedActivation {
             keepalive: ResidentPackedActivationKeepalive::SwigluPackF16(runner.clone()),
-            shared_context: runner.borrow().shared_context().clone(),
-            buffer: runner.borrow().output_buffer_handle(),
-            buffer_size: runner.borrow().output_buffer_size(),
-            packed_len: runner.borrow().packed_len(),
+            tensor: GpuResidentBuffer::new(
+                runner.borrow().shared_context().clone(),
+                runner.borrow().output_buffer_handle(),
+                runner.borrow().packed_len(),
+                runner.borrow().output_buffer_size(),
+            ),
             logical_len: pair.first_rows,
             upload_duration: report.upload_duration,
             gpu_duration: report.gpu_duration,
@@ -3137,10 +3138,12 @@ impl<'a> PackedGpuSession<'a> {
         });
         Ok(ResidentGpuPackedActivation {
             keepalive: ResidentPackedActivationKeepalive::PackF16(runner.clone()),
-            shared_context: runner.borrow().shared_context().clone(),
-            buffer: runner.borrow().output_buffer_handle(),
-            buffer_size: runner.borrow().output_buffer_size(),
-            packed_len: runner.borrow().packed_len(),
+            tensor: GpuResidentBuffer::new(
+                runner.borrow().shared_context().clone(),
+                runner.borrow().output_buffer_handle(),
+                runner.borrow().packed_len(),
+                runner.borrow().output_buffer_size(),
+            ),
             logical_len: swiglu.runner.borrow().len(),
             upload_duration: report.upload_duration,
             gpu_duration: report.gpu_duration,
@@ -3161,10 +3164,10 @@ impl<'a> PackedGpuSession<'a> {
             .runner
             .borrow_mut()
             .run_resident_from_packed_buffer(
-                &activation.shared_context,
-                activation.buffer,
-                activation.packed_len,
-                activation.buffer_size,
+                &activation.tensor.shared_context,
+                activation.tensor.buffer,
+                activation.tensor.len,
+                activation.tensor.buffer_size,
             )
             .map_err(|error| {
                 ReferenceError::Decode(format!(
@@ -3333,10 +3336,10 @@ impl<'a> PackedGpuSession<'a> {
             .runner
             .borrow_mut()
             .run_resident_from_packed_buffer(
-                &activation.shared_context,
-                activation.buffer,
-                activation.packed_len,
-                activation.buffer_size,
+                &activation.tensor.shared_context,
+                activation.tensor.buffer,
+                activation.tensor.len,
+                activation.tensor.buffer_size,
             )
             .map_err(|error| {
                 ReferenceError::Decode(format!(
