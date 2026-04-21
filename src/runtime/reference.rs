@@ -1241,9 +1241,10 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let hidden_size = self.model.config.hidden_size;
         let (embedding_compile_duration, embedding_runner) =
             self.ensure_embedding_lookup_runner()?;
-        let (hidden, embedding_report) = embedding_runner
-            .run_with_output(token_id)
+        let embedding_report = embedding_runner
+            .run_resident(token_id)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let hidden = vec![0.0; hidden_size];
         let embedding_output = embedding_runner.resident_output();
 
         let cache_key = format!(
@@ -6801,8 +6802,6 @@ impl ReferenceModel {
                     std::mem::size_of::<u32>() + self.config.hidden_size * std::mem::size_of::<f32>();
                 session.metrics.upload_bytes +=
                     std::mem::size_of::<u32>() + self.config.hidden_size * std::mem::size_of::<f32>();
-                session.metrics.download_bytes +=
-                    self.config.hidden_size * std::mem::size_of::<f32>();
                 metrics.embedding_duration += embedding_report.upload_duration
                     + embedding_report.gpu_duration
                     + embedding_report.download_duration;
