@@ -1063,6 +1063,30 @@ impl CachedGpuPackedMatvecRunner {
         Ok(((first, second), download_started.elapsed()))
     }
 
+    pub fn read_output_pair_into(
+        &self,
+        first_rows: usize,
+        second_rows: usize,
+        first: &mut Vec<f32>,
+        second: &mut Vec<f32>,
+    ) -> Result<Duration, GpuPackedMatvecError> {
+        if first_rows + second_rows != self.rows {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "pair rows {} + {} must equal output rows {}",
+                first_rows, second_rows, self.rows
+            )));
+        }
+        let download_started = Instant::now();
+        let values = unsafe {
+            std::slice::from_raw_parts(self.output_buffer.mapped_ptr as *const f32, self.rows)
+        };
+        first.clear();
+        first.extend_from_slice(&values[..first_rows]);
+        second.clear();
+        second.extend_from_slice(&values[first_rows..first_rows + second_rows]);
+        Ok(download_started.elapsed())
+    }
+
     pub fn read_output_triplet(
         &self,
         first_rows: usize,
@@ -1084,6 +1108,36 @@ impl CachedGpuPackedMatvecRunner {
         let third =
             values[first_rows + second_rows..first_rows + second_rows + third_rows].to_vec();
         Ok(((first, second, third), download_started.elapsed()))
+    }
+
+    pub fn read_output_triplet_into(
+        &self,
+        first_rows: usize,
+        second_rows: usize,
+        third_rows: usize,
+        first: &mut Vec<f32>,
+        second: &mut Vec<f32>,
+        third: &mut Vec<f32>,
+    ) -> Result<Duration, GpuPackedMatvecError> {
+        if first_rows + second_rows + third_rows != self.rows {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "triplet rows {} + {} + {} must equal output rows {}",
+                first_rows, second_rows, third_rows, self.rows
+            )));
+        }
+        let download_started = Instant::now();
+        let values = unsafe {
+            std::slice::from_raw_parts(self.output_buffer.mapped_ptr as *const f32, self.rows)
+        };
+        first.clear();
+        first.extend_from_slice(&values[..first_rows]);
+        second.clear();
+        second.extend_from_slice(&values[first_rows..first_rows + second_rows]);
+        third.clear();
+        third.extend_from_slice(
+            &values[first_rows + second_rows..first_rows + second_rows + third_rows],
+        );
+        Ok(download_started.elapsed())
     }
 
     pub fn argmax_output(&self) -> Result<(usize, Duration), GpuPackedMatvecError> {
