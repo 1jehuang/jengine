@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::gpu::packed_matvec::SharedGpuPackedContext;
+use crate::gpu::resident_buffer::GpuResidentBuffer;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GpuQkRopeReport {
@@ -199,6 +200,24 @@ impl CachedGpuQkRopeRunner {
         let k_out = read_f32_buffer(&self.k_out_buffer, self.key_len)?;
         let download_duration = download_started.elapsed();
         Ok(((q_out, k_out), GpuQkRopeReport { query_len: self.query_len, key_len: self.key_len, compile_duration: Duration::ZERO, upload_duration, gpu_duration, download_duration }))
+    }
+
+    pub fn query_resident_output(&self) -> GpuResidentBuffer {
+        GpuResidentBuffer::new(
+            self._shared_context.clone(),
+            self.q_out_buffer.buffer,
+            self.query_len,
+            self.q_out_buffer.size,
+        )
+    }
+
+    pub fn key_resident_output(&self) -> GpuResidentBuffer {
+        GpuResidentBuffer::new(
+            self._shared_context.clone(),
+            self.k_out_buffer.buffer,
+            self.key_len,
+            self.k_out_buffer.size,
+        )
     }
 
     fn submit_and_wait(&self) -> Result<Duration, GpuQkRopeError> {
