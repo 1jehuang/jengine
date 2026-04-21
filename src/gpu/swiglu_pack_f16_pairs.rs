@@ -346,6 +346,36 @@ impl CachedGpuSwigluPackF16PairsRunner {
         })
     }
 
+    pub fn prepare_with_output_from_buffer(
+        &mut self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: vk::Buffer,
+        source_len: usize,
+        source_buffer_size: u64,
+    ) -> Result<(), GpuSwigluPackF16PairsError> {
+        if source_len != self.len * 2 {
+            return Err(GpuSwigluPackF16PairsError::Shape(format!(
+                "source len {} does not match destination len {}",
+                source_len,
+                self.len * 2
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuSwigluPackF16PairsError::Shape(
+                "resident chaining requires runners to share the same Vulkan context".to_string(),
+            ));
+        }
+        let byte_len = self.len * 2 * std::mem::size_of::<f32>();
+        if byte_len as u64 > source_buffer_size {
+            return Err(GpuSwigluPackF16PairsError::Shape(format!(
+                "source {} bytes exceeds provided buffer size {}",
+                byte_len, source_buffer_size
+            )));
+        }
+        self.bind_input_buffer(source_buffer);
+        Ok(())
+    }
+
     pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> {
         &self._shared_context
     }
@@ -368,6 +398,10 @@ impl CachedGpuSwigluPackF16PairsRunner {
     }
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub fn command_buffer_handle(&self) -> vk::CommandBuffer {
+        self.command_buffer
     }
 
     fn submit_and_wait(&self) -> Result<Duration, GpuSwigluPackF16PairsError> {

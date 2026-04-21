@@ -421,6 +421,44 @@ impl CachedGpuWeightedRmsNormRunner {
         })
     }
 
+    pub fn prepare_resident_from_f32_buffer(
+        &mut self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: vk::Buffer,
+        source_len: usize,
+        source_buffer_size: u64,
+        weight: &[f32],
+    ) -> Result<(), GpuWeightedRmsNormError> {
+        if weight.len() != self.len {
+            return Err(GpuWeightedRmsNormError::Shape(format!(
+                "weight len {} must match runner len {}",
+                weight.len(),
+                self.len
+            )));
+        }
+        if source_len != self.len {
+            return Err(GpuWeightedRmsNormError::Shape(format!(
+                "source len {} does not match destination len {}",
+                source_len, self.len
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuWeightedRmsNormError::Shape(
+                "resident chaining requires runners to share the same Vulkan context".to_string(),
+            ));
+        }
+        let byte_len = self.len * std::mem::size_of::<f32>();
+        if byte_len as u64 > source_buffer_size {
+            return Err(GpuWeightedRmsNormError::Shape(format!(
+                "source {} bytes exceeds provided buffer size {}",
+                byte_len, source_buffer_size
+            )));
+        }
+        self.bind_input_buffer(source_buffer);
+        write_f32_buffer(&self.weight_buffer, weight)?;
+        Ok(())
+    }
+
     pub fn run_resident_from_tensor(
         &mut self,
         source: &GpuResidentBuffer,
@@ -468,6 +506,10 @@ impl CachedGpuWeightedRmsNormRunner {
 
     pub fn output_buffer_size(&self) -> u64 {
         self.output_buffer.size
+    }
+
+    pub fn command_buffer_handle(&self) -> vk::CommandBuffer {
+        self.command_buffer
     }
 
     fn submit_and_wait(&self) -> Result<Duration, GpuWeightedRmsNormError> {
