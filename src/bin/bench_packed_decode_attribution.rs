@@ -81,6 +81,7 @@ fn main() {
         ReferenceModel::load_from_root_with_packed_artifact(&root, &artifact_dir)
             .expect("packed model should load")
     });
+    let manifest = model.packed_model_manifest().cloned();
     if std::env::var_os("JENGINE_PREWARM_PACKED").is_some() {
         let use_attention_full = std::env::var_os("JENGINE_PACKED_ATTENTION_FULL").is_some();
         let use_mlp_full = std::env::var_os("JENGINE_PACKED_MLP_FULL").is_some();
@@ -154,6 +155,9 @@ fn main() {
                 "e2e_pct_of_hw": e2e_pct_of_hw,
                 "stream_window_pct_of_hw": stream_window_pct_of_hw,
                 "summary": metrics.summarize(),
+                "artifact_manifest_sha256": manifest.as_ref().and_then(|m| m.source_file_sha256.clone()),
+                "artifact_created_unix_secs": manifest.as_ref().map(|m| m.created_unix_secs),
+                "artifact_source_file_bytes": manifest.as_ref().map(|m| m.source_file_bytes),
             }),
         );
     }
@@ -177,6 +181,9 @@ fn main() {
             "avg_total_ms": total_ms_sum / iterations as f64,
             "avg_e2e_gbps": e2e_gbps_sum / iterations as f64,
             "avg_stream_window_gbps": stream_window_gbps_sum / iterations as f64,
+            "artifact_manifest_sha256": manifest.as_ref().and_then(|m| m.source_file_sha256.clone()),
+            "artifact_created_unix_secs": manifest.as_ref().map(|m| m.created_unix_secs),
+            "artifact_source_file_bytes": manifest.as_ref().map(|m| m.source_file_bytes),
         }),
     );
     let summary = format!("{}\n", lines.join("\n"));

@@ -47,7 +47,7 @@ use crate::runtime::gpu_decode_session_state::{
 use crate::runtime::gpu_decode_state::{
     GpuKvBinding, GpuTailResult, GpuTailStepReport, PackedResidentDecodeState, ResidentHiddenState,
 };
-use crate::runtime::packed_model::PackedModelStore;
+use crate::runtime::packed_model::{PackedModelManifest, PackedModelStore};
 use crate::runtime::reference_error::ReferenceError;
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
 use crate::runtime::weights::WeightStore;
@@ -1874,6 +1874,10 @@ impl ReferenceModel {
 
     pub fn tokenizer_diagnostics(&self) -> Option<TokenizerDiagnostics> {
         self.tokenizer.as_ref().map(TokenizerRuntime::diagnostics)
+    }
+
+    pub fn packed_model_manifest(&self) -> Option<&PackedModelManifest> {
+        self.packed_model.as_ref().map(|packed| &packed.manifest)
     }
 
     pub fn memory_report(&self, prompt_tokens: usize, generated_tokens: usize) -> MemoryReport {

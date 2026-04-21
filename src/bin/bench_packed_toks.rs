@@ -66,6 +66,7 @@ fn main() {
         ReferenceModel::load_from_root_with_packed_artifact(&root, &artifact_dir)
             .expect("packed model should load")
     });
+    let manifest = packed.packed_model_manifest().cloned();
 
     let (use_attention_qkv, use_mlp_gu) = match variant.as_str() {
         "attention" => (true, false),
@@ -127,6 +128,9 @@ fn main() {
                 "total_ms": total,
                 "tok_s": tok_s,
                 "summary": result.summarize(),
+                "artifact_manifest_sha256": manifest.as_ref().and_then(|m| m.source_file_sha256.clone()),
+                "artifact_created_unix_secs": manifest.as_ref().map(|m| m.created_unix_secs),
+                "artifact_source_file_bytes": manifest.as_ref().map(|m| m.source_file_bytes),
             }),
         );
     }
@@ -147,6 +151,9 @@ fn main() {
             "iterations": iterations,
             "avg_total_ms": avg_total_ms,
             "avg_tok_s": avg_tok_s,
+            "artifact_manifest_sha256": manifest.as_ref().and_then(|m| m.source_file_sha256.clone()),
+            "artifact_created_unix_secs": manifest.as_ref().map(|m| m.created_unix_secs),
+            "artifact_source_file_bytes": manifest.as_ref().map(|m| m.source_file_bytes),
         }),
     );
 }

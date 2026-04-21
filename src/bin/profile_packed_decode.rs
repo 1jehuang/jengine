@@ -89,6 +89,7 @@ fn main() {
 
     let model = ReferenceModel::load_from_root_with_packed_artifact(&root, &artifact_dir)
         .expect("packed reference model should load");
+    let manifest = model.packed_model_manifest().cloned();
     if std::env::var_os("JENGINE_PREWARM_PACKED").is_some() {
         let expected_tokens = model
             .prompt_analysis(&prompt)
@@ -118,6 +119,7 @@ fn main() {
         "decode_metrics": decode_metrics_json(&result.decode_metrics),
         "packed_metrics": packed_metrics_json(&result.metrics),
         "dispatch_trace": result.dispatch_trace,
+        "packed_artifact_manifest": manifest,
     });
     let output = serde_json::to_string_pretty(&document).expect("profile JSON should serialize");
 
