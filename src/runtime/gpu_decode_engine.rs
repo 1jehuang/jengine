@@ -1,23 +1,22 @@
+use crate::gpu::resident_buffer::GpuResidentBuffer;
+use crate::model::tokenizer::TokenizerRuntime;
 use crate::runtime::decode_plan::PackedDecodePlan;
 use crate::runtime::gpu_decode_env::{gpu_first_use_attention_full, gpu_first_use_mlp_full};
 use crate::runtime::gpu_decode_metrics::{
-    DecodeMetrics, PackedAttentionStageMetrics, PackedDecodeMetrics,
-    PackedGpuSessionMetrics,
-    PackedDecodeValidationReport, PackedMlpStageMetrics,
-    account_projection_report,
+    DecodeMetrics, PackedAttentionStageMetrics, PackedDecodeMetrics, PackedDecodeValidationReport,
+    PackedGpuSessionMetrics, PackedMlpStageMetrics, account_projection_report,
 };
 use crate::runtime::gpu_decode_output::{PackedDecodeResult, PackedDispatchTrace};
-use crate::gpu::resident_buffer::GpuResidentBuffer;
 use crate::runtime::gpu_decode_projection_state::{
     PackedProjectionCache, PreparedProjectionRunner, ResidentGpuFinalNorm,
-    ResidentGpuPackedActivation, ResidentGpuVectorAdd, ResidentPackedProjection,
+    ResidentGpuPackedActivation, ResidentGpuPackedActivationKeepalive, ResidentGpuSwigluCombined,
+    ResidentGpuVectorAdd, ResidentPackedPairProjection, ResidentPackedProjection,
 };
 use crate::runtime::gpu_decode_scratch::PackedDecodeScratch;
 use crate::runtime::gpu_decode_session_state::{
     LayerCache, PackedDecodeStepResult, allocate_layer_cache_vec,
 };
 use crate::runtime::gpu_decode_state::PackedResidentDecodeState;
-use crate::model::tokenizer::TokenizerRuntime;
 use crate::runtime::reference::{GpuFirstRunnerCache, ReferenceModel};
 use crate::runtime::reference_error::ReferenceError;
 use std::time::Duration;
@@ -87,6 +86,8 @@ pub(crate) struct PackedGpuSession<'a> {
     pub(crate) dispatch_trace: Vec<PackedDispatchTrace>,
     pub(crate) scratch: PackedDecodeScratch,
 }
+
+type ProjectionTripletOutputs = (Vec<f32>, Vec<f32>, Vec<f32>);
 
 impl<'a> PackedGpuSession<'a> {
     pub(crate) fn new(model: &'a ReferenceModel) -> Self {
@@ -284,21 +285,22 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.gpu_cache_hits += usize::from(activation.gpu_cache_hit);
         self.metrics.activation_upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
-        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
-            self.dispatch_trace.len() + 1,
-            "gpu_pack",
-            "pack_f16_pairs",
-            "pack_f16_pairs",
-            cols.div_ceil(2),
-            cols,
-            activation.gpu_cache_hit,
-            activation.compile_duration,
-            Duration::ZERO,
-            activation.upload_duration,
-            activation.gpu_duration,
-            0,
-            activation.logical_len * std::mem::size_of::<f32>(),
-        ));
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_pack",
+                "pack_f16_pairs",
+                "pack_f16_pairs",
+                cols.div_ceil(2),
+                cols,
+                activation.gpu_cache_hit,
+                activation.compile_duration,
+                Duration::ZERO,
+                activation.upload_duration,
+                activation.gpu_duration,
+                0,
+                activation.logical_len * std::mem::size_of::<f32>(),
+            ));
 
         let weight_upload_bytes = usize::from(!prepared.gpu_cache_hit)
             * (prepared.packed.code_words.len() * std::mem::size_of::<u32>()
@@ -368,17 +370,18 @@ impl<'a> PackedGpuSession<'a> {
         &mut self,
         resident: ResidentPackedProjection,
     ) -> Result<Vec<f32>, ReferenceError> {
-        let (output, download_duration) = resident
-            .prepared
-            .runner
-            .borrow()
-            .read_output()
-            .map_err(|error| {
-                ReferenceError::Decode(format!(
-                    "gpu projection output download failed for {}: {error}",
-                    resident.tensor_name
-                ))
-            })?;
+        let (output, download_duration) =
+            resident
+                .prepared
+                .runner
+                .borrow()
+                .read_output()
+                .map_err(|error| {
+                    ReferenceError::Decode(format!(
+                        "gpu projection output download failed for {}: {error}",
+                        resident.tensor_name
+                    ))
+                })?;
         let mut report = resident.report;
         report.download_duration = download_duration;
         let weight_upload_bytes = usize::from(!resident.prepared.gpu_cache_hit)
@@ -420,9 +423,11 @@ impl<'a> PackedGpuSession<'a> {
         cols: usize,
     ) -> Result<PreparedProjectionRunner, ReferenceError> {
         let (packed, pack_duration, pack_cache_hit) =
-            self.model.get_or_create_projection_cache(tensor_name, rows, cols)?;
-        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) =
-            self.model.get_or_create_projection_gpu(tensor_name, &packed)?;
+            self.model
+                .get_or_create_projection_cache(tensor_name, rows, cols)?;
+        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu(tensor_name, &packed)?;
         self.metrics.pack_duration += pack_duration;
         self.metrics.compile_duration += compile_duration;
         self.metrics.weight_upload_duration += weight_upload_duration;
@@ -465,8 +470,9 @@ impl<'a> PackedGpuSession<'a> {
         &mut self,
         final_norm: ResidentGpuFinalNorm,
     ) -> Result<ResidentGpuPackedActivation, ReferenceError> {
-        let (runner, compile_duration, gpu_cache_hit) =
-            self.model.get_or_create_pack_f16_pairs_gpu(final_norm.len)?;
+        let (runner, compile_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_pack_f16_pairs_gpu(final_norm.len)?;
         let report = runner
             .borrow_mut()
             .run_resident_from_f32_buffer(
@@ -487,21 +493,22 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.activation_upload_bytes += final_norm.len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += 2 * final_norm.len * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(final_norm.gpu_cache_hit);
-        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
-            self.dispatch_trace.len() + 1,
-            "gpu_dense",
-            "final_norm_gpu",
-            "model.norm.weight",
-            final_norm.len,
-            final_norm.len,
-            final_norm.gpu_cache_hit,
-            final_norm.compile_duration,
-            final_norm.report.upload_duration,
-            Duration::ZERO,
-            final_norm.report.gpu_duration,
-            final_norm.len * std::mem::size_of::<f32>(),
-            final_norm.len * std::mem::size_of::<f32>(),
-        ));
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_dense",
+                "final_norm_gpu",
+                "model.norm.weight",
+                final_norm.len,
+                final_norm.len,
+                final_norm.gpu_cache_hit,
+                final_norm.compile_duration,
+                final_norm.report.upload_duration,
+                Duration::ZERO,
+                final_norm.report.gpu_duration,
+                final_norm.len * std::mem::size_of::<f32>(),
+                final_norm.len * std::mem::size_of::<f32>(),
+            ));
         Ok(ResidentGpuPackedActivation {
             keepalive: crate::runtime::gpu_decode_projection_state::ResidentGpuPackedActivationKeepalive::PackF16(runner.clone()),
             tensor: GpuResidentBuffer::new(
@@ -588,21 +595,22 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.activation_upload_bytes += 2 * activation.len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += 2 * activation.len * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(activation.gpu_cache_hit);
-        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
-            self.dispatch_trace.len() + 1,
-            "gpu_dense",
-            "vector_add_gpu",
-            "vector_add",
-            activation.len,
-            activation.len,
-            activation.gpu_cache_hit,
-            activation.compile_duration,
-            Duration::ZERO,
-            activation.report.upload_duration,
-            activation.report.gpu_duration,
-            0,
-            2 * activation.len * std::mem::size_of::<f32>(),
-        ));
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_dense",
+                "vector_add_gpu",
+                "vector_add",
+                activation.len,
+                activation.len,
+                activation.gpu_cache_hit,
+                activation.compile_duration,
+                Duration::ZERO,
+                activation.report.upload_duration,
+                activation.report.gpu_duration,
+                0,
+                2 * activation.len * std::mem::size_of::<f32>(),
+            ));
 
         let (runner, compile_duration, gpu_cache_hit) =
             self.model.get_or_create_final_norm_gpu()?;
@@ -657,21 +665,22 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.gpu_cache_hits += usize::from(activation.gpu_cache_hit);
         self.metrics.activation_upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
-        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
-            self.dispatch_trace.len() + 1,
-            "gpu_pack",
-            "pack_f16_pairs",
-            "pack_f16_pairs",
-            cols.div_ceil(2),
-            cols,
-            activation.gpu_cache_hit,
-            activation.compile_duration,
-            Duration::ZERO,
-            activation.upload_duration,
-            activation.gpu_duration,
-            0,
-            activation.logical_len * std::mem::size_of::<f32>(),
-        ));
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_pack",
+                "pack_f16_pairs",
+                "pack_f16_pairs",
+                cols.div_ceil(2),
+                cols,
+                activation.gpu_cache_hit,
+                activation.compile_duration,
+                Duration::ZERO,
+                activation.upload_duration,
+                activation.gpu_duration,
+                0,
+                activation.logical_len * std::mem::size_of::<f32>(),
+            ));
         let tensor = GpuResidentBuffer::new(
             prepared.runner.borrow().shared_context().clone(),
             prepared.runner.borrow().output_buffer_handle(),
@@ -711,11 +720,12 @@ impl<'a> PackedGpuSession<'a> {
                     "gpu packed projection chaining failed for {tensor_name}: {error}"
                 ))
             })?;
-        let (output, download_duration) = prepared.runner.borrow().read_output().map_err(|error| {
-            ReferenceError::Decode(format!(
-                "gpu projection output download failed for {tensor_name}: {error}"
-            ))
-        })?;
+        let (output, download_duration) =
+            prepared.runner.borrow().read_output().map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection output download failed for {tensor_name}: {error}"
+                ))
+            })?;
         report.download_duration = download_duration;
         let weight_upload_bytes = usize::from(!prepared.gpu_cache_hit)
             * (prepared.packed.code_words.len() * std::mem::size_of::<u32>()
@@ -759,7 +769,8 @@ impl<'a> PackedGpuSession<'a> {
         if residual.len() != rows {
             return Err(ReferenceError::Decode(format!(
                 "residual len {} must match rows {} for {tensor_name}",
-                residual.len(), rows
+                residual.len(),
+                rows
             )));
         }
         let prepared = self.prepare_projection_runner(tensor_name, rows, cols)?;
@@ -818,6 +829,744 @@ impl<'a> PackedGpuSession<'a> {
             download_bytes,
         );
         Ok(summed)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn run_swiglu_combined_resident(
+        &mut self,
+        pair: ResidentPackedPairProjection,
+    ) -> Result<ResidentGpuSwigluCombined, ReferenceError> {
+        let weight_upload_bytes = usize::from(!pair.prepared.gpu_cache_hit)
+            * (pair.prepared.packed.code_words.len() * std::mem::size_of::<u32>()
+                + pair.prepared.packed.scales.len() * std::mem::size_of::<f32>());
+        self.account_projection_report(
+            &pair.prepared.packed,
+            pair.cols,
+            pair.prepared.weight_upload_duration,
+            pair.prepared.gpu_cache_hit,
+            &pair.report,
+            0,
+        );
+        self.push_dispatch_trace(
+            &pair.tensor_name,
+            "pair_resident",
+            pair.first_rows + pair.second_rows,
+            pair.cols,
+            pair.prepared.pack_cache_hit,
+            pair.prepared.gpu_cache_hit,
+            pair.prepared.compile_duration,
+            pair.prepared.weight_upload_duration,
+            pair.report.upload_duration,
+            pair.report.gpu_duration,
+            pair.report.download_duration,
+            weight_upload_bytes,
+            pair.activation_upload_bytes,
+            0,
+        );
+
+        let (runner, compile_duration, gpu_cache_hit) =
+            self.model.get_or_create_swiglu_combined_gpu()?;
+        let report = runner
+            .borrow_mut()
+            .run_resident_from_f32_buffer(
+                &pair.tensor.shared_context,
+                pair.tensor.buffer,
+                pair.first_rows + pair.second_rows,
+                pair.tensor.buffer_size,
+            )
+            .map_err(|error| {
+                ReferenceError::Decode(format!("gpu combined swiglu failed: {error}"))
+            })?;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.upload_duration += report.upload_duration;
+        self.metrics.gpu_duration += report.gpu_duration;
+        self.metrics.dispatch_count += 1;
+        self.metrics.activation_upload_bytes +=
+            (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes +=
+            (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_dense",
+                "mlp_swiglu_gpu",
+                "swiglu_combined",
+                pair.first_rows,
+                pair.first_rows + pair.second_rows,
+                gpu_cache_hit,
+                compile_duration,
+                Duration::ZERO,
+                report.upload_duration,
+                report.gpu_duration,
+                0,
+                (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>(),
+            ));
+        let len = pair.first_rows;
+        let tensor = GpuResidentBuffer::new(
+            runner.borrow().shared_context().clone(),
+            runner.borrow().output_buffer_handle(),
+            len,
+            runner.borrow().output_buffer_size(),
+        );
+        Ok(ResidentGpuSwigluCombined {
+            tensor,
+            len,
+            runner,
+            report,
+            compile_duration,
+            gpu_cache_hit,
+        })
+    }
+
+    pub(crate) fn run_swiglu_pack_f16_pairs_resident(
+        &mut self,
+        pair: ResidentPackedPairProjection,
+    ) -> Result<ResidentGpuPackedActivation, ReferenceError> {
+        let weight_upload_bytes = usize::from(!pair.prepared.gpu_cache_hit)
+            * (pair.prepared.packed.code_words.len() * std::mem::size_of::<u32>()
+                + pair.prepared.packed.scales.len() * std::mem::size_of::<f32>());
+        self.account_projection_report(
+            &pair.prepared.packed,
+            pair.cols,
+            pair.prepared.weight_upload_duration,
+            pair.prepared.gpu_cache_hit,
+            &pair.report,
+            0,
+        );
+        self.push_dispatch_trace(
+            &pair.tensor_name,
+            "pair_resident",
+            pair.first_rows + pair.second_rows,
+            pair.cols,
+            pair.prepared.pack_cache_hit,
+            pair.prepared.gpu_cache_hit,
+            pair.prepared.compile_duration,
+            pair.prepared.weight_upload_duration,
+            pair.report.upload_duration,
+            pair.report.gpu_duration,
+            pair.report.download_duration,
+            weight_upload_bytes,
+            pair.activation_upload_bytes,
+            0,
+        );
+
+        let (runner, compile_duration, gpu_cache_hit) =
+            self.model.get_or_create_swiglu_pack_f16_pairs_gpu()?;
+        let report = runner
+            .borrow_mut()
+            .run_with_output_from_buffer(
+                &pair.tensor.shared_context,
+                pair.tensor.buffer,
+                pair.first_rows + pair.second_rows,
+                pair.tensor.buffer_size,
+            )
+            .map_err(|error| {
+                ReferenceError::Decode(format!("gpu fused swiglu pack failed: {error}"))
+            })?;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.upload_duration += report.upload_duration;
+        self.metrics.gpu_duration += report.gpu_duration;
+        self.metrics.dispatch_count += 1;
+        self.metrics.activation_upload_bytes +=
+            (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes +=
+            (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_pack",
+                "mlp_swiglu_pack_gpu",
+                "swiglu_pack_f16_pairs",
+                pair.first_rows.div_ceil(2),
+                pair.first_rows + pair.second_rows,
+                gpu_cache_hit,
+                compile_duration,
+                Duration::ZERO,
+                report.upload_duration,
+                report.gpu_duration,
+                0,
+                (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>(),
+            ));
+        Ok(ResidentGpuPackedActivation {
+            keepalive: ResidentGpuPackedActivationKeepalive::SwigluPackF16(runner.clone()),
+            tensor: GpuResidentBuffer::new(
+                runner.borrow().shared_context().clone(),
+                runner.borrow().output_buffer_handle(),
+                runner.borrow().packed_len(),
+                runner.borrow().output_buffer_size(),
+            ),
+            logical_len: pair.first_rows,
+            upload_duration: report.upload_duration,
+            gpu_duration: report.gpu_duration,
+            compile_duration,
+            gpu_cache_hit,
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn run_pack_f16_pairs_from_swiglu(
+        &mut self,
+        swiglu: ResidentGpuSwigluCombined,
+    ) -> Result<ResidentGpuPackedActivation, ReferenceError> {
+        let (runner, compile_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_pack_f16_pairs_gpu(swiglu.runner.borrow().len())?;
+        let report = runner
+            .borrow_mut()
+            .run_resident_from_f32_buffer(
+                &swiglu.tensor.shared_context,
+                swiglu.tensor.buffer,
+                swiglu.len,
+                swiglu.tensor.buffer_size,
+            )
+            .map_err(|error| {
+                ReferenceError::Decode(format!("gpu pack f16 pairs failed: {error}"))
+            })?;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.upload_duration += report.upload_duration;
+        self.metrics.gpu_duration += report.gpu_duration;
+        self.metrics.dispatch_count += 1;
+        self.metrics.activation_upload_bytes += swiglu.len * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes += swiglu.len * std::mem::size_of::<f32>();
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_pack",
+                "pack_f16_pairs",
+                "pack_f16_pairs",
+                swiglu.len.div_ceil(2),
+                swiglu.len,
+                gpu_cache_hit,
+                compile_duration,
+                Duration::ZERO,
+                report.upload_duration,
+                report.gpu_duration,
+                0,
+                swiglu.len * std::mem::size_of::<f32>(),
+            ));
+        Ok(ResidentGpuPackedActivation {
+            keepalive: ResidentGpuPackedActivationKeepalive::PackF16(runner.clone()),
+            tensor: GpuResidentBuffer::new(
+                runner.borrow().shared_context().clone(),
+                runner.borrow().output_buffer_handle(),
+                runner.borrow().packed_len(),
+                runner.borrow().output_buffer_size(),
+            ),
+            logical_len: swiglu.len,
+            upload_duration: report.upload_duration,
+            gpu_duration: report.gpu_duration,
+            compile_duration,
+            gpu_cache_hit,
+        })
+    }
+
+    pub(crate) fn run_projection_pair(
+        &mut self,
+        first_name: &str,
+        first_rows: usize,
+        second_name: &str,
+        second_rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>), ReferenceError> {
+        let pair_key = format!("concat::{first_name}||{second_name}");
+        let (packed, pack_duration, pack_cache_hit) =
+            self.model.get_or_create_projection_pair_cache(
+                &pair_key,
+                first_name,
+                first_rows,
+                second_name,
+                second_rows,
+                cols,
+            )?;
+        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu(&pair_key, &packed)?;
+        self.metrics.pack_duration += pack_duration;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.weight_upload_duration += weight_upload_duration;
+        self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+
+        let report = runner.borrow_mut().run_resident(input).map_err(|error| {
+            ReferenceError::Decode(format!(
+                "gpu projection failed for {first_name}+{second_name}: {error}"
+            ))
+        })?;
+        let ((first, second), download_duration) = runner
+            .borrow()
+            .read_output_pair(first_rows, second_rows)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection output download failed for {first_name}+{second_name}: {error}"
+                ))
+            })?;
+        let report = crate::gpu::packed_matvec::GpuPackedMatvecReport {
+            download_duration,
+            ..report
+        };
+        self.metrics.activation_upload_duration += report.upload_duration;
+        self.metrics.upload_duration += weight_upload_duration + report.upload_duration;
+        self.metrics.gpu_duration += report.gpu_duration;
+        self.metrics.download_duration += report.download_duration;
+        self.metrics.dispatch_count += 1;
+        let weight_bytes = packed.code_words.len() * std::mem::size_of::<u32>()
+            + packed.scales.len() * std::mem::size_of::<f32>();
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        if !gpu_cache_hit {
+            self.metrics.weight_upload_bytes += weight_bytes;
+        }
+        self.metrics.activation_upload_bytes += activation_upload_bytes;
+        self.metrics.upload_bytes +=
+            usize::from(!gpu_cache_hit) * weight_bytes + activation_upload_bytes;
+        self.metrics.download_bytes += (first_rows + second_rows) * std::mem::size_of::<f32>();
+
+        let weight_upload_bytes = usize::from(!gpu_cache_hit)
+            * (packed.code_words.len() * std::mem::size_of::<u32>()
+                + packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        let download_bytes = (first_rows + second_rows) * std::mem::size_of::<f32>();
+        self.push_dispatch_trace(
+            &pair_key,
+            "pair",
+            first_rows + second_rows,
+            cols,
+            pack_cache_hit,
+            gpu_cache_hit,
+            compile_duration,
+            weight_upload_duration,
+            report.upload_duration,
+            report.gpu_duration,
+            report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            download_bytes,
+        );
+        Ok((first, second))
+    }
+
+    pub(crate) fn run_projection_pair_into(
+        &mut self,
+        first_name: &str,
+        first_rows: usize,
+        second_name: &str,
+        second_rows: usize,
+        cols: usize,
+        input: &[f32],
+        first: &mut Vec<f32>,
+        second: &mut Vec<f32>,
+    ) -> Result<(), ReferenceError> {
+        let pair_key = format!("concat::{first_name}||{second_name}");
+        let (packed, pack_duration, pack_cache_hit) =
+            self.model.get_or_create_projection_pair_cache(
+                &pair_key,
+                first_name,
+                first_rows,
+                second_name,
+                second_rows,
+                cols,
+            )?;
+        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu(&pair_key, &packed)?;
+        self.metrics.pack_duration += pack_duration;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.weight_upload_duration += weight_upload_duration;
+        self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+
+        let report = runner.borrow_mut().run_resident(input).map_err(|error| {
+            ReferenceError::Decode(format!(
+                "gpu projection failed for {first_name}+{second_name}: {error}"
+            ))
+        })?;
+        let download_duration = runner
+            .borrow()
+            .read_output_pair_into(first_rows, second_rows, first, second)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection output download failed for {first_name}+{second_name}: {error}"
+                ))
+            })?;
+        let report = crate::gpu::packed_matvec::GpuPackedMatvecReport {
+            download_duration,
+            ..report
+        };
+        self.metrics.activation_upload_duration += report.upload_duration;
+        self.metrics.upload_duration += weight_upload_duration + report.upload_duration;
+        self.metrics.gpu_duration += report.gpu_duration;
+        self.metrics.download_duration += report.download_duration;
+        self.metrics.dispatch_count += 1;
+        let weight_bytes = packed.code_words.len() * std::mem::size_of::<u32>()
+            + packed.scales.len() * std::mem::size_of::<f32>();
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        if !gpu_cache_hit {
+            self.metrics.weight_upload_bytes += weight_bytes;
+        }
+        self.metrics.activation_upload_bytes += activation_upload_bytes;
+        self.metrics.upload_bytes +=
+            usize::from(!gpu_cache_hit) * weight_bytes + activation_upload_bytes;
+        self.metrics.download_bytes += (first_rows + second_rows) * std::mem::size_of::<f32>();
+
+        let weight_upload_bytes = usize::from(!gpu_cache_hit)
+            * (packed.code_words.len() * std::mem::size_of::<u32>()
+                + packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        let download_bytes = (first_rows + second_rows) * std::mem::size_of::<f32>();
+        self.push_dispatch_trace(
+            &pair_key,
+            "pair",
+            first_rows + second_rows,
+            cols,
+            pack_cache_hit,
+            gpu_cache_hit,
+            compile_duration,
+            weight_upload_duration,
+            report.upload_duration,
+            report.gpu_duration,
+            report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            download_bytes,
+        );
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn run_projection_pair_resident(
+        &mut self,
+        first_name: &str,
+        first_rows: usize,
+        second_name: &str,
+        second_rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Result<ResidentPackedPairProjection, ReferenceError> {
+        let pair_key = format!("concat::{first_name}||{second_name}");
+        let (packed, pack_duration, pack_cache_hit) =
+            self.model.get_or_create_projection_pair_cache(
+                &pair_key,
+                first_name,
+                first_rows,
+                second_name,
+                second_rows,
+                cols,
+            )?;
+        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu(&pair_key, &packed)?;
+        self.metrics.pack_duration += pack_duration;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.weight_upload_duration += weight_upload_duration;
+        self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+        let report = runner.borrow_mut().run_resident(input).map_err(|error| {
+            ReferenceError::Decode(format!(
+                "gpu projection failed for {first_name}+{second_name}: {error}"
+            ))
+        })?;
+        let tensor = GpuResidentBuffer::new(
+            runner.borrow().shared_context().clone(),
+            runner.borrow().output_buffer_handle(),
+            first_rows + second_rows,
+            runner.borrow().output_buffer_size(),
+        );
+        Ok(ResidentPackedPairProjection {
+            tensor_name: pair_key,
+            first_rows,
+            second_rows,
+            cols,
+            tensor,
+            activation_upload_bytes: cols.div_ceil(2) * std::mem::size_of::<u32>(),
+            prepared: PreparedProjectionRunner {
+                packed,
+                runner,
+                compile_duration,
+                weight_upload_duration,
+                pack_cache_hit,
+                gpu_cache_hit,
+            },
+            report,
+        })
+    }
+
+    pub(crate) fn run_projection_pair_resident_from_final_norm(
+        &mut self,
+        first_name: &str,
+        first_rows: usize,
+        second_name: &str,
+        second_rows: usize,
+        cols: usize,
+        final_norm: ResidentGpuFinalNorm,
+    ) -> Result<ResidentPackedPairProjection, ReferenceError> {
+        let len = final_norm.len;
+        self.metrics.compile_duration += final_norm.compile_duration;
+        self.metrics.upload_duration += final_norm.report.upload_duration;
+        self.metrics.gpu_duration += final_norm.report.gpu_duration;
+        self.metrics.dispatch_count += 1;
+        self.metrics.activation_upload_bytes += len * std::mem::size_of::<f32>();
+        self.metrics.weight_upload_bytes += len * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes += 2 * len * std::mem::size_of::<f32>();
+        self.metrics.gpu_cache_hits += usize::from(final_norm.gpu_cache_hit);
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_dense",
+                "post_attention_norm_gpu",
+                "post_attention_layernorm.weight",
+                len,
+                len,
+                final_norm.gpu_cache_hit,
+                final_norm.compile_duration,
+                final_norm.report.upload_duration,
+                Duration::ZERO,
+                final_norm.report.gpu_duration,
+                len * std::mem::size_of::<f32>(),
+                len * std::mem::size_of::<f32>(),
+            ));
+
+        let pair_key = format!("concat::{first_name}||{second_name}");
+        let (packed, pack_duration, pack_cache_hit) =
+            self.model.get_or_create_projection_pair_cache(
+                &pair_key,
+                first_name,
+                first_rows,
+                second_name,
+                second_rows,
+                cols,
+            )?;
+        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu_raw_f32(&pair_key, &packed)?;
+        self.metrics.pack_duration += pack_duration;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.weight_upload_duration += weight_upload_duration;
+        self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+        let report = runner
+            .borrow_mut()
+            .run_resident_from_f32_buffer(
+                &final_norm.tensor.shared_context,
+                final_norm.tensor.buffer,
+                len,
+                final_norm.tensor.buffer_size,
+            )
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu raw-f32 pair projection failed for {first_name}+{second_name}: {error}"
+                ))
+            })?;
+        let tensor = GpuResidentBuffer::new(
+            runner.borrow().shared_context().clone(),
+            runner.borrow().output_buffer_handle(),
+            first_rows + second_rows,
+            runner.borrow().output_buffer_size(),
+        );
+        Ok(ResidentPackedPairProjection {
+            tensor_name: pair_key,
+            first_rows,
+            second_rows,
+            cols,
+            tensor,
+            activation_upload_bytes: cols * std::mem::size_of::<f32>(),
+            prepared: PreparedProjectionRunner {
+                packed,
+                runner,
+                compile_duration,
+                weight_upload_duration,
+                pack_cache_hit,
+                gpu_cache_hit,
+            },
+            report,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub(crate) fn run_projection_triplet(
+        &mut self,
+        first_name: &str,
+        first_rows: usize,
+        second_name: &str,
+        second_rows: usize,
+        third_name: &str,
+        third_rows: usize,
+        cols: usize,
+        input: &[f32],
+    ) -> Result<ProjectionTripletOutputs, ReferenceError> {
+        let triplet_key = format!("concat::{first_name}||{second_name}||{third_name}");
+        let (packed, pack_duration, pack_cache_hit) =
+            self.model.get_or_create_projection_triplet_cache(
+                &triplet_key,
+                first_name,
+                first_rows,
+                second_name,
+                second_rows,
+                third_name,
+                third_rows,
+                cols,
+            )?;
+        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu(&triplet_key, &packed)?;
+        self.metrics.pack_duration += pack_duration;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.weight_upload_duration += weight_upload_duration;
+        self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+
+        let report = runner.borrow_mut().run_resident(input).map_err(|error| {
+            ReferenceError::Decode(format!(
+                "gpu projection failed for {first_name}+{second_name}+{third_name}: {error}"
+            ))
+        })?;
+        let ((first, second, third), download_duration) = runner
+            .borrow()
+            .read_output_triplet(first_rows, second_rows, third_rows)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection output download failed for {first_name}+{second_name}+{third_name}: {error}"
+                ))
+            })?;
+        let report = crate::gpu::packed_matvec::GpuPackedMatvecReport {
+            download_duration,
+            ..report
+        };
+        self.metrics.activation_upload_duration += report.upload_duration;
+        self.metrics.upload_duration += weight_upload_duration + report.upload_duration;
+        self.metrics.gpu_duration += report.gpu_duration;
+        self.metrics.download_duration += report.download_duration;
+        self.metrics.dispatch_count += 1;
+        let weight_bytes = packed.code_words.len() * std::mem::size_of::<u32>()
+            + packed.scales.len() * std::mem::size_of::<f32>();
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        if !gpu_cache_hit {
+            self.metrics.weight_upload_bytes += weight_bytes;
+        }
+        self.metrics.activation_upload_bytes += activation_upload_bytes;
+        self.metrics.upload_bytes +=
+            usize::from(!gpu_cache_hit) * weight_bytes + activation_upload_bytes;
+        self.metrics.download_bytes +=
+            (first_rows + second_rows + third_rows) * std::mem::size_of::<f32>();
+
+        let weight_upload_bytes = usize::from(!gpu_cache_hit)
+            * (packed.code_words.len() * std::mem::size_of::<u32>()
+                + packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        let download_bytes = (first_rows + second_rows + third_rows) * std::mem::size_of::<f32>();
+        self.push_dispatch_trace(
+            &triplet_key,
+            "triplet",
+            first_rows + second_rows + third_rows,
+            cols,
+            pack_cache_hit,
+            gpu_cache_hit,
+            compile_duration,
+            weight_upload_duration,
+            report.upload_duration,
+            report.gpu_duration,
+            report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            download_bytes,
+        );
+        Ok((first, second, third))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn run_projection_triplet_into(
+        &mut self,
+        first_name: &str,
+        first_rows: usize,
+        second_name: &str,
+        second_rows: usize,
+        third_name: &str,
+        third_rows: usize,
+        cols: usize,
+        input: &[f32],
+        first: &mut Vec<f32>,
+        second: &mut Vec<f32>,
+        third: &mut Vec<f32>,
+    ) -> Result<(), ReferenceError> {
+        let triplet_key = format!("concat::{first_name}||{second_name}||{third_name}");
+        let (packed, pack_duration, pack_cache_hit) =
+            self.model.get_or_create_projection_triplet_cache(
+                &triplet_key,
+                first_name,
+                first_rows,
+                second_name,
+                second_rows,
+                third_name,
+                third_rows,
+                cols,
+            )?;
+        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu(&triplet_key, &packed)?;
+        self.metrics.pack_duration += pack_duration;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.weight_upload_duration += weight_upload_duration;
+        self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+
+        let report = runner.borrow_mut().run_resident(input).map_err(|error| {
+            ReferenceError::Decode(format!(
+                "gpu projection failed for {first_name}+{second_name}+{third_name}: {error}"
+            ))
+        })?;
+        let download_duration = runner
+            .borrow()
+            .read_output_triplet_into(first_rows, second_rows, third_rows, first, second, third)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection output download failed for {first_name}+{second_name}+{third_name}: {error}"
+                ))
+            })?;
+        let report = crate::gpu::packed_matvec::GpuPackedMatvecReport {
+            download_duration,
+            ..report
+        };
+        self.metrics.activation_upload_duration += report.upload_duration;
+        self.metrics.upload_duration += weight_upload_duration + report.upload_duration;
+        self.metrics.gpu_duration += report.gpu_duration;
+        self.metrics.download_duration += report.download_duration;
+        self.metrics.dispatch_count += 1;
+        let weight_bytes = packed.code_words.len() * std::mem::size_of::<u32>()
+            + packed.scales.len() * std::mem::size_of::<f32>();
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        if !gpu_cache_hit {
+            self.metrics.weight_upload_bytes += weight_bytes;
+        }
+        self.metrics.activation_upload_bytes += activation_upload_bytes;
+        self.metrics.upload_bytes +=
+            usize::from(!gpu_cache_hit) * weight_bytes + activation_upload_bytes;
+        self.metrics.download_bytes +=
+            (first_rows + second_rows + third_rows) * std::mem::size_of::<f32>();
+
+        let weight_upload_bytes = usize::from(!gpu_cache_hit)
+            * (packed.code_words.len() * std::mem::size_of::<u32>()
+                + packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        let download_bytes = (first_rows + second_rows + third_rows) * std::mem::size_of::<f32>();
+        self.push_dispatch_trace(
+            &triplet_key,
+            "triplet",
+            first_rows + second_rows + third_rows,
+            cols,
+            pack_cache_hit,
+            gpu_cache_hit,
+            compile_duration,
+            weight_upload_duration,
+            report.upload_duration,
+            report.gpu_duration,
+            report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            download_bytes,
+        );
+        Ok(())
     }
 }
 
@@ -1111,7 +1860,9 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
         &mut self,
         token_id: usize,
     ) -> Result<Option<Vec<f32>>, ReferenceError> {
-        self.inner.gpu_first_session.embedding_lookup_output(token_id)
+        self.inner
+            .gpu_first_session
+            .embedding_lookup_output(token_id)
     }
 }
 
@@ -1236,34 +1987,32 @@ impl<'a> GpuDecodeEngine<'a> {
         if self.plan.gpu_first_session {
             let mut gpu_first_cache =
                 GpuFirstRunnerCache::new(self.model, self.request.expected_tokens.max(1));
-            gpu_first_cache.prewarm_decode_path(
-                self.request.use_attention_qkv,
-                self.request.use_mlp_gu,
-            )?;
+            gpu_first_cache
+                .prewarm_decode_path(self.request.use_attention_qkv, self.request.use_mlp_gu)?;
         }
         Ok(())
     }
 
     pub fn begin_packed_session(&self) -> PackedDecodeSession<'a> {
         match self.session_mode() {
-            GpuDecodeSessionMode::GpuFirst => PackedDecodeSession::GpuFirst(
-                GpuFirstPackedDecodeSession::new(
+            GpuDecodeSessionMode::GpuFirst => {
+                PackedDecodeSession::GpuFirst(GpuFirstPackedDecodeSession::new(
                     self.model,
                     self.request.expected_tokens,
                     self.request.use_attention_qkv,
                     self.request.use_mlp_gu,
                     self.request.argmax_only,
-                ),
-            ),
-            GpuDecodeSessionMode::Legacy => PackedDecodeSession::Legacy(
-                PersistentPackedDecodeSession::new(
+                ))
+            }
+            GpuDecodeSessionMode::Legacy => {
+                PackedDecodeSession::Legacy(PersistentPackedDecodeSession::new(
                     self.model,
                     self.request.expected_tokens,
                     self.request.use_attention_qkv,
                     self.request.use_mlp_gu,
                     self.request.argmax_only,
-                ),
-            ),
+                ))
+            }
         }
     }
 
@@ -1462,7 +2211,8 @@ impl ReferenceModel {
         use_mlp_gu: bool,
     ) -> Result<PackedDecodeValidationReport, ReferenceError> {
         let dense_logits = dense_reference.prefill_logits_for_variant(prompt, false, false)?;
-        let packed_logits = self.prefill_logits_for_variant(prompt, use_attention_qkv, use_mlp_gu)?;
+        let packed_logits =
+            self.prefill_logits_for_variant(prompt, use_attention_qkv, use_mlp_gu)?;
         if dense_logits.len() != packed_logits.len() {
             return Err(ReferenceError::Decode(format!(
                 "logit length mismatch: dense {} vs packed {}",
@@ -1586,12 +2336,7 @@ impl ReferenceModel {
     ) -> Result<(), ReferenceError> {
         GpuDecodeEngine::new(
             self,
-            PackedDecodeRequest::new(
-                expected_tokens,
-                use_attention_qkv,
-                use_mlp_gu,
-                argmax_only,
-            ),
+            PackedDecodeRequest::new(expected_tokens, use_attention_qkv, use_mlp_gu, argmax_only),
         )
         .prewarm()
     }
@@ -1605,12 +2350,7 @@ impl ReferenceModel {
     ) -> PackedDecodeSession<'_> {
         GpuDecodeEngine::new(
             self,
-            PackedDecodeRequest::new(
-                expected_tokens,
-                use_attention_qkv,
-                use_mlp_gu,
-                argmax_only,
-            ),
+            PackedDecodeRequest::new(expected_tokens, use_attention_qkv, use_mlp_gu, argmax_only),
         )
         .begin_packed_session()
     }
