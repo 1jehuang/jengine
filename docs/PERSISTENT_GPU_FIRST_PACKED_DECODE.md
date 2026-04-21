@@ -106,9 +106,11 @@ Helpers now exist to both capture the branch matrix and summarize hotspot breakd
 - `scripts/summarize_packed_profile_hotspots.py <profile.json> [top_n]`
 - `scripts/profile_gpu_first_matrix_with_hotspots.sh [root] [artifact_dir] [prompt] [tokens] [out_dir] [top_n]`
 - `scripts/compare_packed_profile_hotspots.py <before.json> <after.json> [top_n]`
+- `scripts/compare_gpu_first_matrices.sh <before_dir> <after_dir> [top_n]`
 
 The combined helper runs the branch matrix capture and writes a `hotspots.txt` file next to the generated JSON profiles.
 The compare helper makes it easy to separate real progress from run-to-run noise by showing metric deltas plus the largest per-stage regressions and improvements between two checkpoints.
+The matrix compare wrapper applies that comparison across every JSON in two branch-matrix directories.
 
 Using the summarizer on the latest matrix checkpoint makes the blocker hierarchy much clearer.
 
