@@ -307,6 +307,61 @@ impl PackedDecodeValidationReport {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_packed_decode_metrics(
+    enabled_projections: String,
+    total_duration: Duration,
+    decode_metrics: &DecodeMetrics,
+    attention_stage_metrics: &PackedAttentionStageMetrics,
+    mlp_stage_metrics: &PackedMlpStageMetrics,
+    non_offloaded_dense_duration: Duration,
+    session_metrics: &PackedGpuSessionMetrics,
+    output_text: String,
+) -> PackedDecodeMetrics {
+    let orchestration_duration = total_duration.saturating_sub(
+        session_metrics.pack_duration
+            + session_metrics.compile_duration
+            + session_metrics.weight_upload_duration
+            + session_metrics.activation_upload_duration
+            + session_metrics.gpu_duration
+            + session_metrics.download_duration
+            + non_offloaded_dense_duration,
+    );
+    PackedDecodeMetrics {
+        enabled_projections,
+        total_duration,
+        embedding_duration: decode_metrics.embedding_duration,
+        norm_duration: decode_metrics.norm_duration,
+        qkv_duration: decode_metrics.qkv_duration,
+        attention_duration: decode_metrics.attention_duration,
+        attention_query_duration: attention_stage_metrics.query_duration,
+        attention_oproj_duration: attention_stage_metrics.oproj_duration,
+        attention_residual_duration: attention_stage_metrics.residual_duration,
+        mlp_duration: decode_metrics.mlp_duration,
+        mlp_swiglu_duration: mlp_stage_metrics.swiglu_duration,
+        mlp_down_duration: mlp_stage_metrics.down_duration,
+        mlp_residual_duration: mlp_stage_metrics.residual_duration,
+        logits_duration: decode_metrics.logits_duration,
+        pack_duration: session_metrics.pack_duration,
+        compile_duration: session_metrics.compile_duration,
+        weight_upload_duration: session_metrics.weight_upload_duration,
+        activation_upload_duration: session_metrics.activation_upload_duration,
+        upload_duration: session_metrics.upload_duration,
+        gpu_duration: session_metrics.gpu_duration,
+        download_duration: session_metrics.download_duration,
+        non_offloaded_dense_duration,
+        orchestration_duration,
+        pack_cache_hits: session_metrics.pack_cache_hits,
+        gpu_cache_hits: session_metrics.gpu_cache_hits,
+        dispatch_count: session_metrics.dispatch_count,
+        weight_upload_bytes: session_metrics.weight_upload_bytes,
+        activation_upload_bytes: session_metrics.activation_upload_bytes,
+        upload_bytes: session_metrics.upload_bytes,
+        download_bytes: session_metrics.download_bytes,
+        output_text,
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PackedAttentionStageMetrics {
     pub query_duration: Duration,

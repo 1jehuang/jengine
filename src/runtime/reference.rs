@@ -31,10 +31,11 @@ use crate::runtime::gpu_decode_env::{
     packed_use_gpu_tail, packed_use_mlp_full,
 };
 use crate::runtime::gpu_decode_metrics::{
-    AttentionProjectionMixMetrics, DecodeMetrics, HybridDecodeMetrics,
-    HybridProjectionDecodeMetrics, MlpProjectionMixMetrics, PackedAttentionStageMetrics,
-    PackedDecodeMetrics, PackedDecodeValidationReport, PackedGpuSessionMetrics,
-    PackedMlpStageMetrics, ProjectionComparison,
+    finish_packed_decode_metrics, AttentionProjectionMixMetrics, DecodeMetrics,
+    HybridDecodeMetrics, HybridProjectionDecodeMetrics, MlpProjectionMixMetrics,
+    PackedAttentionStageMetrics, PackedDecodeMetrics, PackedDecodeValidationReport,
+    PackedGpuSessionMetrics, PackedMlpStageMetrics,
+    ProjectionComparison,
 };
 use crate::runtime::gpu_decode_model_state::{HybridQProjCache, LayerTensorNames};
 use crate::runtime::gpu_decode_output::{
@@ -250,14 +251,14 @@ impl<'a> PersistentPackedDecodeSession<'a> {
         total_duration: Duration,
         output_text: String,
     ) -> PackedDecodeMetrics {
-        ReferenceModel::finish_packed_decode_metrics(
+        finish_packed_decode_metrics(
             enabled_projections,
             total_duration,
             &self.metrics,
             &self.attention_stage_metrics,
             &self.mlp_stage_metrics,
             self.non_offloaded_dense_duration,
-            &self.gpu_session,
+            &self.gpu_session.metrics,
             output_text,
         )
     }
@@ -277,14 +278,14 @@ impl<'a> PersistentPackedDecodeSession<'a> {
             gpu_session,
             ..
         } = self;
-        let metrics = ReferenceModel::finish_packed_decode_metrics(
+        let metrics = finish_packed_decode_metrics(
             enabled_projections,
             total_duration,
             &decode_metrics,
             &attention_stage_metrics,
             &mlp_stage_metrics,
             non_offloaded_dense_duration,
-            &gpu_session,
+            &gpu_session.metrics,
             output_text.clone(),
         );
         let dispatch_trace = gpu_session.dispatch_trace;
@@ -3558,61 +3559,6 @@ pub struct ReferenceModel {
 }
 
 impl ReferenceModel {
-    #[allow(clippy::too_many_arguments)]
-    fn finish_packed_decode_metrics(
-        enabled_projections: String,
-        total_duration: Duration,
-        decode_metrics: &DecodeMetrics,
-        attention_stage_metrics: &PackedAttentionStageMetrics,
-        mlp_stage_metrics: &PackedMlpStageMetrics,
-        non_offloaded_dense_duration: Duration,
-        session: &PackedGpuSession<'_>,
-        output_text: String,
-    ) -> PackedDecodeMetrics {
-        let orchestration_duration = total_duration.saturating_sub(
-            session.metrics.pack_duration
-                + session.metrics.compile_duration
-                + session.metrics.weight_upload_duration
-                + session.metrics.activation_upload_duration
-                + session.metrics.gpu_duration
-                + session.metrics.download_duration
-                + non_offloaded_dense_duration,
-        );
-        PackedDecodeMetrics {
-            enabled_projections,
-            total_duration,
-            embedding_duration: decode_metrics.embedding_duration,
-            norm_duration: decode_metrics.norm_duration,
-            qkv_duration: decode_metrics.qkv_duration,
-            attention_duration: decode_metrics.attention_duration,
-            attention_query_duration: attention_stage_metrics.query_duration,
-            attention_oproj_duration: attention_stage_metrics.oproj_duration,
-            attention_residual_duration: attention_stage_metrics.residual_duration,
-            mlp_duration: decode_metrics.mlp_duration,
-            mlp_swiglu_duration: mlp_stage_metrics.swiglu_duration,
-            mlp_down_duration: mlp_stage_metrics.down_duration,
-            mlp_residual_duration: mlp_stage_metrics.residual_duration,
-            logits_duration: decode_metrics.logits_duration,
-            pack_duration: session.metrics.pack_duration,
-            compile_duration: session.metrics.compile_duration,
-            weight_upload_duration: session.metrics.weight_upload_duration,
-            activation_upload_duration: session.metrics.activation_upload_duration,
-            upload_duration: session.metrics.upload_duration,
-            gpu_duration: session.metrics.gpu_duration,
-            download_duration: session.metrics.download_duration,
-            non_offloaded_dense_duration,
-            orchestration_duration,
-            pack_cache_hits: session.metrics.pack_cache_hits,
-            gpu_cache_hits: session.metrics.gpu_cache_hits,
-            dispatch_count: session.metrics.dispatch_count,
-            weight_upload_bytes: session.metrics.weight_upload_bytes,
-            activation_upload_bytes: session.metrics.activation_upload_bytes,
-            upload_bytes: session.metrics.upload_bytes,
-            download_bytes: session.metrics.download_bytes,
-            output_text,
-        }
-    }
-
     pub fn load_core_from_root(root: impl AsRef<Path>) -> Result<Self, ReferenceError> {
         let assets = BonsaiAssetPaths::from_root(root)?;
         let config = serde_json::from_str::<BonsaiModelConfig>(&std::fs::read_to_string(
@@ -5883,14 +5829,14 @@ impl ReferenceModel {
 
         Ok((
             hidden,
-            Self::finish_packed_decode_metrics(
+            finish_packed_decode_metrics(
                 packed_enabled_label(use_attention_qkv, use_mlp_gu),
                 total_started.elapsed(),
                 &metrics,
                 &attention_stage_metrics,
                 &mlp_stage_metrics,
                 non_offloaded_dense_duration,
-                &session,
+                &session.metrics,
                 String::new(),
             ),
         ))
