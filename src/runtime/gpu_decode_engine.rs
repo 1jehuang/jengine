@@ -556,6 +556,34 @@ impl<'a> GpuDecodeEngine<'a> {
         ))
     }
 
+    pub fn generate_from_prompt(
+        &self,
+        tokenizer: &TokenizerRuntime,
+        prompt: &str,
+        max_new_tokens: usize,
+    ) -> Result<PackedDecodeResult, ReferenceError> {
+        let prompt_ids = tokenizer
+            .encode(prompt)?
+            .into_iter()
+            .map(|id| id as usize)
+            .collect::<Vec<_>>();
+        if prompt_ids.is_empty() {
+            return Err(ReferenceError::Decode(
+                "prompt encoded to zero tokens".to_string(),
+            ));
+        }
+        GpuDecodeEngine::new(
+            self.model,
+            PackedDecodeRequest::new(
+                prompt_ids.len() + max_new_tokens,
+                self.request.use_attention_qkv,
+                self.request.use_mlp_gu,
+                self.request.argmax_only,
+            ),
+        )
+        .generate_from_token_ids(tokenizer, &prompt_ids, max_new_tokens)
+    }
+
     pub fn prefill_logits_from_token_ids(
         &self,
         prompt_ids: &[usize],
@@ -576,6 +604,33 @@ impl<'a> GpuDecodeEngine<'a> {
             };
         }
         Ok(last_logits)
+    }
+
+    pub fn prefill_logits_from_prompt(
+        &self,
+        tokenizer: &TokenizerRuntime,
+        prompt: &str,
+    ) -> Result<Vec<f32>, ReferenceError> {
+        let prompt_ids = tokenizer
+            .encode(prompt)?
+            .into_iter()
+            .map(|id| id as usize)
+            .collect::<Vec<_>>();
+        if prompt_ids.is_empty() {
+            return Err(ReferenceError::Decode(
+                "prompt encoded to zero tokens".to_string(),
+            ));
+        }
+        GpuDecodeEngine::new(
+            self.model,
+            PackedDecodeRequest::new(
+                prompt_ids.len(),
+                self.request.use_attention_qkv,
+                self.request.use_mlp_gu,
+                self.request.argmax_only,
+            ),
+        )
+        .prefill_logits_from_token_ids(&prompt_ids)
     }
 }
 

@@ -6870,13 +6870,11 @@ impl ReferenceModel {
             .tokenizer
             .as_ref()
             .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
-        let prompt_ids = self.encode_prompt_ids(tokenizer, prompt)?;
-        self.generate_packed_from_token_ids(
-            &prompt_ids,
-            max_new_tokens,
-            use_attention_qkv,
-            use_mlp_gu,
+        GpuDecodeEngine::new(
+            self,
+            PackedDecodeRequest::new(1, use_attention_qkv, use_mlp_gu, true),
         )
+        .generate_from_prompt(tokenizer, prompt, max_new_tokens)
     }
 
     pub fn generate_packed_from_token_ids(
@@ -6912,12 +6910,11 @@ impl ReferenceModel {
             .tokenizer
             .as_ref()
             .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
-        let prompt_ids = self.encode_prompt_ids(tokenizer, prompt)?;
         GpuDecodeEngine::new(
             self,
-            PackedDecodeRequest::new(prompt_ids.len(), use_attention_qkv, use_mlp_gu, false),
+            PackedDecodeRequest::new(1, use_attention_qkv, use_mlp_gu, false),
         )
-        .prefill_logits_from_token_ids(&prompt_ids)
+        .prefill_logits_from_prompt(tokenizer, prompt)
     }
 
     pub fn compare_prefill_logits_against(
