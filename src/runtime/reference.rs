@@ -31,11 +31,11 @@ use crate::runtime::gpu_decode_env::{
     packed_use_gpu_tail, packed_use_mlp_full,
 };
 use crate::runtime::gpu_decode_metrics::{
-    finish_packed_decode_metrics, AttentionProjectionMixMetrics, DecodeMetrics,
+    account_projection_report, AttentionProjectionMixMetrics, DecodeMetrics,
     HybridDecodeMetrics, HybridProjectionDecodeMetrics, MlpProjectionMixMetrics,
     PackedAttentionStageMetrics, PackedDecodeMetrics, PackedDecodeValidationReport,
-    PackedGpuSessionMetrics, PackedMlpStageMetrics,
-    ProjectionComparison,
+    PackedGpuSessionMetrics, PackedMlpStageMetrics, ProjectionComparison,
+    finish_packed_decode_metrics,
 };
 use crate::runtime::gpu_decode_model_state::{HybridQProjCache, LayerTensorNames};
 use crate::runtime::gpu_decode_output::{
@@ -2834,21 +2834,17 @@ impl<'a> PackedGpuSession<'a> {
         report: &crate::gpu::packed_matvec::GpuPackedMatvecReport,
         download_bytes: usize,
     ) {
-        self.metrics.activation_upload_duration += report.upload_duration;
-        self.metrics.upload_duration += weight_upload_duration + report.upload_duration;
-        self.metrics.gpu_duration += report.gpu_duration;
-        self.metrics.download_duration += report.download_duration;
-        self.metrics.dispatch_count += 1;
-        let weight_bytes = packed.code_words.len() * std::mem::size_of::<u32>()
+        let packed_weight_bytes = packed.code_words.len() * std::mem::size_of::<u32>()
             + packed.scales.len() * std::mem::size_of::<f32>();
-        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
-        if !gpu_cache_hit {
-            self.metrics.weight_upload_bytes += weight_bytes;
-        }
-        self.metrics.activation_upload_bytes += activation_upload_bytes;
-        self.metrics.upload_bytes +=
-            usize::from(!gpu_cache_hit) * weight_bytes + activation_upload_bytes;
-        self.metrics.download_bytes += download_bytes;
+        account_projection_report(
+            &mut self.metrics,
+            packed_weight_bytes,
+            cols,
+            weight_upload_duration,
+            gpu_cache_hit,
+            report,
+            download_bytes,
+        );
     }
 
     fn run_projection_add_residual(

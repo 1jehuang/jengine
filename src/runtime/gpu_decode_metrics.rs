@@ -362,6 +362,31 @@ pub(crate) fn finish_packed_decode_metrics(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn account_projection_report(
+    session_metrics: &mut PackedGpuSessionMetrics,
+    packed_weight_bytes: usize,
+    cols: usize,
+    weight_upload_duration: Duration,
+    gpu_cache_hit: bool,
+    report: &crate::gpu::packed_matvec::GpuPackedMatvecReport,
+    download_bytes: usize,
+) {
+    session_metrics.activation_upload_duration += report.upload_duration;
+    session_metrics.upload_duration += weight_upload_duration + report.upload_duration;
+    session_metrics.gpu_duration += report.gpu_duration;
+    session_metrics.download_duration += report.download_duration;
+    session_metrics.dispatch_count += 1;
+    let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+    if !gpu_cache_hit {
+        session_metrics.weight_upload_bytes += packed_weight_bytes;
+    }
+    session_metrics.activation_upload_bytes += activation_upload_bytes;
+    session_metrics.upload_bytes +=
+        usize::from(!gpu_cache_hit) * packed_weight_bytes + activation_upload_bytes;
+    session_metrics.download_bytes += download_bytes;
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PackedAttentionStageMetrics {
     pub query_duration: Duration,
