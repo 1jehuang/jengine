@@ -266,6 +266,125 @@ impl CachedGpuFullLastLayerRunner {
             argmax_index,
         })
     }
+
+    pub fn run_argmax_from_resident_residual(
+        &mut self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: ash::vk::Buffer,
+        source_len: usize,
+        source_buffer_size: u64,
+        post_norm_weight: &[f32],
+        final_norm_weight: &[f32],
+    ) -> Result<GpuFullLastLayerReport, GpuFullLastLayerError> {
+        if source_len != self.hidden
+            || post_norm_weight.len() != self.hidden
+            || final_norm_weight.len() != self.hidden
+        {
+            return Err(GpuFullLastLayerError(
+                "resident full last-layer runner received mismatched hidden-sized buffers"
+                    .to_string(),
+            ));
+        }
+
+        let post_norm_report = self
+            .post_norm_runner
+            .run_resident_from_f32_buffer(
+                source_context,
+                source_buffer,
+                source_len,
+                source_buffer_size,
+                post_norm_weight,
+            )
+            .map_err(map_weighted_rms_norm_error)?;
+        let pair_report = self
+            .pair_runner
+            .run_resident_from_f32_buffer(
+                self.post_norm_runner.shared_context(),
+                self.post_norm_runner.output_buffer_handle(),
+                self.hidden,
+                self.post_norm_runner.output_buffer_size(),
+            )
+            .map_err(map_packed_matvec_error)?;
+        let swiglu_pack_report = self
+            .swiglu_pack_runner
+            .run_with_output_from_buffer(
+                self.pair_runner.shared_context(),
+                self.pair_runner.output_buffer_handle(),
+                self.intermediate * 2,
+                self.pair_runner.output_buffer_size(),
+            )
+            .map_err(map_swiglu_pack_error)?;
+        let down_report = self
+            .down_runner
+            .run_resident_from_packed_buffer(
+                self.swiglu_pack_runner.shared_context(),
+                self.swiglu_pack_runner.output_buffer_handle(),
+                self.swiglu_pack_runner.packed_len(),
+                self.swiglu_pack_runner.output_buffer_size(),
+            )
+            .map_err(map_packed_matvec_error)?;
+        let add_report = self
+            .add_runner
+            .run_resident_from_buffers(
+                self.down_runner.shared_context(),
+                self.down_runner.output_buffer_handle(),
+                self.hidden,
+                self.down_runner.output_buffer_size(),
+                source_buffer,
+                source_len,
+                source_buffer_size,
+            )
+            .map_err(map_vector_add_error)?;
+        let final_norm_report = self
+            .final_norm_runner
+            .run_resident_from_f32_buffer(
+                self.add_runner.shared_context(),
+                self.add_runner.output_buffer_handle(),
+                self.hidden,
+                self.add_runner.output_buffer_size(),
+                final_norm_weight,
+            )
+            .map_err(map_weighted_rms_norm_error)?;
+        let pack_report = self
+            .pack_runner
+            .run_resident_from_f32_buffer(
+                self.final_norm_runner.shared_context(),
+                self.final_norm_runner.output_buffer_handle(),
+                self.hidden,
+                self.final_norm_runner.output_buffer_size(),
+            )
+            .map_err(map_pack_f16_pairs_error)?;
+        let logits_report = self
+            .logits_runner
+            .run_resident_from_packed_buffer(
+                self.pack_runner.shared_context(),
+                self.pack_runner.output_buffer_handle(),
+                self.pack_runner.packed_len(),
+                self.pack_runner.output_buffer_size(),
+            )
+            .map_err(map_packed_matvec_error)?;
+        let (argmax_index, logits_download_duration) = self
+            .logits_runner
+            .argmax_output()
+            .map_err(map_packed_matvec_error)?;
+
+        Ok(GpuFullLastLayerReport {
+            hidden: self.hidden,
+            intermediate: self.intermediate,
+            vocab: self.vocab,
+            compile_duration: self.compile_duration,
+            post_norm_gpu_duration: post_norm_report.gpu_duration,
+            pair_gpu_duration: pair_report.gpu_duration,
+            swiglu_pack_gpu_duration: swiglu_pack_report.gpu_duration,
+            down_gpu_duration: down_report.gpu_duration,
+            residual_add_gpu_duration: add_report.gpu_duration,
+            final_norm_gpu_duration: final_norm_report.gpu_duration,
+            pack_gpu_duration: pack_report.gpu_duration,
+            logits_gpu_duration: logits_report.gpu_duration,
+            logits_download_duration,
+            argmax_index,
+        })
+    }
 }
 
 fn map_packed_matvec_error(error: GpuPackedMatvecError) -> GpuFullLastLayerError {
