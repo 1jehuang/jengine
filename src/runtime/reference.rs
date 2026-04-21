@@ -9412,6 +9412,91 @@ mod tests {
     }
 
     #[test]
+    fn keeps_cpu_kv_empty_across_persistent_gpu_first_generation_loop_with_gpu_embedding() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_two_layer_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let _guard = lock_env();
+        let _env = ScopedEnvVars::set(&[
+            ("JENGINE_GPU_EMBEDDING", "1"),
+            ("JENGINE_PACKED_ATTENTION_FULL", "1"),
+            ("JENGINE_PACKED_MLP_FULL", "1"),
+            ("JENGINE_GPU_ATTENTION_BLOCK", "1"),
+            ("JENGINE_GPU_SWIGLU_BLOCK", "1"),
+        ]);
+
+        let mut session = model.begin_packed_decode_session(3, true, true, true);
+        let predicted = match session
+            .push_prompt_token(2)
+            .expect("gpu-first prompt token should decode")
+        {
+            PackedDecodeStepResult::NextToken(token_id) => token_id,
+            PackedDecodeStepResult::Logits(_) => unreachable!("argmax-only session should predict"),
+        };
+        let predicted = match session
+            .push_generated_token(predicted)
+            .expect("gpu-first generated token should decode")
+        {
+            PackedDecodeStepResult::NextToken(token_id) => token_id,
+            PackedDecodeStepResult::Logits(_) => unreachable!("argmax-only session should predict"),
+        };
+        assert_eq!(predicted, 2);
+
+        let PackedDecodeSession::GpuFirst(session) = session else {
+            panic!("gpu-first session should be selected when gpu embedding and block flags are enabled");
+        };
+        let expected_q_key = format!(
+            "gpu_first::layer::0::q_proj::{}",
+            model.layer_tensors[0].q_proj_weight,
+        );
+        let expected_k_key = format!(
+            "gpu_first::layer::0::k_proj::{}",
+            model.layer_tensors[0].k_proj_weight,
+        );
+        let expected_v_key = format!(
+            "gpu_first::layer::0::v_proj::{}",
+            model.layer_tensors[0].v_proj_weight,
+        );
+        assert!(session
+            .inner
+            .gpu_first_session
+            .raw_f32_projection_runners
+            .contains_key(&expected_q_key));
+        assert!(session
+            .inner
+            .gpu_first_session
+            .raw_f32_projection_runners
+            .contains_key(&expected_k_key));
+        assert!(session
+            .inner
+            .gpu_first_session
+            .raw_f32_projection_runners
+            .contains_key(&expected_v_key));
+        for (layer_idx, layer_cache) in session.inner.cache.iter().enumerate().take(2) {
+            assert!(layer_cache.keys.is_empty());
+            assert!(layer_cache.values.is_empty());
+            assert_eq!(layer_cache.keys.capacity(), 0);
+            assert_eq!(layer_cache.values.capacity(), 0);
+            assert_eq!(
+                session
+                    .inner
+                    .gpu_first_session
+                    .gpu_kv_caches
+                    .get(&layer_idx)
+                    .expect("layer gpu kv cache should exist")
+                    .len_tokens(),
+                2,
+                "layer {layer_idx} gpu kv cache should contain both decoded tokens"
+            );
+        }
+    }
+
+    #[test]
     fn keeps_cpu_kv_empty_across_persistent_gpu_attention_only_loop() {
         let dir = tempdir().expect("tempdir should be created");
         write_two_layer_synthetic_model(dir.path());
