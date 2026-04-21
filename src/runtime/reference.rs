@@ -5029,6 +5029,50 @@ impl ReferenceModel {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_mlp_input_pair_or_hidden(
+        &self,
+        session: &mut PackedGpuSession<'_>,
+        layer_tensors: &LayerTensorNames,
+        residual: &[f32],
+        post_norm_weight: &[f32],
+        use_gpu_mlp_entry: bool,
+        hidden_states: &mut Vec<f32>,
+        metrics: &mut DecodeMetrics,
+        non_offloaded_dense_duration: &mut Duration,
+    ) -> Result<Option<ResidentPackedPairProjection>, ReferenceError> {
+        if use_gpu_mlp_entry {
+            let started_at = Instant::now();
+            let final_norm = session.run_final_norm_resident(residual, post_norm_weight)?;
+            let pair = session.run_projection_pair_resident_from_final_norm(
+                &layer_tensors.gate_proj_weight,
+                self.config.intermediate_size,
+                &layer_tensors.up_proj_weight,
+                self.config.intermediate_size,
+                self.config.hidden_size,
+                final_norm,
+            )?;
+            let elapsed = started_at.elapsed();
+            metrics.norm_duration += elapsed;
+            return Ok(Some(pair));
+        }
+        let started_at = Instant::now();
+        *hidden_states = weighted_rms_norm(
+            residual,
+            post_norm_weight,
+            self.config.rms_norm_eps as f32,
+        );
+        let elapsed = started_at.elapsed();
+        metrics.norm_duration += elapsed;
+        *non_offloaded_dense_duration += elapsed;
+        session.push_dense_stage_trace(
+            "post_attention_norm",
+            &layer_tensors.post_attention_layernorm_weight,
+            elapsed,
+        );
+        Ok(None)
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -7638,37 +7682,16 @@ impl ReferenceModel {
                     continue;
                 }
             }
-            let mut pair_from_gpu_norm: Option<ResidentPackedPairProjection> = None;
-            if use_gpu_mlp_entry {
-                let started_at = Instant::now();
-                let final_norm = session.run_final_norm_resident(&residual, &post_norm_weight)?;
-                let pair = session.run_projection_pair_resident_from_final_norm(
-                    &layer_tensors.gate_proj_weight,
-                    self.config.intermediate_size,
-                    &layer_tensors.up_proj_weight,
-                    self.config.intermediate_size,
-                    self.config.hidden_size,
-                    final_norm,
-                )?;
-                let elapsed = started_at.elapsed();
-                metrics.norm_duration += elapsed;
-                pair_from_gpu_norm = Some(pair);
-            } else {
-                let started_at = Instant::now();
-                hidden_states = weighted_rms_norm(
-                    &residual,
-                    &post_norm_weight,
-                    self.config.rms_norm_eps as f32,
-                );
-                let elapsed = started_at.elapsed();
-                metrics.norm_duration += elapsed;
-                *non_offloaded_dense_duration += elapsed;
-                session.push_dense_stage_trace(
-                    "post_attention_norm",
-                    &layer_tensors.post_attention_layernorm_weight,
-                    elapsed,
-                );
-            }
+            let mut pair_from_gpu_norm = self.prepare_mlp_input_pair_or_hidden(
+                session,
+                layer_tensors,
+                &residual,
+                &post_norm_weight,
+                use_gpu_mlp_entry,
+                &mut hidden_states,
+                metrics,
+                non_offloaded_dense_duration,
+            )?;
 
             let started_at = Instant::now();
             let use_gpu_swiglu_block = use_mlp_gu && use_mlp_full && packed_use_gpu_swiglu_block();
