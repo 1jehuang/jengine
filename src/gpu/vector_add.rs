@@ -360,6 +360,46 @@ impl CachedGpuVectorAddRunner {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_resident_from_buffers(
+        &mut self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        left_buffer: vk::Buffer,
+        left_len: usize,
+        left_buffer_size: u64,
+        right_buffer: vk::Buffer,
+        right_len: usize,
+        right_buffer_size: u64,
+    ) -> Result<GpuVectorAddReport, GpuVectorAddError> {
+        let left_copy_duration = self.copy_buffer_to_input(
+            source_context,
+            left_buffer,
+            left_len,
+            left_buffer_size,
+            self.left_buffer.buffer,
+            self.left_buffer.size,
+        )?;
+        let right_copy_duration = self.copy_buffer_to_input(
+            source_context,
+            right_buffer,
+            right_len,
+            right_buffer_size,
+            self.right_buffer.buffer,
+            self.right_buffer.size,
+        )?;
+        let upload_duration = left_copy_duration + right_copy_duration;
+        let gpu_duration = self.submit_and_wait()?;
+        Ok(GpuVectorAddReport {
+            len: self.len,
+            compile_duration: Duration::ZERO,
+            upload_duration,
+            gpu_duration,
+            download_duration: Duration::ZERO,
+            max_abs_diff: 0.0,
+            mean_abs_diff: 0.0,
+        })
+    }
+
     fn submit_and_wait(&self) -> Result<Duration, GpuVectorAddError> {
         unsafe { self.device.reset_fences(&[self.fence])? };
         let submit_info = [
@@ -381,6 +421,25 @@ impl CachedGpuVectorAddRunner {
         source_len: usize,
         source_buffer_size: u64,
     ) -> Result<Duration, GpuVectorAddError> {
+        self.copy_buffer_to_input(
+            source_context,
+            source_buffer,
+            source_len,
+            source_buffer_size,
+            self.left_buffer.buffer,
+            self.left_buffer.size,
+        )
+    }
+
+    fn copy_buffer_to_input(
+        &self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: vk::Buffer,
+        source_len: usize,
+        source_buffer_size: u64,
+        destination_buffer: vk::Buffer,
+        destination_buffer_size: u64,
+    ) -> Result<Duration, GpuVectorAddError> {
         if source_len != self.len {
             return Err(GpuVectorAddError::Shape(format!(
                 "source len {} does not match destination len {}",
@@ -393,10 +452,10 @@ impl CachedGpuVectorAddRunner {
             ));
         }
         let byte_len = self.len * std::mem::size_of::<f32>();
-        if byte_len as u64 > source_buffer_size || byte_len as u64 > self.left_buffer.size {
+        if byte_len as u64 > source_buffer_size || byte_len as u64 > destination_buffer_size {
             return Err(GpuVectorAddError::Shape(format!(
                 "copy {} bytes exceeds source {} or destination {} buffer size",
-                byte_len, source_buffer_size, self.left_buffer.size
+                byte_len, source_buffer_size, destination_buffer_size
             )));
         }
         let alloc = vk::CommandBufferAllocateInfo::default()
@@ -408,12 +467,8 @@ impl CachedGpuVectorAddRunner {
             self.device
                 .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
             let region = [vk::BufferCopy::default().size(byte_len as u64)];
-            self.device.cmd_copy_buffer(
-                copy_command,
-                source_buffer,
-                self.left_buffer.buffer,
-                &region,
-            );
+            self.device
+                .cmd_copy_buffer(copy_command, source_buffer, destination_buffer, &region);
             self.device.end_command_buffer(copy_command)?;
             self.device.reset_fences(&[self.fence])?;
         }
@@ -433,6 +488,13 @@ impl CachedGpuVectorAddRunner {
     pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> {
         &self._shared_context
     }
+
+    pub fn read_output(&self) -> Result<(Vec<f32>, Duration), GpuVectorAddError> {
+        let download_started = Instant::now();
+        let output = read_f32_buffer(&self.output_buffer, self.len)?;
+        Ok((output, download_started.elapsed()))
+    }
+
     pub fn output_buffer_handle(&self) -> vk::Buffer {
         self.output_buffer.buffer
     }
