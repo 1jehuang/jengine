@@ -341,17 +341,44 @@ impl CachedGpuWeightedRmsNormRunner {
         write_f32_buffer(&self.input_buffer, input)?;
         write_f32_buffer(&self.weight_buffer, weight)?;
         let upload_duration = upload_started.elapsed();
-        unsafe { self.device.reset_fences(&[self.fence])? };
-        let submit_info = [
-            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer))
-        ];
-        let gpu_started = Instant::now();
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &submit_info, self.fence)?;
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+        let gpu_duration = self.submit_and_wait()?;
+        Ok(GpuWeightedRmsNormReport {
+            len: self.len,
+            compile_duration: Duration::ZERO,
+            upload_duration,
+            gpu_duration,
+            download_duration: Duration::ZERO,
+            max_abs_diff: 0.0,
+            mean_abs_diff: 0.0,
+        })
+    }
+
+    pub fn run_resident_from_f32_buffer(
+        &mut self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: vk::Buffer,
+        source_len: usize,
+        source_buffer_size: u64,
+        weight: &[f32],
+    ) -> Result<GpuWeightedRmsNormReport, GpuWeightedRmsNormError> {
+        if weight.len() != self.len {
+            return Err(GpuWeightedRmsNormError::Shape(format!(
+                "weight len {} must match runner len {}",
+                weight.len(),
+                self.len
+            )));
         }
-        let gpu_duration = gpu_started.elapsed();
+        let copy_duration = self.copy_input_from_buffer(
+            source_context,
+            source_buffer,
+            source_len,
+            source_buffer_size,
+        )?;
+        let upload_started = Instant::now();
+        write_f32_buffer(&self.weight_buffer, weight)?;
+        let weight_upload_duration = upload_started.elapsed();
+        let upload_duration = copy_duration + weight_upload_duration;
+        let gpu_duration = self.submit_and_wait()?;
         Ok(GpuWeightedRmsNormReport {
             len: self.len,
             compile_duration: Duration::ZERO,
@@ -383,6 +410,80 @@ impl CachedGpuWeightedRmsNormRunner {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    pub fn output_buffer_size(&self) -> u64 {
+        self.output_buffer.size
+    }
+
+    fn submit_and_wait(&self) -> Result<Duration, GpuWeightedRmsNormError> {
+        unsafe { self.device.reset_fences(&[self.fence])? };
+        let submit_info = [
+            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer))
+        ];
+        let gpu_started = Instant::now();
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        Ok(gpu_started.elapsed())
+    }
+
+    fn copy_input_from_buffer(
+        &self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: vk::Buffer,
+        source_len: usize,
+        source_buffer_size: u64,
+    ) -> Result<Duration, GpuWeightedRmsNormError> {
+        if source_len != self.len {
+            return Err(GpuWeightedRmsNormError::Shape(format!(
+                "source len {} does not match destination len {}",
+                source_len, self.len
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuWeightedRmsNormError::Shape(
+                "resident chaining requires runners to share the same Vulkan context".to_string(),
+            ));
+        }
+        let byte_len = self.len * std::mem::size_of::<f32>();
+        if byte_len as u64 > source_buffer_size || byte_len as u64 > self.input_buffer.size {
+            return Err(GpuWeightedRmsNormError::Shape(format!(
+                "copy {} bytes exceeds source {} or destination {} buffer size",
+                byte_len, source_buffer_size, self.input_buffer.size
+            )));
+        }
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let copy_command = unsafe { self.device.allocate_command_buffers(&alloc)?[0] };
+        unsafe {
+            self.device
+                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
+            let region = [vk::BufferCopy::default().size(byte_len as u64)];
+            self.device.cmd_copy_buffer(
+                copy_command,
+                source_buffer,
+                self.input_buffer.buffer,
+                &region,
+            );
+            self.device.end_command_buffer(copy_command)?;
+            self.device.reset_fences(&[self.fence])?;
+        }
+        let submit_info =
+            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
+        let started = Instant::now();
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.device
+                .free_command_buffers(self.command_pool, &[copy_command]);
+        }
+        Ok(started.elapsed())
     }
 }
 
