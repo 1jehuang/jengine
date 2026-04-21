@@ -124,6 +124,14 @@ type FirstLayerHostQkvEntry = (
     crate::gpu::packed_matvec::GpuPackedMatvecReport,
     Duration,
 );
+type GpuSwigluBlockExecution = (
+    Option<Vec<f32>>,
+    Option<ResidentGpuVectorAdd>,
+    Duration,
+    Duration,
+    Duration,
+    Instant,
+);
 
 pub struct PersistentPackedDecodeSession<'a> {
     model: &'a ReferenceModel,
@@ -5073,6 +5081,72 @@ impl ReferenceModel {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run_gpu_swiglu_block_execution(
+        &self,
+        session: &mut PackedGpuSession<'_>,
+        layer_tensors: &LayerTensorNames,
+        pair_from_gpu_norm: &mut Option<ResidentPackedPairProjection>,
+        hidden_states: &[f32],
+        residual: &[f32],
+        use_gpu_tail: bool,
+        mlp_stage_metrics: &mut PackedMlpStageMetrics,
+    ) -> Result<GpuSwigluBlockExecution, ReferenceError> {
+        let pair = if let Some(pair) = pair_from_gpu_norm.take() {
+            pair
+        } else {
+            session.run_projection_pair_resident(
+                &layer_tensors.gate_proj_weight,
+                self.config.intermediate_size,
+                &layer_tensors.up_proj_weight,
+                self.config.intermediate_size,
+                self.config.hidden_size,
+                hidden_states,
+            )?
+        };
+        let swiglu_started_at = Instant::now();
+        let packed_activation = session.run_swiglu_pack_f16_pairs_resident(pair)?;
+        let swiglu_elapsed = swiglu_started_at.elapsed();
+        mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
+        let down_started_at = Instant::now();
+        if use_gpu_tail {
+            let down = session.run_projection_resident_from_packed_activation(
+                &layer_tensors.down_proj_weight,
+                self.config.hidden_size,
+                self.config.intermediate_size,
+                packed_activation,
+            )?;
+            let down_elapsed = down_started_at.elapsed();
+            let residual_started_at = Instant::now();
+            let hidden_gpu = session.run_vector_add_resident(down, residual)?;
+            let residual_elapsed = residual_started_at.elapsed();
+            Ok((
+                None,
+                Some(hidden_gpu),
+                swiglu_elapsed,
+                down_elapsed,
+                residual_elapsed,
+                Instant::now(),
+            ))
+        } else {
+            let down = session.run_projection_from_packed_activation(
+                &layer_tensors.down_proj_weight,
+                self.config.hidden_size,
+                self.config.intermediate_size,
+                packed_activation,
+            )?;
+            let down_elapsed = down_started_at.elapsed();
+            Ok((
+                Some(down),
+                None,
+                swiglu_elapsed,
+                down_elapsed,
+                Duration::ZERO,
+                Instant::now(),
+            ))
+        }
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -7708,59 +7782,15 @@ impl ReferenceModel {
                 gpu_residual_elapsed,
                 dense_tail_started_at,
             ) = if use_gpu_swiglu_block {
-                let pair = if let Some(pair) = pair_from_gpu_norm.take() {
-                    pair
-                } else {
-                    session.run_projection_pair_resident(
-                        &layer_tensors.gate_proj_weight,
-                        self.config.intermediate_size,
-                        &layer_tensors.up_proj_weight,
-                        self.config.intermediate_size,
-                        self.config.hidden_size,
-                        &hidden_states,
-                    )?
-                };
-                let swiglu_started_at = Instant::now();
-                let packed_activation = session.run_swiglu_pack_f16_pairs_resident(pair)?;
-                let swiglu_elapsed = swiglu_started_at.elapsed();
-                mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
-                let down_started_at = Instant::now();
-                if use_gpu_tail {
-                    let down = session.run_projection_resident_from_packed_activation(
-                        &layer_tensors.down_proj_weight,
-                        self.config.hidden_size,
-                        self.config.intermediate_size,
-                        packed_activation,
-                    )?;
-                    let down_elapsed = down_started_at.elapsed();
-                    let residual_started_at = Instant::now();
-                    let hidden_gpu = session.run_vector_add_resident(down, &residual)?;
-                    let residual_elapsed = residual_started_at.elapsed();
-                    (
-                        None,
-                        Some(hidden_gpu),
-                        swiglu_elapsed,
-                        down_elapsed,
-                        residual_elapsed,
-                        Instant::now(),
-                    )
-                } else {
-                    let down = session.run_projection_from_packed_activation(
-                        &layer_tensors.down_proj_weight,
-                        self.config.hidden_size,
-                        self.config.intermediate_size,
-                        packed_activation,
-                    )?;
-                    let down_elapsed = down_started_at.elapsed();
-                    (
-                        Some(down),
-                        None,
-                        swiglu_elapsed,
-                        down_elapsed,
-                        Duration::ZERO,
-                        Instant::now(),
-                    )
-                }
+                self.run_gpu_swiglu_block_execution(
+                    session,
+                    layer_tensors,
+                    &mut pair_from_gpu_norm,
+                    &hidden_states,
+                    &residual,
+                    use_gpu_tail,
+                    mlp_stage_metrics,
+                )?
             } else {
                 let mut reusable_gate_up_scratch = false;
                 let (gate, up, dense_tail_started_at) = if use_mlp_gu {
