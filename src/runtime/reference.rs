@@ -2018,6 +2018,12 @@ enum PackedAttentionStageOutcome {
     NextToken(usize),
 }
 
+enum PackedMlpStageOutcome {
+    Continue,
+    ResidentMlp,
+    NextToken(usize),
+}
+
 impl<'a> PackedGpuSession<'a> {
     fn new(model: &'a ReferenceModel) -> Self {
         Self {
@@ -7834,6 +7840,182 @@ impl ReferenceModel {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn handle_mlp_stage_after_attention(
+        &self,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+        layer_idx: usize,
+        layer_tensors: &LayerTensorNames,
+        residual: &[f32],
+        hidden_states: &mut Vec<f32>,
+        hidden: &mut Vec<f32>,
+        final_hidden_gpu: &mut Option<ResidentGpuVectorAdd>,
+        resident_hidden_state: &mut Option<ResidentHiddenState>,
+        stage_selection: &PackedDecodeStageSelection,
+        use_mlp_gu: bool,
+        use_mlp_full: bool,
+        mlp_stage_metrics: &mut PackedMlpStageMetrics,
+        metrics: &mut DecodeMetrics,
+        non_offloaded_dense_duration: &mut Duration,
+        session: &mut PackedGpuSession<'_>,
+    ) -> Result<PackedMlpStageOutcome, ReferenceError> {
+        if stage_selection.use_gpu_full_last_layer {
+            let post_norm_weight =
+                self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
+            let post_norm_started = Instant::now();
+            let post_norm = session.run_final_norm_resident(residual, &post_norm_weight)?;
+            let pair = session.run_projection_pair_resident_from_final_norm(
+                &layer_tensors.gate_proj_weight,
+                self.config.intermediate_size,
+                &layer_tensors.up_proj_weight,
+                self.config.intermediate_size,
+                self.config.hidden_size,
+                post_norm,
+            )?;
+            let post_norm_elapsed = post_norm_started.elapsed();
+            metrics.norm_duration += post_norm_elapsed;
+
+            let mlp_started = Instant::now();
+            let swiglu_started = Instant::now();
+            let packed_activation = session.run_swiglu_pack_f16_pairs_resident(pair)?;
+            let swiglu_elapsed = swiglu_started.elapsed();
+            mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
+
+            let down_started = Instant::now();
+            let down = session.run_projection_resident_from_packed_activation(
+                &layer_tensors.down_proj_weight,
+                self.config.hidden_size,
+                self.config.intermediate_size,
+                packed_activation,
+            )?;
+            let down_elapsed = down_started.elapsed();
+            mlp_stage_metrics.down_duration += down_elapsed;
+
+            let residual_started = Instant::now();
+            let hidden_gpu = session.run_vector_add_resident(down, residual)?;
+            let residual_elapsed = residual_started.elapsed();
+            mlp_stage_metrics.residual_duration += residual_elapsed;
+            metrics.mlp_duration += mlp_started.elapsed();
+
+            let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
+            let final_norm_started = Instant::now();
+            let final_norm =
+                session.run_final_norm_resident_from_vector_add(hidden_gpu, &final_norm_weight)?;
+            metrics.norm_duration += final_norm_started.elapsed();
+
+            let logits_started = Instant::now();
+            let packed_activation = session.run_pack_f16_pairs_resident(final_norm)?;
+            let next_token = session.run_projection_argmax_from_packed_activation(
+                "model.embed_tokens.weight",
+                self.config.vocab_size,
+                self.config.hidden_size,
+                packed_activation,
+            )?;
+            metrics.logits_duration += logits_started.elapsed();
+            return Ok(PackedMlpStageOutcome::NextToken(next_token));
+        }
+
+        let post_norm_weight =
+            self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
+        if stage_selection.use_gpu_mlp_only {
+            if stage_selection.use_gpu_mlp_tail {
+                let next_token = self.run_gpu_mlp_only_tail_argmax(
+                    gpu_first_session,
+                    layer_idx,
+                    residual,
+                    &post_norm_weight,
+                    mlp_stage_metrics,
+                    metrics,
+                    session,
+                )?;
+                return Ok(PackedMlpStageOutcome::NextToken(next_token));
+            }
+            self.run_gpu_mlp_only_resident_handoff(
+                gpu_first_session,
+                layer_idx,
+                residual,
+                &post_norm_weight,
+                mlp_stage_metrics,
+                metrics,
+                session,
+            )?;
+            return Ok(PackedMlpStageOutcome::ResidentMlp);
+        }
+
+        let mut pair_from_gpu_norm = self.prepare_mlp_input_pair_or_hidden(
+            session,
+            layer_tensors,
+            residual,
+            &post_norm_weight,
+            stage_selection.use_gpu_mlp_entry,
+            hidden_states,
+            metrics,
+            non_offloaded_dense_duration,
+        )?;
+
+        let started_at = Instant::now();
+        let (
+            down,
+            gpu_hidden_after_mlp,
+            swiglu_elapsed,
+            down_elapsed,
+            gpu_residual_elapsed,
+            dense_tail_started_at,
+        ) = if stage_selection.use_gpu_swiglu_block {
+            self.run_gpu_swiglu_block_execution(
+                session,
+                layer_tensors,
+                &mut pair_from_gpu_norm,
+                hidden_states,
+                residual,
+                stage_selection.use_gpu_tail,
+                mlp_stage_metrics,
+            )?
+        } else {
+            self.run_cpu_mlp_execution(
+                session,
+                layer_tensors,
+                hidden_states,
+                residual,
+                use_mlp_gu,
+                use_mlp_full,
+                mlp_stage_metrics,
+            )?
+        };
+        mlp_stage_metrics.down_duration += down_elapsed;
+        let residual_elapsed = self.resolve_hidden_after_mlp(
+            session,
+            down,
+            gpu_hidden_after_mlp,
+            residual,
+            hidden,
+            final_hidden_gpu,
+            resident_hidden_state,
+            use_mlp_full,
+            stage_selection.use_gpu_swiglu_block,
+            gpu_residual_elapsed,
+        );
+        mlp_stage_metrics.residual_duration += residual_elapsed;
+        let elapsed = started_at.elapsed();
+        metrics.mlp_duration += elapsed;
+        if use_mlp_gu {
+            if use_mlp_full {
+                if stage_selection.use_gpu_swiglu_block {
+                    if !stage_selection.use_gpu_tail {
+                        *non_offloaded_dense_duration += residual_elapsed;
+                    }
+                } else {
+                    *non_offloaded_dense_duration += swiglu_elapsed + residual_elapsed;
+                }
+            } else {
+                *non_offloaded_dense_duration += dense_tail_started_at.elapsed();
+            }
+        } else {
+            *non_offloaded_dense_duration += elapsed;
+        }
+        Ok(PackedMlpStageOutcome::Continue)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn forward_step_packed_decode(
         &self,
         token_id: usize,
@@ -8073,159 +8255,31 @@ impl ReferenceModel {
             }
 
             let residual = hidden.clone();
-            if stage_selection.use_gpu_full_last_layer {
-                let post_norm_weight =
-                    self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
-                let post_norm_started = Instant::now();
-                let post_norm = session.run_final_norm_resident(&residual, &post_norm_weight)?;
-                let pair = session.run_projection_pair_resident_from_final_norm(
-                    &layer_tensors.gate_proj_weight,
-                    self.config.intermediate_size,
-                    &layer_tensors.up_proj_weight,
-                    self.config.intermediate_size,
-                    self.config.hidden_size,
-                    post_norm,
-                )?;
-                let post_norm_elapsed = post_norm_started.elapsed();
-                metrics.norm_duration += post_norm_elapsed;
-
-                let mlp_started = Instant::now();
-                let swiglu_started = Instant::now();
-                let packed_activation = session.run_swiglu_pack_f16_pairs_resident(pair)?;
-                let swiglu_elapsed = swiglu_started.elapsed();
-                mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
-
-                let down_started = Instant::now();
-                let down = session.run_projection_resident_from_packed_activation(
-                    &layer_tensors.down_proj_weight,
-                    self.config.hidden_size,
-                    self.config.intermediate_size,
-                    packed_activation,
-                )?;
-                let down_elapsed = down_started.elapsed();
-                mlp_stage_metrics.down_duration += down_elapsed;
-
-                let residual_started = Instant::now();
-                let hidden_gpu = session.run_vector_add_resident(down, &residual)?;
-                let residual_elapsed = residual_started.elapsed();
-                mlp_stage_metrics.residual_duration += residual_elapsed;
-                metrics.mlp_duration += mlp_started.elapsed();
-
-                let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
-                let final_norm_started = Instant::now();
-                let final_norm = session
-                    .run_final_norm_resident_from_vector_add(hidden_gpu, &final_norm_weight)?;
-                metrics.norm_duration += final_norm_started.elapsed();
-
-                let logits_started = Instant::now();
-                let packed_activation = session.run_pack_f16_pairs_resident(final_norm)?;
-                let next_token = session.run_projection_argmax_from_packed_activation(
-                    "model.embed_tokens.weight",
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                    packed_activation,
-                )?;
-                metrics.logits_duration += logits_started.elapsed();
-                return Ok(PackedDecodeStepResult::NextToken(next_token));
-            }
-            let post_norm_weight =
-                self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
-            if stage_selection.use_gpu_mlp_only {
-                if stage_selection.use_gpu_mlp_tail {
-                    let next_token = self.run_gpu_mlp_only_tail_argmax(
-                        gpu_first_session,
-                        layer_idx,
-                        &residual,
-                        &post_norm_weight,
-                        mlp_stage_metrics,
-                        metrics,
-                        session,
-                    )?;
-                    return Ok(PackedDecodeStepResult::NextToken(next_token));
-                } else {
-                    self.run_gpu_mlp_only_resident_handoff(
-                        gpu_first_session,
-                        layer_idx,
-                        &residual,
-                        &post_norm_weight,
-                        mlp_stage_metrics,
-                        metrics,
-                        session,
-                    )?;
-                    resident_hidden_state = Some(ResidentHiddenState::Mlp { layer_idx });
-                    continue;
-                }
-            }
-            let mut pair_from_gpu_norm = self.prepare_mlp_input_pair_or_hidden(
-                session,
+            match self.handle_mlp_stage_after_attention(
+                gpu_first_session,
+                layer_idx,
                 layer_tensors,
                 &residual,
-                &post_norm_weight,
-                stage_selection.use_gpu_mlp_entry,
                 &mut hidden_states,
-                metrics,
-                non_offloaded_dense_duration,
-            )?;
-
-            let started_at = Instant::now();
-            let (
-                down,
-                gpu_hidden_after_mlp,
-                swiglu_elapsed,
-                down_elapsed,
-                gpu_residual_elapsed,
-                dense_tail_started_at,
-            ) = if stage_selection.use_gpu_swiglu_block {
-                self.run_gpu_swiglu_block_execution(
-                    session,
-                    layer_tensors,
-                    &mut pair_from_gpu_norm,
-                    &hidden_states,
-                    &residual,
-                    stage_selection.use_gpu_tail,
-                    mlp_stage_metrics,
-                )?
-            } else {
-                self.run_cpu_mlp_execution(
-                    session,
-                    layer_tensors,
-                    &hidden_states,
-                    &residual,
-                    use_mlp_gu,
-                    use_mlp_full,
-                    mlp_stage_metrics,
-                )?
-            };
-            mlp_stage_metrics.down_duration += down_elapsed;
-            let residual_elapsed = self.resolve_hidden_after_mlp(
-                session,
-                down,
-                gpu_hidden_after_mlp,
-                &residual,
                 &mut hidden,
                 &mut final_hidden_gpu,
                 &mut resident_hidden_state,
+                &stage_selection,
+                use_mlp_gu,
                 use_mlp_full,
-                stage_selection.use_gpu_swiglu_block,
-                gpu_residual_elapsed,
-            );
-            mlp_stage_metrics.residual_duration += residual_elapsed;
-            let elapsed = started_at.elapsed();
-            metrics.mlp_duration += elapsed;
-            if use_mlp_gu {
-                if use_mlp_full {
-                    if stage_selection.use_gpu_swiglu_block {
-                        if !stage_selection.use_gpu_tail {
-                            *non_offloaded_dense_duration += residual_elapsed;
-                        }
-                    } else {
-                        *non_offloaded_dense_duration += swiglu_elapsed + residual_elapsed;
-                    }
-                } else {
-                    *non_offloaded_dense_duration += dense_tail_started_at.elapsed();
+                mlp_stage_metrics,
+                metrics,
+                non_offloaded_dense_duration,
+                session,
+            )? {
+                PackedMlpStageOutcome::NextToken(next_token) => {
+                    return Ok(PackedDecodeStepResult::NextToken(next_token));
                 }
-            } else {
-                *non_offloaded_dense_duration += elapsed;
+                PackedMlpStageOutcome::ResidentMlp => {
+                    resident_hidden_state = Some(ResidentHiddenState::Mlp { layer_idx });
+                    continue;
+                }
+                PackedMlpStageOutcome::Continue => {}
             }
         }
 
