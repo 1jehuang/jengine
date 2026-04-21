@@ -2107,6 +2107,10 @@ impl ReferenceModel {
         std::env::var_os("JENGINE_GPU_MLP_ENTRY").is_some()
     }
 
+    fn packed_use_gpu_full_last_layer() -> bool {
+        std::env::var_os("JENGINE_GPU_FULL_LAST_LAYER").is_some()
+    }
+
     fn packed_use_gpu_tail() -> bool {
         std::env::var_os("JENGINE_GPU_TAIL").is_some()
     }
@@ -2362,7 +2366,7 @@ impl ReferenceModel {
                     self.config.hidden_size,
                 )?;
                 let _ = self.get_or_create_projection_gpu(&pair_key, &packed)?;
-                if Self::packed_use_gpu_mlp_entry() {
+                if Self::packed_use_gpu_mlp_entry() || Self::packed_use_gpu_full_last_layer() {
                     let _ = self.get_or_create_projection_gpu_raw_f32(&pair_key, &packed)?;
                 }
                 if use_mlp_full {
@@ -2380,10 +2384,10 @@ impl ReferenceModel {
             }
         }
         let _ = self.load_vector_f32_resolved("model.norm.weight")?;
-        if Self::packed_use_gpu_final_norm() {
+        if Self::packed_use_gpu_final_norm() || Self::packed_use_gpu_full_last_layer() {
             let _ = self.get_or_create_final_norm_gpu()?;
             let _ = self.get_or_create_pack_f16_pairs_gpu(self.config.hidden_size)?;
-            if Self::packed_use_gpu_tail() {
+            if Self::packed_use_gpu_tail() || Self::packed_use_gpu_full_last_layer() {
                 let _ = self.get_or_create_vector_add_gpu(self.config.hidden_size)?;
             }
         }
@@ -4899,6 +4903,66 @@ impl ReferenceModel {
             }
 
             let residual = hidden;
+            let use_gpu_full_last_layer = use_mlp_gu
+                && use_mlp_full
+                && argmax_only
+                && Self::packed_use_gpu_full_last_layer()
+                && layer_idx + 1 == self.config.num_hidden_layers;
+            if use_gpu_full_last_layer {
+                let post_norm_weight =
+                    self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
+                let post_norm_started = Instant::now();
+                let post_norm = session.run_final_norm_resident(&residual, &post_norm_weight)?;
+                let pair = session.run_projection_pair_resident_from_final_norm(
+                    &layer_tensors.gate_proj_weight,
+                    self.config.intermediate_size,
+                    &layer_tensors.up_proj_weight,
+                    self.config.intermediate_size,
+                    self.config.hidden_size,
+                    post_norm,
+                )?;
+                let post_norm_elapsed = post_norm_started.elapsed();
+                metrics.norm_duration += post_norm_elapsed;
+
+                let mlp_started = Instant::now();
+                let swiglu_started = Instant::now();
+                let packed_activation = session.run_swiglu_pack_f16_pairs_resident(pair)?;
+                let swiglu_elapsed = swiglu_started.elapsed();
+                mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
+
+                let down_started = Instant::now();
+                let down = session.run_projection_resident_from_packed_activation(
+                    &layer_tensors.down_proj_weight,
+                    self.config.hidden_size,
+                    self.config.intermediate_size,
+                    packed_activation,
+                )?;
+                let down_elapsed = down_started.elapsed();
+                mlp_stage_metrics.down_duration += down_elapsed;
+
+                let residual_started = Instant::now();
+                let hidden_gpu = session.run_vector_add_resident(down, &residual)?;
+                let residual_elapsed = residual_started.elapsed();
+                mlp_stage_metrics.residual_duration += residual_elapsed;
+                metrics.mlp_duration += mlp_started.elapsed();
+
+                let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
+                let final_norm_started = Instant::now();
+                let final_norm = session
+                    .run_final_norm_resident_from_vector_add(hidden_gpu, &final_norm_weight)?;
+                metrics.norm_duration += final_norm_started.elapsed();
+
+                let logits_started = Instant::now();
+                let packed_activation = session.run_pack_f16_pairs_resident(final_norm)?;
+                let next_token = session.run_projection_argmax_from_packed_activation(
+                    "model.embed_tokens.weight",
+                    self.config.vocab_size,
+                    self.config.hidden_size,
+                    packed_activation,
+                )?;
+                metrics.logits_duration += logits_started.elapsed();
+                return Ok(PackedDecodeStepResult::NextToken(next_token));
+            }
             let post_norm_weight =
                 self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
             let use_gpu_mlp_entry = use_mlp_gu && use_mlp_full && Self::packed_use_gpu_mlp_entry();
