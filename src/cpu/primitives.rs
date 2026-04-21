@@ -84,6 +84,22 @@ pub fn swiglu(gate: &[f32], up: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+pub fn swiglu_into(gate: &[f32], up: &[f32], out: &mut Vec<f32>) {
+    assert_eq!(
+        gate.len(),
+        up.len(),
+        "swiglu operands must have the same length"
+    );
+    out.clear();
+    out.reserve(gate.len());
+    out.extend(
+        gate.iter().zip(up).map(|(gate_value, up_value)| {
+            let silu_gate = *gate_value / (1.0 + (-*gate_value).exp());
+            silu_gate * *up_value
+        }),
+    );
+}
+
 pub fn softmax(logits: &[f32]) -> Vec<f32> {
     if logits.is_empty() {
         return Vec::new();

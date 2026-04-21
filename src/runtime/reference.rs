@@ -1,5 +1,5 @@
 use crate::cpu::block::{YarnRope, build_yarn_rope, rope_cos_sin};
-use crate::cpu::primitives::{argmax, swiglu};
+use crate::cpu::primitives::{argmax, swiglu, swiglu_into};
 use crate::gpu::attention_block::{CachedGpuAttentionBlockRunner, GpuAttentionBlockReport};
 use crate::gpu::embedding_lookup::{CachedGpuEmbeddingLookupRunner, GpuEmbeddingLookupReport};
 use crate::gpu::full_last_layer_block::{
@@ -344,6 +344,7 @@ struct PackedDecodeScratch {
     v: Vec<f32>,
     gate: Vec<f32>,
     up: Vec<f32>,
+    mlp: Vec<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2579,6 +2580,14 @@ impl<'a> PackedGpuSession<'a> {
     fn restore_gate_up_scratch(&mut self, gate: Vec<f32>, up: Vec<f32>) {
         self.scratch.gate = gate;
         self.scratch.up = up;
+    }
+
+    fn take_mlp_scratch(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.scratch.mlp)
+    }
+
+    fn restore_mlp_scratch(&mut self, mlp: Vec<f32>) {
+        self.scratch.mlp = mlp;
     }
 
     fn run_projection(
@@ -8193,7 +8202,8 @@ impl ReferenceModel {
                     )
                 };
                 let swiglu_started_at = Instant::now();
-                let mlp = swiglu(&gate, &up);
+                let mut mlp = session.take_mlp_scratch();
+                swiglu_into(&gate, &up, &mut mlp);
                 if reusable_gate_up_scratch {
                     session.restore_gate_up_scratch(gate, up);
                 }
@@ -8217,6 +8227,7 @@ impl ReferenceModel {
                         .map(|(left, right)| left + right)
                         .collect()
                 };
+                session.restore_mlp_scratch(mlp);
                 let down_elapsed = down_started_at.elapsed();
                 (
                     Some(down),
