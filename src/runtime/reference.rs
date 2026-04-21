@@ -5322,43 +5322,15 @@ impl ReferenceModel {
             .as_ref()
             .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
         let prompt_ids = self.encode_prompt_ids(tokenizer, prompt)?;
-        let mut metrics = DecodeMetrics {
-            prompt_tokens: prompt_ids.len(),
-            generated_tokens: 0,
-            total_duration: Duration::ZERO,
-            embedding_duration: Duration::ZERO,
-            norm_duration: Duration::ZERO,
-            qkv_duration: Duration::ZERO,
-            attention_duration: Duration::ZERO,
-            mlp_duration: Duration::ZERO,
-            logits_duration: Duration::ZERO,
-        };
-        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len());
-        let mut session = PackedGpuSession::new(self);
-        let mut gpu_first_session = GpuFirstRunnerCache::new(self, prompt_ids.len());
-        let mut non_offloaded_dense_duration = Duration::ZERO;
-        let mut attention_stage_metrics = PackedAttentionStageMetrics::default();
-        let mut mlp_stage_metrics = PackedMlpStageMetrics::default();
-        let use_attention_full = use_attention_qkv && Self::packed_use_attention_full();
-        let use_mlp_full = use_mlp_gu && Self::packed_use_mlp_full();
         let mut last_logits = Vec::new();
-        for (position, &token_id) in prompt_ids.iter().enumerate() {
-            last_logits = match self.forward_step_packed_decode(
-                token_id,
-                position,
-                &mut cache,
-                &mut metrics,
-                &mut attention_stage_metrics,
-                &mut mlp_stage_metrics,
-                &mut non_offloaded_dense_duration,
-                &mut session,
-                &mut gpu_first_session,
-                use_attention_qkv,
-                use_mlp_gu,
-                use_attention_full,
-                use_mlp_full,
-                false,
-            )? {
+        let mut session = self.begin_packed_decode_session(
+            prompt_ids.len(),
+            use_attention_qkv,
+            use_mlp_gu,
+            false,
+        );
+        for &token_id in &prompt_ids {
+            last_logits = match session.push_prompt_token(token_id)? {
                 PackedDecodeStepResult::Logits(logits) => logits,
                 PackedDecodeStepResult::NextToken(_) => {
                     unreachable!("full-logits prefill path should not return argmax-only output")
