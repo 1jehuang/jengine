@@ -1,7 +1,9 @@
 use jengine::gpu::vulkan::{collect_vulkan_report, version_string};
 use jengine::report::{BenchIterationRecord, BenchReport};
 use jengine::runtime::packed::PackedTensorFile;
-use jengine::runtime::reference::{DecodeMetrics, MemoryReport, ReferenceModel};
+use jengine::runtime::decode_report::MemoryReport;
+use jengine::runtime::gpu_decode_metrics::DecodeMetrics;
+use jengine::runtime::reference::ReferenceModel;
 use jengine::runtime::repack::{analyze_ternary_packability, pack_ternary_g128};
 use jengine::runtime::weights::WeightStore;
 

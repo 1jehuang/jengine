@@ -1,6 +1,6 @@
 use crate::model::tokenizer::PromptAnalysis;
+use crate::runtime::decode_report::MemoryReport;
 use crate::runtime::gpu_decode_metrics::DecodeMetrics;
-use crate::runtime::reference::MemoryReport;
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
