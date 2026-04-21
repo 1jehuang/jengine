@@ -49,6 +49,17 @@ pub fn runtime_fingerprint_json() -> Value {
             .filter(|s| !s.is_empty())
     }
 
+    fn command_trimmed(program: &str, args: &[&str]) -> Option<String> {
+        std::process::Command::new(program)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
     let recorded_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -57,6 +68,7 @@ pub fn runtime_fingerprint_json() -> Value {
         "recorded_unix_secs": recorded_unix_secs,
         "hostname": std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()).or_else(|| read_trimmed("/etc/hostname")),
         "kernel_release": read_trimmed("/proc/sys/kernel/osrelease"),
+        "git_head": command_trimmed("git", &["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"]),
     })
 }
 
