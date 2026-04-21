@@ -16,6 +16,7 @@ use crate::gpu::swiglu_combined::CachedGpuSwigluCombinedRunner;
 use crate::gpu::swiglu_pack_f16_pairs::CachedGpuSwigluPackF16PairsRunner;
 use crate::gpu::tail_block::{CachedGpuTailBlockRunner, GpuTailBlockReport};
 use crate::gpu::vector_add::CachedGpuVectorAddRunner;
+use crate::gpu::qk_rope::{CachedGpuQkRopeRunner, GpuQkRopeReport};
 use crate::gpu::resident_buffer::GpuResidentBuffer;
 use crate::gpu::weighted_rms_norm::{
     CachedGpuWeightedRmsNormRunner, GpuWeightedRmsNormReport,
@@ -868,6 +869,7 @@ struct GpuFirstRunnerCache<'a> {
     shared_context: Option<Arc<SharedGpuPackedContext>>,
     embedding_lookup_runner: Option<CachedGpuEmbeddingLookupRunner>,
     input_norm_runner: Option<CachedGpuWeightedRmsNormRunner>,
+    qk_rope_runner: Option<CachedGpuQkRopeRunner>,
     raw_f32_projection_runners: HashMap<String, CachedGpuPackedMatvecRunner>,
     gpu_kv_caches: HashMap<usize, GpuKvCache>,
     attention_blocks: HashMap<(usize, usize), CachedGpuAttentionBlockRunner>,
@@ -884,6 +886,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
             shared_context: None,
             embedding_lookup_runner: None,
             input_norm_runner: None,
+            qk_rope_runner: None,
             raw_f32_projection_runners: HashMap::new(),
             gpu_kv_caches: HashMap::new(),
             attention_blocks: HashMap::new(),
@@ -1006,6 +1009,47 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .as_mut()
                 .expect("input norm runner should exist after creation"),
         ))
+    }
+
+    fn ensure_qk_rope_runner(
+        &mut self,
+    ) -> Result<(Duration, &mut CachedGpuQkRopeRunner), ReferenceError> {
+        let compile_duration = if self.qk_rope_runner.is_some() {
+            Duration::ZERO
+        } else {
+            let context = self.get_or_create_shared_context()?;
+            let (runner, compile_duration) = CachedGpuQkRopeRunner::new_with_context(
+                context,
+                self.model.config.num_attention_heads,
+                self.model.config.num_key_value_heads,
+                self.model.config.head_dim,
+            )
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+            self.qk_rope_runner = Some(runner);
+            compile_duration
+        };
+        Ok((
+            compile_duration,
+            self.qk_rope_runner
+                .as_mut()
+                .expect("qk rope runner should exist after creation"),
+        ))
+    }
+
+    fn run_qk_rope_to_host(
+        &mut self,
+        q: &[f32],
+        k: &[f32],
+        q_weight: &[f32],
+        k_weight: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+    ) -> Result<((Vec<f32>, Vec<f32>), GpuQkRopeReport, Duration), ReferenceError> {
+        let (compile_duration, runner) = self.ensure_qk_rope_runner()?;
+        let ((q_out, k_out), report) = runner
+            .run_with_output(q, k, q_weight, k_weight, cos, sin)
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        Ok(((q_out, k_out), report, compile_duration))
     }
 
     fn ensure_raw_f32_projection_runner(
@@ -1381,6 +1425,57 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .as_mut()
                 .expect("full last-layer runner should exist after creation"),
         ))
+    }
+
+    fn prewarm_decode_path(
+        &mut self,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+    ) -> Result<(), ReferenceError> {
+        let _ = self.get_or_create_shared_context()?;
+
+        if ReferenceModel::packed_use_gpu_embedding()
+            || ReferenceModel::packed_use_gpu_attention_block()
+            || ReferenceModel::packed_use_gpu_tail()
+            || ReferenceModel::packed_use_gpu_full_last_layer()
+            || ReferenceModel::packed_use_gpu_swiglu_block()
+        {
+            let _ = self.ensure_embedding_lookup_runner()?;
+            let _ = self.ensure_input_norm_runner()?;
+        }
+
+        if use_attention_qkv
+            && (ReferenceModel::packed_use_gpu_attention_block()
+                || ReferenceModel::packed_use_gpu_tail()
+                || ReferenceModel::packed_use_gpu_full_last_layer())
+        {
+            for layer_idx in 0..self.model.config.num_hidden_layers {
+                let _ = self.ensure_gpu_kv_cache(layer_idx)?;
+                let _ = self.ensure_attention_block(layer_idx, 1)?;
+            }
+        }
+
+        if use_mlp_gu
+            && (ReferenceModel::packed_use_gpu_swiglu_block()
+                || ReferenceModel::packed_use_gpu_tail()
+                || ReferenceModel::packed_use_gpu_full_last_layer())
+        {
+            for layer_idx in 0..self.model.config.num_hidden_layers {
+                let _ = self.ensure_mlp_block(layer_idx)?;
+            }
+        }
+
+        if ReferenceModel::packed_use_gpu_tail() {
+            let _ = self.ensure_tail_block()?;
+        }
+
+        if ReferenceModel::packed_use_gpu_full_last_layer() {
+            let last_layer_idx = self.model.config.num_hidden_layers - 1;
+            let _ = self.ensure_attention_block(last_layer_idx, 1)?;
+            let _ = self.ensure_full_last_layer_block()?;
+        }
+
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3339,12 +3434,15 @@ impl ReferenceModel {
                 let _ = self.get_or_create_vector_add_gpu(self.config.hidden_size)?;
             }
         }
-        let (logits_packed, _, _) = self.get_or_create_projection_cache(
+        let (_logits_packed, _, _) = self.get_or_create_projection_cache(
             "model.embed_tokens.weight",
             self.config.vocab_size,
             self.config.hidden_size,
         )?;
-        let _ = self.get_or_create_projection_gpu("model.embed_tokens.weight", &logits_packed)?;
+        if Self::packed_use_gpu_first_session() {
+            let mut gpu_first_cache = GpuFirstRunnerCache::new(self, 1);
+            gpu_first_cache.prewarm_decode_path(use_attention_qkv, use_mlp_gu)?;
+        }
         Ok(())
     }
 
@@ -5869,43 +5967,73 @@ impl ReferenceModel {
                 *non_offloaded_dense_duration += elapsed;
             }
 
-            let started_at = Instant::now();
-            let q_norm_weight = self.load_vector_f32_resolved(&layer_tensors.q_norm_weight)?;
-            let k_norm_weight = self.load_vector_f32_resolved(&layer_tensors.k_norm_weight)?;
-            apply_head_rms_norm_weighted(
-                &mut q,
-                self.config.num_attention_heads,
-                self.config.head_dim,
-                &q_norm_weight,
-                self.config.rms_norm_eps as f32,
-            );
-            apply_head_rms_norm_weighted(
-                &mut k,
-                self.config.num_key_value_heads,
-                self.config.head_dim,
-                &k_norm_weight,
-                self.config.rms_norm_eps as f32,
-            );
-            apply_rotary_single(
-                &mut q,
-                &mut k,
-                &cos,
-                &sin,
-                self.config.num_attention_heads,
-                self.config.num_key_value_heads,
-                self.config.head_dim,
-            );
-            let elapsed = started_at.elapsed();
-            metrics.norm_duration += elapsed;
-            *non_offloaded_dense_duration += elapsed;
-            session.push_dense_stage_trace("qk_norm_rope", &layer_tensors.q_norm_weight, elapsed);
-
             let use_gpu_attention_block =
                 use_attention_qkv && use_attention_full && Self::packed_use_gpu_attention_block();
             let use_gpu_attention_mlp_block = use_gpu_attention_block
                 && use_mlp_gu
                 && use_mlp_full
                 && Self::packed_use_gpu_swiglu_block();
+
+            let started_at = Instant::now();
+            let q_norm_weight = self.load_vector_f32_resolved(&layer_tensors.q_norm_weight)?;
+            let k_norm_weight = self.load_vector_f32_resolved(&layer_tensors.k_norm_weight)?;
+            if use_gpu_attention_block {
+                let ((q_out, k_out), qk_rope_report, compile_duration) =
+                    gpu_first_session.run_qk_rope_to_host(
+                        &q,
+                        &k,
+                        &q_norm_weight,
+                        &k_norm_weight,
+                        &cos,
+                        &sin,
+                    )?;
+                q = q_out;
+                k = k_out;
+                metrics.norm_duration += qk_rope_report.upload_duration
+                    + qk_rope_report.gpu_duration
+                    + qk_rope_report.download_duration;
+                session.metrics.compile_duration += compile_duration;
+                session.metrics.activation_upload_duration += qk_rope_report.upload_duration;
+                session.metrics.upload_duration += qk_rope_report.upload_duration;
+                session.metrics.gpu_duration += qk_rope_report.gpu_duration;
+                session.metrics.download_duration += qk_rope_report.download_duration;
+                session.metrics.activation_upload_bytes +=
+                    (q.len() + k.len() + q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
+                        * std::mem::size_of::<f32>();
+                session.metrics.upload_bytes +=
+                    (q.len() + k.len() + q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
+                        * std::mem::size_of::<f32>();
+                session.metrics.download_bytes += (q.len() + k.len()) * std::mem::size_of::<f32>();
+            } else {
+                apply_head_rms_norm_weighted(
+                    &mut q,
+                    self.config.num_attention_heads,
+                    self.config.head_dim,
+                    &q_norm_weight,
+                    self.config.rms_norm_eps as f32,
+                );
+                apply_head_rms_norm_weighted(
+                    &mut k,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                    &k_norm_weight,
+                    self.config.rms_norm_eps as f32,
+                );
+                apply_rotary_single(
+                    &mut q,
+                    &mut k,
+                    &cos,
+                    &sin,
+                    self.config.num_attention_heads,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                );
+                let elapsed = started_at.elapsed();
+                metrics.norm_duration += elapsed;
+                *non_offloaded_dense_duration += elapsed;
+                session.push_dense_stage_trace("qk_norm_rope", &layer_tensors.q_norm_weight, elapsed);
+            }
+
             if use_gpu_attention_block {
                 gpu_first_session.append_gpu_kv(layer_idx, &k, &v)?;
             }

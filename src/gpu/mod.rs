@@ -8,6 +8,7 @@ pub mod mlp_block;
 pub mod pack_f16_pairs;
 pub mod packed_matvec;
 pub mod packed_pair_swiglu_pack;
+pub mod qk_rope;
 pub mod resident_buffer;
 pub mod swiglu;
 pub mod swiglu_combined;
