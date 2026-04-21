@@ -4722,6 +4722,44 @@ impl ReferenceModel {
         Ok(next_token)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run_gpu_attention_only_to_host(
+        &self,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+        layer_idx: usize,
+        position: usize,
+        q: &[f32],
+        q_resident: Option<&GpuResidentBuffer>,
+        layer_cache: &LayerCache,
+        residual: &[f32],
+        attention_stage_metrics: &mut PackedAttentionStageMetrics,
+        metrics: &mut DecodeMetrics,
+        session: &mut PackedGpuSession<'_>,
+    ) -> Result<Vec<f32>, ReferenceError> {
+        let (next_hidden, attention_report, compile_duration, download_duration) =
+            gpu_first_session.run_attention_layer_to_host(
+                layer_idx,
+                position + 1,
+                Some(q),
+                q_resident,
+                layer_cache.keys(),
+                layer_cache.values(),
+                residual,
+            )?;
+        attention_stage_metrics.query_duration += attention_report.attention_gpu_duration;
+        attention_stage_metrics.oproj_duration += attention_report.oproj_gpu_duration;
+        attention_stage_metrics.residual_duration += attention_report.residual_add_gpu_duration;
+        metrics.attention_duration += attention_report.attention_gpu_duration
+            + attention_report.oproj_gpu_duration
+            + attention_report.residual_add_gpu_duration;
+        session.metrics.compile_duration += compile_duration;
+        session.metrics.gpu_duration += attention_report.attention_gpu_duration
+            + attention_report.oproj_gpu_duration
+            + attention_report.residual_add_gpu_duration;
+        session.metrics.download_duration += download_duration;
+        Ok(next_hidden)
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -7145,30 +7183,18 @@ impl ReferenceModel {
                     }
                     return Ok(PackedDecodeStepResult::NextToken(next_token));
                 } else {
-                    let (next_hidden, attention_report, compile_duration, download_duration) =
-                        gpu_first_session.run_attention_layer_to_host(
-                            layer_idx,
-                            position + 1,
-                            Some(&q),
-                            q_resident.as_ref(),
-                            layer_cache.keys(),
-                            layer_cache.values(),
-                            &residual,
-                        )?;
-                    hidden = next_hidden;
-                    attention_stage_metrics.query_duration +=
-                        attention_report.attention_gpu_duration;
-                    attention_stage_metrics.oproj_duration += attention_report.oproj_gpu_duration;
-                    attention_stage_metrics.residual_duration +=
-                        attention_report.residual_add_gpu_duration;
-                    metrics.attention_duration += attention_report.attention_gpu_duration
-                        + attention_report.oproj_gpu_duration
-                        + attention_report.residual_add_gpu_duration;
-                    session.metrics.compile_duration += compile_duration;
-                    session.metrics.gpu_duration += attention_report.attention_gpu_duration
-                        + attention_report.oproj_gpu_duration
-                        + attention_report.residual_add_gpu_duration;
-                    session.metrics.download_duration += download_duration;
+                    hidden = self.run_gpu_attention_only_to_host(
+                        gpu_first_session,
+                        layer_idx,
+                        position,
+                        &q,
+                        q_resident.as_ref(),
+                        layer_cache,
+                        &residual,
+                        attention_stage_metrics,
+                        metrics,
+                        session,
+                    )?;
                 }
             }
 
