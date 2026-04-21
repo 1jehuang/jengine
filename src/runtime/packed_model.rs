@@ -6,6 +6,7 @@ use crate::runtime::repack::{
 };
 use crate::runtime::weights::{WeightError, WeightStore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
@@ -17,6 +18,22 @@ type EmbeddingRowCache = RefCell<HashMap<(String, usize), Rc<Vec<f32>>>>;
 
 const MANIFEST_VERSION: u32 = 1;
 const PACK_TOLERANCE: f32 = 1e-3;
+
+fn sha256_hex_for_path(path: &Path) -> Result<String, PackedModelError> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorPackSpec {
@@ -44,6 +61,7 @@ pub struct PackedModelManifest {
     pub source_model_root: String,
     pub source_safetensors_path: String,
     pub source_file_bytes: u64,
+    pub source_file_sha256: Option<String>,
     pub source_tensor_count: usize,
     pub architecture: String,
     pub hidden_size: usize,
@@ -382,6 +400,7 @@ pub fn write_packed_model_artifact(
         serde_json::from_str::<BonsaiModelConfig>(&fs::read_to_string(&assets.config_json)?)?;
     let store = WeightStore::load_from_assets(&assets)?;
     let progress = WeightStore::download_progress(&assets.safetensors_path)?;
+    let source_file_sha256 = sha256_hex_for_path(&assets.safetensors_path)?;
     let (tensors_dir, manifest_path) = build_artifact_layout(out_dir);
     fs::create_dir_all(&tensors_dir)?;
 
@@ -424,6 +443,7 @@ pub fn write_packed_model_artifact(
         source_model_root: assets.root.display().to_string(),
         source_safetensors_path: assets.safetensors_path.display().to_string(),
         source_file_bytes: progress.file_bytes,
+        source_file_sha256: Some(source_file_sha256),
         source_tensor_count: progress.total_tensors,
         architecture: config
             .architectures
@@ -555,8 +575,8 @@ fn sanitize_name(name: &str) -> String {
 mod tests {
     use super::{
         PackedModelStore, benchmark_packed_model_artifact, build_artifact_layout,
-        build_packable_tensor_specs, load_packed_model_manifest, validate_packed_model_artifact,
-        validate_packed_model_manifest, write_packed_model_artifact,
+        build_packable_tensor_specs, load_packed_model_manifest, sha256_hex_for_path,
+        validate_packed_model_artifact, validate_packed_model_manifest, write_packed_model_artifact,
     };
     use crate::model::config::BonsaiModelConfig;
     use std::fs;
@@ -662,6 +682,9 @@ mod tests {
         validate_packed_model_manifest(&loaded, &config).unwrap();
         let validation = validate_packed_model_artifact(root.path(), out.path()).unwrap();
         let bench = benchmark_packed_model_artifact(out.path()).unwrap();
+        let expected_sha = sha256_hex_for_path(&root.path().join("model.safetensors")).unwrap();
+        assert_eq!(manifest.source_file_sha256.as_deref(), Some(expected_sha.as_str()));
+        assert_eq!(loaded.source_file_sha256.as_deref(), Some(expected_sha.as_str()));
         assert_eq!(manifest.entries.len(), 8);
         assert_eq!(summary.entry_count, 8);
         assert_eq!(validation.checked_entries, 8);
