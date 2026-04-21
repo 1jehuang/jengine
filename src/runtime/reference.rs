@@ -1460,6 +1460,49 @@ impl<'a> GpuFirstRunnerCache<'a> {
         ))
     }
 
+    fn run_attention_layer_to_host(
+        &mut self,
+        layer_idx: usize,
+        seq_len: usize,
+        q: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        residual: &[f32],
+    ) -> Result<(Vec<f32>, GpuAttentionBlockReport, Duration, Duration), ReferenceError> {
+        let kv_state = self.gpu_kv_state(layer_idx);
+        let (attention_compile_duration, attention_block) =
+            self.ensure_attention_block(layer_idx, seq_len)?;
+        let attention_report = if let Some((key_buffer, key_len, key_buffer_size, value_buffer, value_len, value_buffer_size)) =
+            kv_state
+        {
+            attention_block
+                .run_with_resident_kv(
+                    q,
+                    key_buffer,
+                    key_len,
+                    key_buffer_size,
+                    value_buffer,
+                    value_len,
+                    value_buffer_size,
+                    residual,
+                )
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+        } else {
+            attention_block
+                .run_resident(q, keys, values, residual)
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+        };
+        let (hidden, download_duration) = attention_block
+            .read_output()
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        Ok((
+            hidden,
+            attention_report,
+            attention_compile_duration,
+            download_duration,
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn run_attention_to_full_last_layer_argmax(
         &mut self,
@@ -4791,7 +4834,7 @@ impl ReferenceModel {
             let elapsed = started_at.elapsed();
             metrics.norm_duration += elapsed;
             non_offloaded_dense_duration += elapsed;
-            let residual = hidden;
+            let residual = hidden.clone();
 
             let started_at = Instant::now();
             let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
@@ -5741,7 +5784,7 @@ impl ReferenceModel {
                 );
                 hidden_states
             };
-            let residual = hidden;
+            let residual = hidden.clone();
 
             let started_at = Instant::now();
             let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
@@ -5811,6 +5854,32 @@ impl ReferenceModel {
                 use_gpu_attention_block && Self::packed_use_gpu_swiglu_block();
             if Self::packed_use_gpu_attention_block() {
                 gpu_first_session.append_gpu_kv(layer_idx, &k, &v)?;
+            }
+
+            let use_gpu_attention_only = use_gpu_attention_block && !use_gpu_attention_mlp_block;
+            if use_gpu_attention_only {
+                let (next_hidden, attention_report, compile_duration, download_duration) =
+                    gpu_first_session.run_attention_layer_to_host(
+                        layer_idx,
+                        position + 1,
+                        &q,
+                        &layer_cache.keys,
+                        &layer_cache.values,
+                        &residual,
+                    )?;
+                hidden = next_hidden;
+                attention_stage_metrics.query_duration += attention_report.attention_gpu_duration;
+                attention_stage_metrics.oproj_duration += attention_report.oproj_gpu_duration;
+                attention_stage_metrics.residual_duration +=
+                    attention_report.residual_add_gpu_duration;
+                metrics.attention_duration += attention_report.attention_gpu_duration
+                    + attention_report.oproj_gpu_duration
+                    + attention_report.residual_add_gpu_duration;
+                session.metrics.compile_duration += compile_duration;
+                session.metrics.gpu_duration += attention_report.attention_gpu_duration
+                    + attention_report.oproj_gpu_duration
+                    + attention_report.residual_add_gpu_duration;
+                session.metrics.download_duration += download_duration;
             }
 
             if !use_gpu_attention_mlp_block {
@@ -5916,60 +5985,62 @@ impl ReferenceModel {
                 continue;
             }
 
-            let started_at = Instant::now();
-            let attn_started_at = Instant::now();
-            let attn = attention_single_query(
-                &q,
-                &layer_cache.keys,
-                &layer_cache.values,
-                position + 1,
-                self.config.num_attention_heads,
-                self.config.num_key_value_heads,
-                self.config.head_dim,
-            );
-            let attn_elapsed = attn_started_at.elapsed();
-            attention_stage_metrics.query_duration += attn_elapsed;
-            session.push_dense_stage_trace(
-                "attention_core",
-                "attention_single_query",
-                attn_elapsed,
-            );
-            let oproj_started_at = Instant::now();
-            let attn_output = if use_attention_full {
-                session.run_projection(
-                    &layer_tensors.o_proj_weight,
-                    self.config.hidden_size,
-                    self.config.hidden_size,
-                    &attn,
-                )?
-            } else {
-                self.matvec_f16_resolved(&layer_tensors.o_proj_weight, &attn)?
-            };
-            let oproj_elapsed = oproj_started_at.elapsed();
-            attention_stage_metrics.oproj_duration += oproj_elapsed;
-            let residual_started_at = Instant::now();
-            hidden = residual
-                .iter()
-                .zip(attn_output.iter())
-                .map(|(left, right)| left + right)
-                .collect();
-            let residual_elapsed = residual_started_at.elapsed();
-            attention_stage_metrics.residual_duration += residual_elapsed;
-            session.push_dense_stage_trace(
-                "attention_residual",
-                "attention_residual_add",
-                residual_elapsed,
-            );
-            let elapsed = started_at.elapsed();
-            metrics.attention_duration += elapsed;
-            if use_attention_qkv {
-                if use_attention_full {
-                    *non_offloaded_dense_duration += attn_elapsed + residual_elapsed;
+            if !use_gpu_attention_only {
+                let started_at = Instant::now();
+                let attn_started_at = Instant::now();
+                let attn = attention_single_query(
+                    &q,
+                    &layer_cache.keys,
+                    &layer_cache.values,
+                    position + 1,
+                    self.config.num_attention_heads,
+                    self.config.num_key_value_heads,
+                    self.config.head_dim,
+                );
+                let attn_elapsed = attn_started_at.elapsed();
+                attention_stage_metrics.query_duration += attn_elapsed;
+                session.push_dense_stage_trace(
+                    "attention_core",
+                    "attention_single_query",
+                    attn_elapsed,
+                );
+                let oproj_started_at = Instant::now();
+                let attn_output = if use_attention_full {
+                    session.run_projection(
+                        &layer_tensors.o_proj_weight,
+                        self.config.hidden_size,
+                        self.config.hidden_size,
+                        &attn,
+                    )?
+                } else {
+                    self.matvec_f16_resolved(&layer_tensors.o_proj_weight, &attn)?
+                };
+                let oproj_elapsed = oproj_started_at.elapsed();
+                attention_stage_metrics.oproj_duration += oproj_elapsed;
+                let residual_started_at = Instant::now();
+                hidden = residual
+                    .iter()
+                    .zip(attn_output.iter())
+                    .map(|(left, right)| left + right)
+                    .collect();
+                let residual_elapsed = residual_started_at.elapsed();
+                attention_stage_metrics.residual_duration += residual_elapsed;
+                session.push_dense_stage_trace(
+                    "attention_residual",
+                    "attention_residual_add",
+                    residual_elapsed,
+                );
+                let elapsed = started_at.elapsed();
+                metrics.attention_duration += elapsed;
+                if use_attention_qkv {
+                    if use_attention_full {
+                        *non_offloaded_dense_duration += attn_elapsed + residual_elapsed;
+                    } else {
+                        *non_offloaded_dense_duration += elapsed;
+                    }
                 } else {
                     *non_offloaded_dense_duration += elapsed;
                 }
-            } else {
-                *non_offloaded_dense_duration += elapsed;
             }
 
             let residual = hidden;
