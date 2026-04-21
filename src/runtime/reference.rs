@@ -134,20 +134,20 @@ type GpuSwigluBlockExecution = (
 );
 
 pub struct PersistentPackedDecodeSession<'a> {
-    model: &'a ReferenceModel,
-    cache: Vec<LayerCache>,
-    gpu_session: PackedGpuSession<'a>,
-    gpu_first_session: GpuFirstRunnerCache<'a>,
-    metrics: DecodeMetrics,
-    attention_stage_metrics: PackedAttentionStageMetrics,
-    mlp_stage_metrics: PackedMlpStageMetrics,
-    non_offloaded_dense_duration: Duration,
-    next_position: usize,
-    use_attention_qkv: bool,
-    use_mlp_gu: bool,
-    use_attention_full: bool,
-    use_mlp_full: bool,
-    argmax_only: bool,
+    pub(crate) model: &'a ReferenceModel,
+    pub(crate) cache: Vec<LayerCache>,
+    pub(crate) gpu_session: PackedGpuSession<'a>,
+    pub(crate) gpu_first_session: GpuFirstRunnerCache<'a>,
+    pub(crate) metrics: DecodeMetrics,
+    pub(crate) attention_stage_metrics: PackedAttentionStageMetrics,
+    pub(crate) mlp_stage_metrics: PackedMlpStageMetrics,
+    pub(crate) non_offloaded_dense_duration: Duration,
+    pub(crate) next_position: usize,
+    pub(crate) use_attention_qkv: bool,
+    pub(crate) use_mlp_gu: bool,
+    pub(crate) use_attention_full: bool,
+    pub(crate) use_mlp_full: bool,
+    pub(crate) argmax_only: bool,
 }
 
 impl<'a> PersistentPackedDecodeSession<'a> {
@@ -197,102 +197,8 @@ impl<'a> PersistentPackedDecodeSession<'a> {
         self.use_mlp_full = use_mlp_full;
     }
 
-    pub(crate) fn next_position(&self) -> usize {
-        self.next_position
-    }
-
-    pub fn push_prompt_token(
-        &mut self,
-        token_id: usize,
-    ) -> Result<PackedDecodeStepResult, ReferenceError> {
-        self.metrics.prompt_tokens += 1;
-        self.step_token(token_id)
-    }
-
-    pub fn push_generated_token(
-        &mut self,
-        token_id: usize,
-    ) -> Result<PackedDecodeStepResult, ReferenceError> {
-        self.metrics.generated_tokens += 1;
-        self.step_token(token_id)
-    }
-
-    fn step_token(&mut self, token_id: usize) -> Result<PackedDecodeStepResult, ReferenceError> {
-        let result = self.model.forward_step_packed_decode(
-            token_id,
-            self.next_position,
-            &mut self.cache,
-            &mut self.metrics,
-            &mut self.attention_stage_metrics,
-            &mut self.mlp_stage_metrics,
-            &mut self.non_offloaded_dense_duration,
-            &mut self.gpu_session,
-            &mut self.gpu_first_session,
-            self.use_attention_qkv,
-            self.use_mlp_gu,
-            self.use_attention_full,
-            self.use_mlp_full,
-            self.argmax_only,
-        )?;
-        self.next_position += 1;
-        Ok(result)
-    }
-
     pub fn dispatch_trace(&self) -> &[PackedDispatchTrace] {
         &self.gpu_session.dispatch_trace
-    }
-
-    pub fn finish_metrics(
-        self,
-        enabled_projections: String,
-        total_duration: Duration,
-        output_text: String,
-    ) -> PackedDecodeMetrics {
-        finish_packed_decode_metrics(
-            enabled_projections,
-            total_duration,
-            &self.metrics,
-            &self.attention_stage_metrics,
-            &self.mlp_stage_metrics,
-            self.non_offloaded_dense_duration,
-            &self.gpu_session.metrics,
-            output_text,
-        )
-    }
-
-    pub fn finish_result(
-        self,
-        enabled_projections: String,
-        total_duration: Duration,
-        output_token_ids: Vec<usize>,
-        output_text: String,
-    ) -> PackedDecodeResult {
-        let PersistentPackedDecodeSession {
-            metrics: decode_metrics,
-            attention_stage_metrics,
-            mlp_stage_metrics,
-            non_offloaded_dense_duration,
-            gpu_session,
-            ..
-        } = self;
-        let metrics = finish_packed_decode_metrics(
-            enabled_projections,
-            total_duration,
-            &decode_metrics,
-            &attention_stage_metrics,
-            &mlp_stage_metrics,
-            non_offloaded_dense_duration,
-            &gpu_session.metrics,
-            output_text.clone(),
-        );
-        let dispatch_trace = gpu_session.dispatch_trace;
-        PackedDecodeResult {
-            output_token_ids,
-            output_text,
-            decode_metrics,
-            metrics,
-            dispatch_trace,
-        }
     }
 }
 
@@ -301,24 +207,6 @@ pub struct GpuFirstPackedDecodeSession<'a> {
 }
 
 impl<'a> GpuFirstPackedDecodeSession<'a> {
-    pub fn push_prompt_token(
-        &mut self,
-        token_id: usize,
-    ) -> Result<PackedDecodeStepResult, ReferenceError> {
-        self.inner.push_prompt_token(token_id)
-    }
-
-    pub fn push_generated_token(
-        &mut self,
-        token_id: usize,
-    ) -> Result<PackedDecodeStepResult, ReferenceError> {
-        self.inner.push_generated_token(token_id)
-    }
-
-    pub fn next_position(&self) -> usize {
-        self.inner.next_position
-    }
-
     pub(crate) fn has_qk_rope_runner(&self) -> bool {
         self.inner.gpu_first_session.has_qk_rope_runner()
     }
@@ -381,33 +269,9 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
             .embedding_lookup_output(token_id)
     }
 
-    pub fn finish_metrics(
-        self,
-        enabled_projections: String,
-        total_duration: Duration,
-        output_text: String,
-    ) -> PackedDecodeMetrics {
-        self.inner
-            .finish_metrics(enabled_projections, total_duration, output_text)
-    }
-
-    pub fn finish_result(
-        self,
-        enabled_projections: String,
-        total_duration: Duration,
-        output_token_ids: Vec<usize>,
-        output_text: String,
-    ) -> PackedDecodeResult {
-        self.inner.finish_result(
-            enabled_projections,
-            total_duration,
-            output_token_ids,
-            output_text,
-        )
-    }
 }
 
-struct GpuFirstRunnerCache<'a> {
+pub(crate) struct GpuFirstRunnerCache<'a> {
     model: &'a ReferenceModel,
     kv_capacity_tokens: usize,
     shared_context: Option<Arc<SharedGpuPackedContext>>,
@@ -1991,10 +1855,10 @@ impl<'a> GpuFirstRunnerCache<'a> {
     }
 }
 
-struct PackedGpuSession<'a> {
+pub(crate) struct PackedGpuSession<'a> {
     model: &'a ReferenceModel,
-    metrics: PackedGpuSessionMetrics,
-    dispatch_trace: Vec<PackedDispatchTrace>,
+    pub(crate) metrics: PackedGpuSessionMetrics,
+    pub(crate) dispatch_trace: Vec<PackedDispatchTrace>,
     scratch: PackedDecodeScratch,
 }
 
@@ -8268,7 +8132,7 @@ impl ReferenceModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward_step_packed_decode(
+    pub(crate) fn forward_step_packed_decode(
         &self,
         token_id: usize,
         position: usize,
