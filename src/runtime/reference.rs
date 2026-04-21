@@ -2,7 +2,8 @@ use crate::cpu::block::{YarnRope, build_yarn_rope, rope_cos_sin};
 use crate::cpu::primitives::{argmax, swiglu};
 use crate::gpu::pack_f16_pairs::CachedGpuPackF16PairsRunner;
 use crate::gpu::packed_matvec::{
-    CachedGpuPackedMatvecRunner, SharedGpuPackedContext, run_packed_ternary_matvec_with_output,
+    CachedGpuPackedMatvecRunner, PackedRunnerInputMode, SharedGpuPackedContext,
+    run_packed_ternary_matvec_with_output,
 };
 use crate::gpu::swiglu_combined::CachedGpuSwigluCombinedRunner;
 use crate::gpu::swiglu_pack_f16_pairs::CachedGpuSwigluPackF16PairsRunner;
@@ -749,6 +750,7 @@ struct ResidentPackedPairProjection {
     first_rows: usize,
     second_rows: usize,
     cols: usize,
+    activation_upload_bytes: usize,
     prepared: PreparedProjectionRunner,
     report: crate::gpu::packed_matvec::GpuPackedMatvecReport,
 }
@@ -1165,7 +1167,6 @@ impl<'a> PackedGpuSession<'a> {
         let weight_upload_bytes = usize::from(!pair.prepared.gpu_cache_hit)
             * (pair.prepared.packed.code_words.len() * std::mem::size_of::<u32>()
                 + pair.prepared.packed.scales.len() * std::mem::size_of::<f32>());
-        let activation_upload_bytes = pair.cols.div_ceil(2) * std::mem::size_of::<u32>();
         self.account_projection_report(
             &pair.prepared.packed,
             pair.cols,
@@ -1187,7 +1188,7 @@ impl<'a> PackedGpuSession<'a> {
             pair.report.gpu_duration,
             pair.report.download_duration,
             weight_upload_bytes,
-            activation_upload_bytes,
+            pair.activation_upload_bytes,
             0,
         );
 
@@ -1249,7 +1250,6 @@ impl<'a> PackedGpuSession<'a> {
         let weight_upload_bytes = usize::from(!pair.prepared.gpu_cache_hit)
             * (pair.prepared.packed.code_words.len() * std::mem::size_of::<u32>()
                 + pair.prepared.packed.scales.len() * std::mem::size_of::<f32>());
-        let activation_upload_bytes = pair.cols.div_ceil(2) * std::mem::size_of::<u32>();
         self.account_projection_report(
             &pair.prepared.packed,
             pair.cols,
@@ -1271,7 +1271,7 @@ impl<'a> PackedGpuSession<'a> {
             pair.report.gpu_duration,
             pair.report.download_duration,
             weight_upload_bytes,
-            activation_upload_bytes,
+            pair.activation_upload_bytes,
             0,
         );
 
@@ -1851,6 +1851,96 @@ impl<'a> PackedGpuSession<'a> {
             first_rows,
             second_rows,
             cols,
+            activation_upload_bytes: cols.div_ceil(2) * std::mem::size_of::<u32>(),
+            prepared: PreparedProjectionRunner {
+                packed,
+                runner,
+                compile_duration,
+                weight_upload_duration,
+                pack_cache_hit,
+                gpu_cache_hit,
+            },
+            report,
+        })
+    }
+
+    fn run_projection_pair_resident_from_final_norm(
+        &mut self,
+        first_name: &str,
+        first_rows: usize,
+        second_name: &str,
+        second_rows: usize,
+        cols: usize,
+        final_norm: ResidentGpuFinalNorm,
+    ) -> Result<ResidentPackedPairProjection, ReferenceError> {
+        let len = final_norm.runner.borrow().len();
+        self.metrics.compile_duration += final_norm.compile_duration;
+        self.metrics.upload_duration += final_norm.report.upload_duration;
+        self.metrics.gpu_duration += final_norm.report.gpu_duration;
+        self.metrics.dispatch_count += 1;
+        self.metrics.activation_upload_bytes += len * std::mem::size_of::<f32>();
+        self.metrics.weight_upload_bytes += len * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes += 2 * len * std::mem::size_of::<f32>();
+        self.metrics.gpu_cache_hits += usize::from(final_norm.gpu_cache_hit);
+        self.dispatch_trace.push(PackedDispatchTrace {
+            index: self.dispatch_trace.len() + 1,
+            operation: "resident".to_string(),
+            path: "gpu_dense".to_string(),
+            stage: "post_attention_norm_gpu".to_string(),
+            tensor_name: "post_attention_layernorm.weight".to_string(),
+            rows: len,
+            cols: len,
+            pack_cache_hit: false,
+            gpu_cache_hit: final_norm.gpu_cache_hit,
+            cpu_ms: (final_norm.compile_duration + final_norm.report.upload_duration).as_secs_f64()
+                * 1_000.0,
+            compile_ms: final_norm.compile_duration.as_secs_f64() * 1_000.0,
+            weight_upload_ms: final_norm.report.upload_duration.as_secs_f64() * 1_000.0,
+            activation_upload_ms: 0.0,
+            gpu_ms: final_norm.report.gpu_duration.as_secs_f64() * 1_000.0,
+            download_ms: 0.0,
+            weight_upload_bytes: len * std::mem::size_of::<f32>(),
+            activation_upload_bytes: len * std::mem::size_of::<f32>(),
+            download_bytes: 0,
+        });
+
+        let pair_key = format!("concat::{first_name}||{second_name}");
+        let (packed, pack_duration, pack_cache_hit) =
+            self.model.get_or_create_projection_pair_cache(
+                &pair_key,
+                first_name,
+                first_rows,
+                second_name,
+                second_rows,
+                cols,
+            )?;
+        let (runner, compile_duration, weight_upload_duration, gpu_cache_hit) = self
+            .model
+            .get_or_create_projection_gpu_raw_f32(&pair_key, &packed)?;
+        self.metrics.pack_duration += pack_duration;
+        self.metrics.compile_duration += compile_duration;
+        self.metrics.weight_upload_duration += weight_upload_duration;
+        self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
+        self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
+        let report = runner
+            .borrow_mut()
+            .run_resident_from_f32_buffer(
+                final_norm.runner.borrow().shared_context(),
+                final_norm.runner.borrow().output_buffer_handle(),
+                len,
+                final_norm.runner.borrow().output_buffer_size(),
+            )
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu raw-f32 pair projection failed for {first_name}+{second_name}: {error}"
+                ))
+            })?;
+        Ok(ResidentPackedPairProjection {
+            tensor_name: pair_key,
+            first_rows,
+            second_rows,
+            cols,
+            activation_upload_bytes: cols * std::mem::size_of::<f32>(),
             prepared: PreparedProjectionRunner {
                 packed,
                 runner,
@@ -1962,6 +2052,7 @@ pub struct ReferenceModel {
     cached_hybrid_qproj_gpu: RefCell<HashMap<usize, Rc<RefCell<CachedGpuPackedMatvecRunner>>>>,
     cached_projection_packed: RefCell<HashMap<String, Rc<PackedProjectionCache>>>,
     cached_projection_gpu: RefCell<HashMap<String, CachedProjectionGpuRunner>>,
+    cached_projection_gpu_raw_f32: RefCell<HashMap<String, CachedProjectionGpuRunner>>,
     cached_final_norm_gpu: RefCell<Option<CachedWeightedRmsNormGpuRunner>>,
     cached_pack_f16_pairs_gpu: RefCell<HashMap<usize, CachedPackF16PairsGpuRunner>>,
     cached_vector_add_gpu: RefCell<HashMap<usize, CachedVectorAddGpuRunner>>,
@@ -2010,6 +2101,10 @@ impl ReferenceModel {
 
     fn packed_use_gpu_swiglu_block() -> bool {
         std::env::var_os("JENGINE_GPU_SWIGLU_BLOCK").is_some()
+    }
+
+    fn packed_use_gpu_mlp_entry() -> bool {
+        std::env::var_os("JENGINE_GPU_MLP_ENTRY").is_some()
     }
 
     fn packed_use_gpu_tail() -> bool {
@@ -2114,6 +2209,7 @@ impl ReferenceModel {
             cached_hybrid_qproj_gpu: RefCell::new(HashMap::new()),
             cached_projection_packed: RefCell::new(HashMap::new()),
             cached_projection_gpu: RefCell::new(HashMap::new()),
+            cached_projection_gpu_raw_f32: RefCell::new(HashMap::new()),
             cached_final_norm_gpu: RefCell::new(None),
             cached_pack_f16_pairs_gpu: RefCell::new(HashMap::new()),
             cached_vector_add_gpu: RefCell::new(HashMap::new()),
@@ -2266,6 +2362,9 @@ impl ReferenceModel {
                     self.config.hidden_size,
                 )?;
                 let _ = self.get_or_create_projection_gpu(&pair_key, &packed)?;
+                if Self::packed_use_gpu_mlp_entry() {
+                    let _ = self.get_or_create_projection_gpu_raw_f32(&pair_key, &packed)?;
+                }
                 if use_mlp_full {
                     let (packed, _, _) = self.get_or_create_projection_cache(
                         &layer_tensors.down_proj_weight,
@@ -2989,6 +3088,49 @@ impl ReferenceModel {
         self.cached_projection_gpu
             .borrow_mut()
             .insert(tensor_name.to_string(), runner.clone());
+        Ok((runner, duration, weight_upload_duration, false))
+    }
+
+    fn get_or_create_projection_gpu_raw_f32(
+        &self,
+        tensor_name: &str,
+        packed: &PackedProjectionCache,
+    ) -> Result<CachedProjectionGpuCacheEntry, ReferenceError> {
+        let cache_key = format!("rawf32::{tensor_name}");
+        if let Some(cached) = self
+            .cached_projection_gpu_raw_f32
+            .borrow()
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok((cached, Duration::ZERO, Duration::ZERO, true));
+        }
+        let context = self.get_or_create_packed_gpu_context()?;
+        let (mut runner, duration) = CachedGpuPackedMatvecRunner::new_with_context_and_input_mode(
+            context,
+            &packed.code_words,
+            &packed.scales,
+            packed.group_size,
+            packed.rows,
+            packed.cols,
+            PackedRunnerInputMode::RawF32,
+        )
+        .map_err(|error| {
+            ReferenceError::Decode(format!(
+                "gpu raw-f32 init failed for {tensor_name}: {error}"
+            ))
+        })?;
+        let weight_upload_duration = runner
+            .update_weights(&packed.code_words, &packed.scales)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu raw-f32 weight upload failed for {tensor_name}: {error}"
+                ))
+            })?;
+        let runner = Rc::new(RefCell::new(runner));
+        self.cached_projection_gpu_raw_f32
+            .borrow_mut()
+            .insert(cache_key, runner.clone());
         Ok((runner, duration, weight_upload_duration, false))
     }
 
@@ -4757,22 +4899,40 @@ impl ReferenceModel {
             }
 
             let residual = hidden;
-            let started_at = Instant::now();
             let post_norm_weight =
                 self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
-            hidden_states = weighted_rms_norm(
-                &residual,
-                &post_norm_weight,
-                self.config.rms_norm_eps as f32,
-            );
-            let elapsed = started_at.elapsed();
-            metrics.norm_duration += elapsed;
-            *non_offloaded_dense_duration += elapsed;
-            session.push_dense_stage_trace(
-                "post_attention_norm",
-                &layer_tensors.post_attention_layernorm_weight,
-                elapsed,
-            );
+            let use_gpu_mlp_entry = use_mlp_gu && use_mlp_full && Self::packed_use_gpu_mlp_entry();
+            let mut pair_from_gpu_norm: Option<ResidentPackedPairProjection> = None;
+            if use_gpu_mlp_entry {
+                let started_at = Instant::now();
+                let final_norm = session.run_final_norm_resident(&residual, &post_norm_weight)?;
+                let pair = session.run_projection_pair_resident_from_final_norm(
+                    &layer_tensors.gate_proj_weight,
+                    self.config.intermediate_size,
+                    &layer_tensors.up_proj_weight,
+                    self.config.intermediate_size,
+                    self.config.hidden_size,
+                    final_norm,
+                )?;
+                let elapsed = started_at.elapsed();
+                metrics.norm_duration += elapsed;
+                pair_from_gpu_norm = Some(pair);
+            } else {
+                let started_at = Instant::now();
+                hidden_states = weighted_rms_norm(
+                    &residual,
+                    &post_norm_weight,
+                    self.config.rms_norm_eps as f32,
+                );
+                let elapsed = started_at.elapsed();
+                metrics.norm_duration += elapsed;
+                *non_offloaded_dense_duration += elapsed;
+                session.push_dense_stage_trace(
+                    "post_attention_norm",
+                    &layer_tensors.post_attention_layernorm_weight,
+                    elapsed,
+                );
+            }
 
             let started_at = Instant::now();
             let use_gpu_swiglu_block =
@@ -4790,14 +4950,18 @@ impl ReferenceModel {
                 gpu_residual_elapsed,
                 dense_tail_started_at,
             ) = if use_gpu_swiglu_block {
-                let pair = session.run_projection_pair_resident(
-                    &layer_tensors.gate_proj_weight,
-                    self.config.intermediate_size,
-                    &layer_tensors.up_proj_weight,
-                    self.config.intermediate_size,
-                    self.config.hidden_size,
-                    &hidden_states,
-                )?;
+                let pair = if let Some(pair) = pair_from_gpu_norm.take() {
+                    pair
+                } else {
+                    session.run_projection_pair_resident(
+                        &layer_tensors.gate_proj_weight,
+                        self.config.intermediate_size,
+                        &layer_tensors.up_proj_weight,
+                        self.config.intermediate_size,
+                        self.config.hidden_size,
+                        &hidden_states,
+                    )?
+                };
                 let swiglu_started_at = Instant::now();
                 let packed_activation = session.run_swiglu_pack_f16_pairs_resident(pair)?;
                 let swiglu_elapsed = swiglu_started_at.elapsed();
