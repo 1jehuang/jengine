@@ -24,6 +24,7 @@ use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRun
 use crate::runtime::assets::BonsaiAssetPaths;
 use crate::runtime::decode_plan::PackedDecodePlan;
 use crate::runtime::decode_report::{MemoryReport, build_memory_report};
+use crate::runtime::gpu_decode_engine::{GpuDecodeEngine, PackedDecodeRequest};
 use crate::runtime::gpu_decode_env::{
     packed_enabled_label, packed_use_attention_full, packed_use_gpu_attention_block,
     packed_use_gpu_embedding, packed_use_gpu_final_norm, packed_use_gpu_first_session,
@@ -6885,60 +6886,20 @@ impl ReferenceModel {
         use_attention_qkv: bool,
         use_mlp_gu: bool,
     ) -> Result<PackedDecodeResult, ReferenceError> {
-        if prompt_ids.is_empty() {
-            return Err(ReferenceError::Decode(
-                "prompt_ids cannot be empty".to_string(),
-            ));
-        }
         let tokenizer = self
             .tokenizer
             .as_ref()
             .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
-        let total_started = Instant::now();
-        let mut session = self.begin_packed_decode_session(
-            prompt_ids.len() + max_new_tokens,
-            use_attention_qkv,
-            use_mlp_gu,
-            true,
-        );
-        let mut last_next_token = None;
-
-        for (position, &token_id) in prompt_ids.iter().enumerate() {
-            debug_assert_eq!(position, session.next_position());
-            let step = session.push_prompt_token(token_id)?;
-            last_next_token = Some(match step {
-                PackedDecodeStepResult::NextToken(token_id) => token_id,
-                PackedDecodeStepResult::Logits(_) => {
-                    unreachable!("argmax-only packed decode should not return logits")
-                }
-            });
-        }
-
-        let mut output_ids = prompt_ids.to_vec();
-        for generation_index in 0..max_new_tokens {
-            let next_token = last_next_token.ok_or_else(|| {
-                ReferenceError::Decode("argmax failed on empty logits".to_string())
-            })?;
-            output_ids.push(next_token);
-            debug_assert_eq!(prompt_ids.len() + generation_index, session.next_position());
-            let step = session.push_generated_token(next_token)?;
-            last_next_token = Some(match step {
-                PackedDecodeStepResult::NextToken(token_id) => token_id,
-                PackedDecodeStepResult::Logits(_) => {
-                    unreachable!("argmax-only packed decode should not return logits")
-                }
-            });
-        }
-
-        let output_text =
-            tokenizer.decode(&output_ids.iter().map(|id| *id as u32).collect::<Vec<_>>())?;
-
-        Ok(session.finish_result(
-            packed_enabled_label(use_attention_qkv, use_mlp_gu),
-            total_started.elapsed(),
-            output_ids,
-            output_text,
-        ))
+        GpuDecodeEngine::new(
+            self,
+            PackedDecodeRequest::new(
+                prompt_ids.len() + max_new_tokens,
+                use_attention_qkv,
+                use_mlp_gu,
+                true,
+            ),
+        )
+        .generate_from_token_ids(tokenizer, prompt_ids, max_new_tokens)
     }
 
     pub fn prefill_logits_for_variant(
@@ -6952,22 +6913,11 @@ impl ReferenceModel {
             .as_ref()
             .ok_or_else(|| ReferenceError::Decode("tokenizer is not loaded".to_string()))?;
         let prompt_ids = self.encode_prompt_ids(tokenizer, prompt)?;
-        let mut last_logits = Vec::new();
-        let mut session = self.begin_packed_decode_session(
-            prompt_ids.len(),
-            use_attention_qkv,
-            use_mlp_gu,
-            false,
-        );
-        for &token_id in &prompt_ids {
-            last_logits = match session.push_prompt_token(token_id)? {
-                PackedDecodeStepResult::Logits(logits) => logits,
-                PackedDecodeStepResult::NextToken(_) => {
-                    unreachable!("full-logits prefill path should not return argmax-only output")
-                }
-            };
-        }
-        Ok(last_logits)
+        GpuDecodeEngine::new(
+            self,
+            PackedDecodeRequest::new(prompt_ids.len(), use_attention_qkv, use_mlp_gu, false),
+        )
+        .prefill_logits_from_token_ids(&prompt_ids)
     }
 
     pub fn compare_prefill_logits_against(
