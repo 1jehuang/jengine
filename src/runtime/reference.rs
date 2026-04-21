@@ -4412,6 +4412,38 @@ impl ReferenceModel {
         vec![0.0; self.config.hidden_size]
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn apply_first_layer_embedding_norm_entry(
+        &self,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+        token_id: usize,
+        input_norm_weight: &[f32],
+        hidden: &mut Vec<f32>,
+        metrics: &mut DecodeMetrics,
+        session: &mut PackedGpuSession<'_>,
+    ) -> Result<Vec<f32>, ReferenceError> {
+        let started_at = Instant::now();
+        let (gpu_hidden, gpu_hidden_states, embedding_report, norm_report, compile_duration) =
+            gpu_first_session.run_embedding_and_input_norm_to_host(token_id, input_norm_weight)?;
+        *hidden = gpu_hidden;
+        session.metrics.compile_duration += compile_duration;
+        session.metrics.activation_upload_duration +=
+            embedding_report.upload_duration + norm_report.upload_duration;
+        session.metrics.upload_duration += embedding_report.upload_duration + norm_report.upload_duration;
+        session.metrics.gpu_duration += embedding_report.gpu_duration + norm_report.gpu_duration;
+        session.metrics.download_duration +=
+            embedding_report.download_duration + norm_report.download_duration;
+        session.metrics.activation_upload_bytes +=
+            std::mem::size_of::<u32>() + self.config.hidden_size * std::mem::size_of::<f32>();
+        session.metrics.upload_bytes +=
+            std::mem::size_of::<u32>() + self.config.hidden_size * std::mem::size_of::<f32>();
+        session.metrics.download_bytes += self.config.hidden_size * std::mem::size_of::<f32>() * 2;
+        metrics.embedding_duration += started_at.elapsed();
+        metrics.norm_duration +=
+            norm_report.upload_duration + norm_report.gpu_duration + norm_report.download_duration;
+        Ok(gpu_hidden_states)
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -6728,36 +6760,14 @@ impl ReferenceModel {
                 && packed_use_gpu_embedding()
                 && packed_use_gpu_first_session()
             {
-                let started_at = Instant::now();
-                let (
-                    gpu_hidden,
-                    gpu_hidden_states,
-                    embedding_report,
-                    norm_report,
-                    compile_duration,
-                ) = gpu_first_session
-                    .run_embedding_and_input_norm_to_host(token_id, &input_norm_weight)?;
-                hidden = gpu_hidden;
-                session.metrics.compile_duration += compile_duration;
-                session.metrics.activation_upload_duration +=
-                    embedding_report.upload_duration + norm_report.upload_duration;
-                session.metrics.upload_duration +=
-                    embedding_report.upload_duration + norm_report.upload_duration;
-                session.metrics.gpu_duration +=
-                    embedding_report.gpu_duration + norm_report.gpu_duration;
-                session.metrics.download_duration +=
-                    embedding_report.download_duration + norm_report.download_duration;
-                session.metrics.activation_upload_bytes += std::mem::size_of::<u32>()
-                    + self.config.hidden_size * std::mem::size_of::<f32>();
-                session.metrics.upload_bytes += std::mem::size_of::<u32>()
-                    + self.config.hidden_size * std::mem::size_of::<f32>();
-                session.metrics.download_bytes +=
-                    self.config.hidden_size * std::mem::size_of::<f32>() * 2;
-                metrics.embedding_duration += started_at.elapsed();
-                metrics.norm_duration += norm_report.upload_duration
-                    + norm_report.gpu_duration
-                    + norm_report.download_duration;
-                gpu_hidden_states
+                self.apply_first_layer_embedding_norm_entry(
+                    gpu_first_session,
+                    token_id,
+                    &input_norm_weight,
+                    &mut hidden,
+                    metrics,
+                    session,
+                )?
             } else {
                 let started_at = Instant::now();
                 let hidden_states =
