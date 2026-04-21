@@ -110,10 +110,9 @@ pub struct CachedGpuAttentionSingleQueryRunner {
     shader_module: vk::ShaderModule,
     pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
-    _descriptor_set: vk::DescriptorSet,
+    descriptor_set: vk::DescriptorSet,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
-    copy_command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     query_buffer: BufferAllocation,
     keys_buffer: BufferAllocation,
@@ -278,10 +277,8 @@ impl CachedGpuAttentionSingleQueryRunner {
         let command_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(2);
-        let command_buffers = unsafe { device.allocate_command_buffers(&command_alloc)? };
-        let command_buffer = command_buffers[0];
-        let copy_command_buffer = command_buffers[1];
+            .command_buffer_count(1);
+        let command_buffer = unsafe { device.allocate_command_buffers(&command_alloc)?[0] };
         unsafe {
             device.begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())?;
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
@@ -324,10 +321,9 @@ impl CachedGpuAttentionSingleQueryRunner {
                 shader_module,
                 pipeline,
                 descriptor_pool,
-                _descriptor_set: descriptor_set,
+                descriptor_set,
                 command_pool,
                 command_buffer,
-                copy_command_buffer,
                 fence,
                 query_buffer,
                 keys_buffer,
@@ -358,6 +354,7 @@ impl CachedGpuAttentionSingleQueryRunner {
             )));
         }
         let upload_started = Instant::now();
+        self.bind_internal_buffers();
         write_f32_buffer(&self.query_buffer, query)?;
         write_f32_buffer(&self.keys_buffer, keys)?;
         write_f32_buffer(&self.values_buffer, values)?;
@@ -404,6 +401,7 @@ impl CachedGpuAttentionSingleQueryRunner {
             )));
         }
         let upload_started = Instant::now();
+        self.bind_internal_buffers();
         write_f32_buffer(&self.query_buffer, query)?;
         write_f32_buffer(&self.keys_buffer, keys)?;
         write_f32_buffer(&self.values_buffer, values)?;
@@ -445,15 +443,24 @@ impl CachedGpuAttentionSingleQueryRunner {
         }
         let query_upload_started = Instant::now();
         write_f32_buffer(&self.query_buffer, query)?;
-        self.copy_kv_from_buffers(
-            source_context,
-            key_buffer,
-            key_buffer_size,
-            value_buffer,
-            value_buffer_size,
-        )?;
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuAttentionSingleQueryError::Shape(
+                "resident KV chaining requires runners to share the same Vulkan context"
+                    .to_string(),
+            ));
+        }
+        let byte_len = self.kv_len * std::mem::size_of::<f32>();
+        if byte_len as u64 > key_buffer_size
+            || byte_len as u64 > value_buffer_size
+        {
+            return Err(GpuAttentionSingleQueryError::Shape(format!(
+                "kv buffer {} bytes exceeds source buffer size",
+                byte_len
+            )));
+        }
+        self.bind_descriptor_buffers(self.query_buffer.buffer, key_buffer, value_buffer);
         let upload_duration = query_upload_started.elapsed();
-        let gpu_duration = self.submit_copy_and_compute_and_wait()?;
+        let gpu_duration = self.submit_and_wait()?;
         Ok(GpuAttentionSingleQueryReport {
             query_len: self.query_len,
             seq_len: self.seq_len,
@@ -478,19 +485,27 @@ impl CachedGpuAttentionSingleQueryRunner {
                 query.len, key.len, value.len, self.query_len, self.kv_len, self.kv_len
             )));
         }
-        let upload_started = Instant::now();
-        self.copy_query_and_kv_from_buffers(
-            &query.shared_context,
-            query.buffer,
-            query.len,
-            query.buffer_size,
-            key.buffer,
-            key.buffer_size,
-            value.buffer,
-            value.buffer_size,
-        )?;
-        let upload_duration = upload_started.elapsed();
-        let gpu_duration = self.submit_copy_and_compute_and_wait()?;
+        if !Arc::ptr_eq(&self._shared_context, &query.shared_context)
+            || !Arc::ptr_eq(&self._shared_context, &key.shared_context)
+            || !Arc::ptr_eq(&self._shared_context, &value.shared_context)
+        {
+            return Err(GpuAttentionSingleQueryError::Shape(
+                "resident query/KV chaining requires matching Vulkan context".to_string(),
+            ));
+        }
+        let query_byte_len = self.query_len * std::mem::size_of::<f32>();
+        let kv_byte_len = self.kv_len * std::mem::size_of::<f32>();
+        if query.buffer_size < query_byte_len as u64
+            || key.buffer_size < kv_byte_len as u64
+            || value.buffer_size < kv_byte_len as u64
+        {
+            return Err(GpuAttentionSingleQueryError::Shape(
+                "resident query/KV buffers are smaller than required".to_string(),
+            ));
+        }
+        self.bind_descriptor_buffers(query.buffer, key.buffer, value.buffer);
+        let upload_duration = Duration::ZERO;
+        let gpu_duration = self.submit_and_wait()?;
         Ok(GpuAttentionSingleQueryReport {
             query_len: self.query_len,
             seq_len: self.seq_len,
@@ -531,191 +546,59 @@ impl CachedGpuAttentionSingleQueryRunner {
         Ok(gpu_started.elapsed())
     }
 
-    fn submit_copy_and_compute_and_wait(&self) -> Result<Duration, GpuAttentionSingleQueryError> {
-        unsafe { self.device.reset_fences(&[self.fence])? };
-        let command_buffers = [self.copy_command_buffer, self.command_buffer];
-        let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
-        let gpu_started = Instant::now();
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &submit_info, self.fence)?;
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
-        Ok(gpu_started.elapsed())
+    fn bind_internal_buffers(&self) {
+        self.bind_descriptor_buffers(
+            self.query_buffer.buffer,
+            self.keys_buffer.buffer,
+            self.values_buffer.buffer,
+        );
     }
 
-    fn copy_query_and_kv_from_buffers(
+    fn bind_descriptor_buffers(
         &self,
-        source_context: &Arc<SharedGpuPackedContext>,
         query_buffer: vk::Buffer,
-        query_len: usize,
-        query_buffer_size: u64,
         key_buffer: vk::Buffer,
-        key_buffer_size: u64,
         value_buffer: vk::Buffer,
-        value_buffer_size: u64,
-    ) -> Result<(), GpuAttentionSingleQueryError> {
-        if query_len != self.query_len {
-            return Err(GpuAttentionSingleQueryError::Shape(format!(
-                "source len {} does not match query len {}",
-                query_len, self.query_len
-            )));
-        }
-        if !Arc::ptr_eq(&self._shared_context, source_context) {
-            return Err(GpuAttentionSingleQueryError::Shape(
-                "resident query/KV chaining requires matching Vulkan context".to_string(),
-            ));
-        }
-        let query_byte_len = self.query_len * std::mem::size_of::<f32>();
-        if query_byte_len as u64 > query_buffer_size || query_byte_len as u64 > self.query_buffer.size {
-            return Err(GpuAttentionSingleQueryError::Shape(format!(
-                "query copy {} bytes exceeds source {} or destination {}",
-                query_byte_len, query_buffer_size, self.query_buffer.size
-            )));
-        }
-        let kv_byte_len = self.kv_len * std::mem::size_of::<f32>();
-        if kv_byte_len as u64 > key_buffer_size
-            || kv_byte_len as u64 > value_buffer_size
-            || kv_byte_len as u64 > self.keys_buffer.size
-            || kv_byte_len as u64 > self.values_buffer.size
-        {
-            return Err(GpuAttentionSingleQueryError::Shape(format!(
-                "kv copy {} bytes exceeds source or destination buffer sizes",
-                kv_byte_len
-            )));
-        }
-        let copy_command = self.copy_command_buffer;
-        unsafe {
-            self.device
-                .reset_command_buffer(copy_command, vk::CommandBufferResetFlags::empty())?;
-            self.device
-                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
-            let query_region = [vk::BufferCopy::default().size(query_byte_len as u64)];
-            self.device.cmd_copy_buffer(
-                copy_command,
-                query_buffer,
-                self.query_buffer.buffer,
-                &query_region,
-            );
-            let kv_region = [vk::BufferCopy::default().size(kv_byte_len as u64)];
-            self.device
-                .cmd_copy_buffer(copy_command, key_buffer, self.keys_buffer.buffer, &kv_region);
-            self.device.cmd_copy_buffer(
-                copy_command,
-                value_buffer,
-                self.values_buffer.buffer,
-                &kv_region,
-            );
-            let barriers = [
-                vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(self.query_buffer.buffer)
-                    .offset(0)
-                    .size(query_byte_len as u64),
-                vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(self.keys_buffer.buffer)
-                    .offset(0)
-                    .size(kv_byte_len as u64),
-                vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(self.values_buffer.buffer)
-                    .offset(0)
-                    .size(kv_byte_len as u64),
-            ];
-            self.device.cmd_pipeline_barrier(
-                copy_command,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &barriers,
-                &[],
-            );
-            self.device.end_command_buffer(copy_command)?;
-        }
-        Ok(())
-    }
-
-    fn copy_kv_from_buffers(
-        &self,
-        source_context: &Arc<SharedGpuPackedContext>,
-        key_buffer: vk::Buffer,
-        key_buffer_size: u64,
-        value_buffer: vk::Buffer,
-        value_buffer_size: u64,
-    ) -> Result<(), GpuAttentionSingleQueryError> {
-        if !Arc::ptr_eq(&self._shared_context, source_context) {
-            return Err(GpuAttentionSingleQueryError::Shape(
-                "resident KV chaining requires runners to share the same Vulkan context"
-                    .to_string(),
-            ));
-        }
-        let byte_len = self.kv_len * std::mem::size_of::<f32>();
-        if byte_len as u64 > key_buffer_size
-            || byte_len as u64 > value_buffer_size
-            || byte_len as u64 > self.keys_buffer.size
-            || byte_len as u64 > self.values_buffer.size
-        {
-            return Err(GpuAttentionSingleQueryError::Shape(format!(
-                "kv copy {} bytes exceeds source or destination buffer sizes",
-                byte_len
-            )));
-        }
-        let copy_command = self.copy_command_buffer;
-        unsafe {
-            self.device
-                .reset_command_buffer(copy_command, vk::CommandBufferResetFlags::empty())?;
-            self.device
-                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
-            let region = [vk::BufferCopy::default().size(byte_len as u64)];
-            self.device
-                .cmd_copy_buffer(copy_command, key_buffer, self.keys_buffer.buffer, &region);
-            self.device.cmd_copy_buffer(
-                copy_command,
-                value_buffer,
-                self.values_buffer.buffer,
-                &region,
-            );
-            let barriers = [
-                vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(self.keys_buffer.buffer)
-                    .offset(0)
-                    .size(byte_len as u64),
-                vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(self.values_buffer.buffer)
-                    .offset(0)
-                    .size(byte_len as u64),
-            ];
-            self.device.cmd_pipeline_barrier(
-                copy_command,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &barriers,
-                &[],
-            );
-            self.device.end_command_buffer(copy_command)?;
-        }
-        Ok(())
+    ) {
+        let query_info = [vk::DescriptorBufferInfo::default()
+            .buffer(query_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let keys_info = [vk::DescriptorBufferInfo::default()
+            .buffer(key_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let values_info = [vk::DescriptorBufferInfo::default()
+            .buffer(value_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let output_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.output_buffer.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&query_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&keys_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&values_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(3)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&output_info),
+        ];
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
     }
 }
 
