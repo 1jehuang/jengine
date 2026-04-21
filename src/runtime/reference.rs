@@ -27,6 +27,7 @@ use crate::runtime::gpu_decode_engine::{GpuDecodeEngine, PackedDecodeRequest};
 use crate::runtime::gpu_decode_metrics::{
     PackedAttentionStageMetrics, PackedGpuSessionMetrics, PackedMlpStageMetrics,
 };
+use crate::runtime::gpu_decode_scratch::PackedDecodeScratch;
 use crate::runtime::gpu_decode_state::{GpuKvBinding, GpuTailResult, GpuTailStepReport, ResidentHiddenState};
 use crate::runtime::packed_model::{PackedModelError, PackedModelStore};
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
@@ -339,16 +340,6 @@ type CachedSwigluPackF16PairsGpuRunner = Rc<RefCell<CachedGpuSwigluPackF16PairsR
 #[allow(dead_code)]
 type CachedSwigluPackF16PairsGpuCacheEntry = (CachedSwigluPackF16PairsGpuRunner, Duration, bool);
 type ProjectionTripletOutputs = (Vec<f32>, Vec<f32>, Vec<f32>);
-
-#[derive(Default)]
-struct PackedDecodeScratch {
-    q: Vec<f32>,
-    k: Vec<f32>,
-    v: Vec<f32>,
-    gate: Vec<f32>,
-    up: Vec<f32>,
-    mlp: Vec<f32>,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttentionProjectionMixMetrics {
