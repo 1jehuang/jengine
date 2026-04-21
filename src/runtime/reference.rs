@@ -2057,27 +2057,21 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.gpu_cache_hits += usize::from(activation.gpu_cache_hit);
         self.metrics.activation_upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
-        self.dispatch_trace.push(PackedDispatchTrace {
-            index: self.dispatch_trace.len() + 1,
-            operation: "resident".to_string(),
-            path: "gpu_pack".to_string(),
-            stage: "pack_f16_pairs".to_string(),
-            tensor_name: "pack_f16_pairs".to_string(),
-            rows: cols.div_ceil(2),
+        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
+            self.dispatch_trace.len() + 1,
+            "gpu_pack",
+            "pack_f16_pairs",
+            "pack_f16_pairs",
+            cols.div_ceil(2),
             cols,
-            pack_cache_hit: false,
-            gpu_cache_hit: activation.gpu_cache_hit,
-            cpu_ms: (activation.compile_duration + activation.upload_duration).as_secs_f64()
-                * 1_000.0,
-            compile_ms: activation.compile_duration.as_secs_f64() * 1_000.0,
-            weight_upload_ms: 0.0,
-            activation_upload_ms: activation.upload_duration.as_secs_f64() * 1_000.0,
-            gpu_ms: activation.gpu_duration.as_secs_f64() * 1_000.0,
-            download_ms: 0.0,
-            weight_upload_bytes: 0,
-            activation_upload_bytes: activation.logical_len * std::mem::size_of::<f32>(),
-            download_bytes: 0,
-        });
+            activation.gpu_cache_hit,
+            activation.compile_duration,
+            Duration::ZERO,
+            activation.upload_duration,
+            activation.gpu_duration,
+            0,
+            activation.logical_len * std::mem::size_of::<f32>(),
+        ));
 
         let weight_upload_bytes = usize::from(!prepared.gpu_cache_hit)
             * (prepared.packed.code_words.len() * std::mem::size_of::<u32>()
@@ -2270,27 +2264,21 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.activation_upload_bytes += final_norm.len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += 2 * final_norm.len * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(final_norm.gpu_cache_hit);
-        self.dispatch_trace.push(PackedDispatchTrace {
-            index: self.dispatch_trace.len() + 1,
-            operation: "resident".to_string(),
-            path: "gpu_dense".to_string(),
-            stage: "final_norm_gpu".to_string(),
-            tensor_name: "model.norm.weight".to_string(),
-            rows: final_norm.len,
-            cols: final_norm.len,
-            pack_cache_hit: false,
-            gpu_cache_hit: final_norm.gpu_cache_hit,
-            cpu_ms: (final_norm.compile_duration + final_norm.report.upload_duration).as_secs_f64()
-                * 1_000.0,
-            compile_ms: final_norm.compile_duration.as_secs_f64() * 1_000.0,
-            weight_upload_ms: final_norm.report.upload_duration.as_secs_f64() * 1_000.0,
-            activation_upload_ms: 0.0,
-            gpu_ms: final_norm.report.gpu_duration.as_secs_f64() * 1_000.0,
-            download_ms: 0.0,
-            weight_upload_bytes: final_norm.len * std::mem::size_of::<f32>(),
-            activation_upload_bytes: final_norm.len * std::mem::size_of::<f32>(),
-            download_bytes: 0,
-        });
+        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
+            self.dispatch_trace.len() + 1,
+            "gpu_dense",
+            "final_norm_gpu",
+            "model.norm.weight",
+            final_norm.len,
+            final_norm.len,
+            final_norm.gpu_cache_hit,
+            final_norm.compile_duration,
+            final_norm.report.upload_duration,
+            Duration::ZERO,
+            final_norm.report.gpu_duration,
+            final_norm.len * std::mem::size_of::<f32>(),
+            final_norm.len * std::mem::size_of::<f32>(),
+        ));
         Ok(ResidentGpuPackedActivation {
             keepalive: ResidentGpuPackedActivationKeepalive::PackF16(runner.clone()),
             tensor: GpuResidentBuffer::new(
@@ -2362,27 +2350,21 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.upload_bytes +=
             (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
-        self.dispatch_trace.push(PackedDispatchTrace {
-            index: self.dispatch_trace.len() + 1,
-            operation: "resident".to_string(),
-            path: "gpu_dense".to_string(),
-            stage: "mlp_swiglu_gpu".to_string(),
-            tensor_name: "swiglu_combined".to_string(),
-            rows: pair.first_rows,
-            cols: pair.first_rows + pair.second_rows,
-            pack_cache_hit: false,
+        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
+            self.dispatch_trace.len() + 1,
+            "gpu_dense",
+            "mlp_swiglu_gpu",
+            "swiglu_combined",
+            pair.first_rows,
+            pair.first_rows + pair.second_rows,
             gpu_cache_hit,
-            cpu_ms: (compile_duration + report.upload_duration).as_secs_f64() * 1_000.0,
-            compile_ms: compile_duration.as_secs_f64() * 1_000.0,
-            weight_upload_ms: 0.0,
-            activation_upload_ms: report.upload_duration.as_secs_f64() * 1_000.0,
-            gpu_ms: report.gpu_duration.as_secs_f64() * 1_000.0,
-            download_ms: 0.0,
-            weight_upload_bytes: 0,
-            activation_upload_bytes: (pair.first_rows + pair.second_rows)
-                * std::mem::size_of::<f32>(),
-            download_bytes: 0,
-        });
+            compile_duration,
+            Duration::ZERO,
+            report.upload_duration,
+            report.gpu_duration,
+            0,
+            (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>(),
+        ));
         let len = pair.first_rows;
         let tensor = GpuResidentBuffer::new(
             runner.borrow().shared_context().clone(),
@@ -2454,27 +2436,21 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.upload_bytes +=
             (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
-        self.dispatch_trace.push(PackedDispatchTrace {
-            index: self.dispatch_trace.len() + 1,
-            operation: "resident".to_string(),
-            path: "gpu_pack".to_string(),
-            stage: "mlp_swiglu_pack_gpu".to_string(),
-            tensor_name: "swiglu_pack_f16_pairs".to_string(),
-            rows: pair.first_rows.div_ceil(2),
-            cols: pair.first_rows + pair.second_rows,
-            pack_cache_hit: false,
+        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
+            self.dispatch_trace.len() + 1,
+            "gpu_pack",
+            "mlp_swiglu_pack_gpu",
+            "swiglu_pack_f16_pairs",
+            pair.first_rows.div_ceil(2),
+            pair.first_rows + pair.second_rows,
             gpu_cache_hit,
-            cpu_ms: (compile_duration + report.upload_duration).as_secs_f64() * 1_000.0,
-            compile_ms: compile_duration.as_secs_f64() * 1_000.0,
-            weight_upload_ms: 0.0,
-            activation_upload_ms: report.upload_duration.as_secs_f64() * 1_000.0,
-            gpu_ms: report.gpu_duration.as_secs_f64() * 1_000.0,
-            download_ms: 0.0,
-            weight_upload_bytes: 0,
-            activation_upload_bytes: (pair.first_rows + pair.second_rows)
-                * std::mem::size_of::<f32>(),
-            download_bytes: 0,
-        });
+            compile_duration,
+            Duration::ZERO,
+            report.upload_duration,
+            report.gpu_duration,
+            0,
+            (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>(),
+        ));
         Ok(ResidentGpuPackedActivation {
             keepalive: ResidentGpuPackedActivationKeepalive::SwigluPackF16(runner.clone()),
             tensor: GpuResidentBuffer::new(
@@ -2517,26 +2493,21 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.activation_upload_bytes += swiglu.len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += swiglu.len * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
-        self.dispatch_trace.push(PackedDispatchTrace {
-            index: self.dispatch_trace.len() + 1,
-            operation: "resident".to_string(),
-            path: "gpu_pack".to_string(),
-            stage: "pack_f16_pairs".to_string(),
-            tensor_name: "pack_f16_pairs".to_string(),
-            rows: swiglu.len.div_ceil(2),
-            cols: swiglu.len,
-            pack_cache_hit: false,
+        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
+            self.dispatch_trace.len() + 1,
+            "gpu_pack",
+            "pack_f16_pairs",
+            "pack_f16_pairs",
+            swiglu.len.div_ceil(2),
+            swiglu.len,
             gpu_cache_hit,
-            cpu_ms: (compile_duration + report.upload_duration).as_secs_f64() * 1_000.0,
-            compile_ms: compile_duration.as_secs_f64() * 1_000.0,
-            weight_upload_ms: 0.0,
-            activation_upload_ms: report.upload_duration.as_secs_f64() * 1_000.0,
-            gpu_ms: report.gpu_duration.as_secs_f64() * 1_000.0,
-            download_ms: 0.0,
-            weight_upload_bytes: 0,
-            activation_upload_bytes: swiglu.len * std::mem::size_of::<f32>(),
-            download_bytes: 0,
-        });
+            compile_duration,
+            Duration::ZERO,
+            report.upload_duration,
+            report.gpu_duration,
+            0,
+            swiglu.len * std::mem::size_of::<f32>(),
+        ));
         Ok(ResidentGpuPackedActivation {
             keepalive: ResidentGpuPackedActivationKeepalive::PackF16(runner.clone()),
             tensor: GpuResidentBuffer::new(
@@ -2582,27 +2553,21 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.gpu_cache_hits += usize::from(activation.gpu_cache_hit);
         self.metrics.activation_upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
-        self.dispatch_trace.push(PackedDispatchTrace {
-            index: self.dispatch_trace.len() + 1,
-            operation: "resident".to_string(),
-            path: "gpu_pack".to_string(),
-            stage: "pack_f16_pairs".to_string(),
-            tensor_name: "pack_f16_pairs".to_string(),
-            rows: cols.div_ceil(2),
+        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
+            self.dispatch_trace.len() + 1,
+            "gpu_pack",
+            "pack_f16_pairs",
+            "pack_f16_pairs",
+            cols.div_ceil(2),
             cols,
-            pack_cache_hit: false,
-            gpu_cache_hit: activation.gpu_cache_hit,
-            cpu_ms: (activation.compile_duration + activation.upload_duration).as_secs_f64()
-                * 1_000.0,
-            compile_ms: activation.compile_duration.as_secs_f64() * 1_000.0,
-            weight_upload_ms: 0.0,
-            activation_upload_ms: activation.upload_duration.as_secs_f64() * 1_000.0,
-            gpu_ms: activation.gpu_duration.as_secs_f64() * 1_000.0,
-            download_ms: 0.0,
-            weight_upload_bytes: 0,
-            activation_upload_bytes: activation.logical_len * std::mem::size_of::<f32>(),
-            download_bytes: 0,
-        });
+            activation.gpu_cache_hit,
+            activation.compile_duration,
+            Duration::ZERO,
+            activation.upload_duration,
+            activation.gpu_duration,
+            0,
+            activation.logical_len * std::mem::size_of::<f32>(),
+        ));
         let tensor = GpuResidentBuffer::new(
             prepared.runner.borrow().shared_context().clone(),
             prepared.runner.borrow().output_buffer_handle(),
@@ -2690,27 +2655,21 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.activation_upload_bytes += 2 * activation.len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += 2 * activation.len * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(activation.gpu_cache_hit);
-        self.dispatch_trace.push(PackedDispatchTrace {
-            index: self.dispatch_trace.len() + 1,
-            operation: "resident".to_string(),
-            path: "gpu_dense".to_string(),
-            stage: "vector_add_gpu".to_string(),
-            tensor_name: "vector_add".to_string(),
-            rows: activation.len,
-            cols: activation.len,
-            pack_cache_hit: false,
-            gpu_cache_hit: activation.gpu_cache_hit,
-            cpu_ms: (activation.compile_duration + activation.report.upload_duration).as_secs_f64()
-                * 1_000.0,
-            compile_ms: activation.compile_duration.as_secs_f64() * 1_000.0,
-            weight_upload_ms: 0.0,
-            activation_upload_ms: activation.report.upload_duration.as_secs_f64() * 1_000.0,
-            gpu_ms: activation.report.gpu_duration.as_secs_f64() * 1_000.0,
-            download_ms: 0.0,
-            weight_upload_bytes: 0,
-            activation_upload_bytes: 2 * activation.len * std::mem::size_of::<f32>(),
-            download_bytes: 0,
-        });
+        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
+            self.dispatch_trace.len() + 1,
+            "gpu_dense",
+            "vector_add_gpu",
+            "vector_add",
+            activation.len,
+            activation.len,
+            activation.gpu_cache_hit,
+            activation.compile_duration,
+            Duration::ZERO,
+            activation.report.upload_duration,
+            activation.report.gpu_duration,
+            0,
+            2 * activation.len * std::mem::size_of::<f32>(),
+        ));
 
         let (runner, compile_duration, gpu_cache_hit) =
             self.model.get_or_create_final_norm_gpu()?;
@@ -3185,27 +3144,21 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.weight_upload_bytes += len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += 2 * len * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(final_norm.gpu_cache_hit);
-        self.dispatch_trace.push(PackedDispatchTrace {
-            index: self.dispatch_trace.len() + 1,
-            operation: "resident".to_string(),
-            path: "gpu_dense".to_string(),
-            stage: "post_attention_norm_gpu".to_string(),
-            tensor_name: "post_attention_layernorm.weight".to_string(),
-            rows: len,
-            cols: len,
-            pack_cache_hit: false,
-            gpu_cache_hit: final_norm.gpu_cache_hit,
-            cpu_ms: (final_norm.compile_duration + final_norm.report.upload_duration).as_secs_f64()
-                * 1_000.0,
-            compile_ms: final_norm.compile_duration.as_secs_f64() * 1_000.0,
-            weight_upload_ms: final_norm.report.upload_duration.as_secs_f64() * 1_000.0,
-            activation_upload_ms: 0.0,
-            gpu_ms: final_norm.report.gpu_duration.as_secs_f64() * 1_000.0,
-            download_ms: 0.0,
-            weight_upload_bytes: len * std::mem::size_of::<f32>(),
-            activation_upload_bytes: len * std::mem::size_of::<f32>(),
-            download_bytes: 0,
-        });
+        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
+            self.dispatch_trace.len() + 1,
+            "gpu_dense",
+            "post_attention_norm_gpu",
+            "post_attention_layernorm.weight",
+            len,
+            len,
+            final_norm.gpu_cache_hit,
+            final_norm.compile_duration,
+            final_norm.report.upload_duration,
+            Duration::ZERO,
+            final_norm.report.gpu_duration,
+            len * std::mem::size_of::<f32>(),
+            len * std::mem::size_of::<f32>(),
+        ));
 
         let pair_key = format!("concat::{first_name}||{second_name}");
         let (packed, pack_duration, pack_cache_hit) =

@@ -111,6 +111,46 @@ impl PackedDispatchTrace {
             download_bytes: 0,
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn resident_stage(
+        index: usize,
+        path: &str,
+        stage: &str,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+        gpu_cache_hit: bool,
+        compile_duration: std::time::Duration,
+        weight_upload_duration: std::time::Duration,
+        activation_upload_duration: std::time::Duration,
+        gpu_duration: std::time::Duration,
+        weight_upload_bytes: usize,
+        activation_upload_bytes: usize,
+    ) -> Self {
+        Self {
+            index,
+            operation: "resident".to_string(),
+            path: path.to_string(),
+            stage: stage.to_string(),
+            tensor_name: tensor_name.to_string(),
+            rows,
+            cols,
+            pack_cache_hit: false,
+            gpu_cache_hit,
+            cpu_ms: (compile_duration + weight_upload_duration + activation_upload_duration)
+                .as_secs_f64()
+                * 1_000.0,
+            compile_ms: compile_duration.as_secs_f64() * 1_000.0,
+            weight_upload_ms: weight_upload_duration.as_secs_f64() * 1_000.0,
+            activation_upload_ms: activation_upload_duration.as_secs_f64() * 1_000.0,
+            gpu_ms: gpu_duration.as_secs_f64() * 1_000.0,
+            download_ms: 0.0,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            download_bytes: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
