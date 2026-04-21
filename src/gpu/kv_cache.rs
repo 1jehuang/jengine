@@ -173,8 +173,7 @@ impl GpuKvCache {
             ));
         }
         let offset_bytes = self.len_tokens * self.kv_width * std::mem::size_of::<f32>();
-        self.copy_into_key_slot(key.buffer, key.buffer_size, offset_bytes)?;
-        self.copy_into_value_slot(value.buffer, value.buffer_size, offset_bytes)?;
+        self.copy_into_kv_slots(key, value, offset_bytes)?;
         self.len_tokens += 1;
         Ok(())
     }
@@ -258,18 +257,24 @@ impl GpuKvCache {
         Ok(())
     }
 
-    fn copy_into_value_slot(
+    fn copy_into_kv_slots(
         &self,
-        source_buffer: vk::Buffer,
-        source_buffer_size: u64,
+        key: &GpuResidentBuffer,
+        value: &GpuResidentBuffer,
         offset_bytes: usize,
     ) -> Result<(), GpuKvCacheError> {
         let byte_len = self.kv_width * std::mem::size_of::<f32>();
         let end = offset_bytes + byte_len;
-        if byte_len as u64 > source_buffer_size || end as u64 > self.value_buffer.size {
+        if byte_len as u64 > key.buffer_size || end as u64 > self.key_buffer.size {
+            return Err(GpuKvCacheError::Shape(format!(
+                "kv key copy [{}..{}) exceeds source {} or destination {}",
+                offset_bytes, end, key.buffer_size, self.key_buffer.size
+            )));
+        }
+        if byte_len as u64 > value.buffer_size || end as u64 > self.value_buffer.size {
             return Err(GpuKvCacheError::Shape(format!(
                 "kv value copy [{}..{}) exceeds source {} or destination {}",
-                offset_bytes, end, source_buffer_size, self.value_buffer.size
+                offset_bytes, end, value.buffer_size, self.value_buffer.size
             )));
         }
         let alloc = vk::CommandBufferAllocateInfo::default()
@@ -280,15 +285,25 @@ impl GpuKvCache {
         unsafe {
             self.device
                 .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
-            let region = [vk::BufferCopy::default()
+            let key_region = [vk::BufferCopy::default()
                 .src_offset(0)
                 .dst_offset(offset_bytes as u64)
                 .size(byte_len as u64)];
             self.device.cmd_copy_buffer(
                 copy_command,
-                source_buffer,
+                key.buffer,
+                self.key_buffer.buffer,
+                &key_region,
+            );
+            let value_region = [vk::BufferCopy::default()
+                .src_offset(0)
+                .dst_offset(offset_bytes as u64)
+                .size(byte_len as u64)];
+            self.device.cmd_copy_buffer(
+                copy_command,
+                value.buffer,
                 self.value_buffer.buffer,
-                &region,
+                &value_region,
             );
             self.device.end_command_buffer(copy_command)?;
             self.device.reset_fences(&[self.fence])?;

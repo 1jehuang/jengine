@@ -374,28 +374,13 @@ impl CachedGpuQkRopeRunner {
                 "qk rope tensor input shapes must match runner dimensions".to_string(),
             ));
         }
-        let copy_q_duration = self.copy_input_from_buffer(
-            &q.shared_context,
-            q.buffer,
-            q.buffer_size,
-            self.q_buffer.buffer,
-            self.q_buffer.size,
-            self.query_len,
-        )?;
-        let copy_k_duration = self.copy_input_from_buffer(
-            &k.shared_context,
-            k.buffer,
-            k.buffer_size,
-            self.k_buffer.buffer,
-            self.k_buffer.size,
-            self.key_len,
-        )?;
+        let copy_duration = self.copy_inputs_from_buffers(q, k)?;
         let upload_started = Instant::now();
         write_f32_buffer(&self.q_weight_buffer, q_weight)?;
         write_f32_buffer(&self.k_weight_buffer, k_weight)?;
         write_f32_buffer(&self.cos_buffer, cos)?;
         write_f32_buffer(&self.sin_buffer, sin)?;
-        let upload_duration = copy_q_duration + copy_k_duration + upload_started.elapsed();
+        let upload_duration = copy_duration + upload_started.elapsed();
         let gpu_duration = self.submit_and_wait()?;
         Ok(GpuQkRopeReport {
             query_len: self.query_len,
@@ -462,25 +447,30 @@ impl CachedGpuQkRopeRunner {
         Ok(gpu_started.elapsed())
     }
 
-    fn copy_input_from_buffer(
+    fn copy_inputs_from_buffers(
         &self,
-        source_context: &Arc<SharedGpuPackedContext>,
-        source_buffer: vk::Buffer,
-        source_buffer_size: u64,
-        destination_buffer: vk::Buffer,
-        destination_buffer_size: u64,
-        len: usize,
+        q: &GpuResidentBuffer,
+        k: &GpuResidentBuffer,
     ) -> Result<Duration, GpuQkRopeError> {
-        if !Arc::ptr_eq(&self._shared_context, source_context) {
+        if !Arc::ptr_eq(&self._shared_context, &q.shared_context)
+            || !Arc::ptr_eq(&self._shared_context, &k.shared_context)
+        {
             return Err(GpuQkRopeError::Shape(
                 "resident qk-rope chaining requires matching Vulkan context".to_string(),
             ));
         }
-        let byte_len = len * std::mem::size_of::<f32>();
-        if byte_len as u64 > source_buffer_size || byte_len as u64 > destination_buffer_size {
+        let q_byte_len = self.query_len * std::mem::size_of::<f32>();
+        let k_byte_len = self.key_len * std::mem::size_of::<f32>();
+        if q_byte_len as u64 > q.buffer_size || q_byte_len as u64 > self.q_buffer.size {
             return Err(GpuQkRopeError::Shape(format!(
-                "copy {} bytes exceeds source {} or destination {} buffer size",
-                byte_len, source_buffer_size, destination_buffer_size
+                "copy {} bytes exceeds query source {} or destination {} buffer size",
+                q_byte_len, q.buffer_size, self.q_buffer.size
+            )));
+        }
+        if k_byte_len as u64 > k.buffer_size || k_byte_len as u64 > self.k_buffer.size {
+            return Err(GpuQkRopeError::Shape(format!(
+                "copy {} bytes exceeds key source {} or destination {} buffer size",
+                k_byte_len, k.buffer_size, self.k_buffer.size
             )));
         }
         let alloc = vk::CommandBufferAllocateInfo::default()
@@ -491,9 +481,12 @@ impl CachedGpuQkRopeRunner {
         unsafe {
             self.device
                 .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
-            let region = [vk::BufferCopy::default().size(byte_len as u64)];
+            let q_region = [vk::BufferCopy::default().size(q_byte_len as u64)];
             self.device
-                .cmd_copy_buffer(copy_command, source_buffer, destination_buffer, &region);
+                .cmd_copy_buffer(copy_command, q.buffer, self.q_buffer.buffer, &q_region);
+            let k_region = [vk::BufferCopy::default().size(k_byte_len as u64)];
+            self.device
+                .cmd_copy_buffer(copy_command, k.buffer, self.k_buffer.buffer, &k_region);
             self.device.end_command_buffer(copy_command)?;
             self.device.reset_fences(&[self.fence])?;
         }
