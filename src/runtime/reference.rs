@@ -1449,6 +1449,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 || ReferenceModel::packed_use_gpu_tail()
                 || ReferenceModel::packed_use_gpu_full_last_layer())
         {
+            let _ = self.ensure_qk_rope_runner()?;
             for layer_idx in 0..self.model.config.num_hidden_layers {
                 let _ = self.ensure_gpu_kv_cache(layer_idx)?;
                 let _ = self.ensure_attention_block(layer_idx, 1)?;
