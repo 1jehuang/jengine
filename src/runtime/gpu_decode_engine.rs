@@ -627,6 +627,198 @@ impl<'a> PackedGpuSession<'a> {
             gpu_cache_hit,
         })
     }
+
+    pub(crate) fn run_projection_resident_from_packed_activation(
+        &mut self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+        activation: ResidentGpuPackedActivation,
+    ) -> Result<ResidentPackedProjection, ReferenceError> {
+        let prepared = self.prepare_projection_runner(tensor_name, rows, cols)?;
+        let report = prepared
+            .runner
+            .borrow_mut()
+            .run_resident_from_packed_buffer(
+                &activation.tensor.shared_context,
+                activation.tensor.buffer,
+                activation.tensor.len,
+                activation.tensor.buffer_size,
+            )
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu packed projection chaining failed for {tensor_name}: {error}"
+                ))
+            })?;
+        self.metrics.compile_duration += activation.compile_duration;
+        self.metrics.upload_duration += activation.upload_duration;
+        self.metrics.gpu_duration += activation.gpu_duration;
+        self.metrics.dispatch_count += 1;
+        self.metrics.gpu_cache_hits += usize::from(activation.gpu_cache_hit);
+        self.metrics.activation_upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
+        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
+            self.dispatch_trace.len() + 1,
+            "gpu_pack",
+            "pack_f16_pairs",
+            "pack_f16_pairs",
+            cols.div_ceil(2),
+            cols,
+            activation.gpu_cache_hit,
+            activation.compile_duration,
+            Duration::ZERO,
+            activation.upload_duration,
+            activation.gpu_duration,
+            0,
+            activation.logical_len * std::mem::size_of::<f32>(),
+        ));
+        let tensor = GpuResidentBuffer::new(
+            prepared.runner.borrow().shared_context().clone(),
+            prepared.runner.borrow().output_buffer_handle(),
+            rows,
+            prepared.runner.borrow().output_buffer_size(),
+        );
+        Ok(ResidentPackedProjection {
+            tensor_name: tensor_name.to_string(),
+            operation: "single_resident".to_string(),
+            rows,
+            cols,
+            tensor,
+            prepared,
+            report,
+        })
+    }
+
+    pub(crate) fn run_projection_from_packed_activation(
+        &mut self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+        activation: ResidentGpuPackedActivation,
+    ) -> Result<Vec<f32>, ReferenceError> {
+        let prepared = self.prepare_projection_runner(tensor_name, rows, cols)?;
+        let mut report = prepared
+            .runner
+            .borrow_mut()
+            .run_resident_from_packed_buffer(
+                &activation.tensor.shared_context,
+                activation.tensor.buffer,
+                activation.tensor.len,
+                activation.tensor.buffer_size,
+            )
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu packed projection chaining failed for {tensor_name}: {error}"
+                ))
+            })?;
+        let (output, download_duration) = prepared.runner.borrow().read_output().map_err(|error| {
+            ReferenceError::Decode(format!(
+                "gpu projection output download failed for {tensor_name}: {error}"
+            ))
+        })?;
+        report.download_duration = download_duration;
+        let weight_upload_bytes = usize::from(!prepared.gpu_cache_hit)
+            * (prepared.packed.code_words.len() * std::mem::size_of::<u32>()
+                + prepared.packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        self.account_projection_report(
+            &prepared.packed,
+            cols,
+            prepared.weight_upload_duration,
+            prepared.gpu_cache_hit,
+            &report,
+            rows * std::mem::size_of::<f32>(),
+        );
+        self.push_dispatch_trace(
+            tensor_name,
+            "single",
+            rows,
+            cols,
+            prepared.pack_cache_hit,
+            prepared.gpu_cache_hit,
+            prepared.compile_duration,
+            prepared.weight_upload_duration,
+            report.upload_duration,
+            report.gpu_duration,
+            report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            rows * std::mem::size_of::<f32>(),
+        );
+        Ok(output)
+    }
+
+    pub(crate) fn run_projection_add_residual(
+        &mut self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+        residual: &[f32],
+    ) -> Result<Vec<f32>, ReferenceError> {
+        if residual.len() != rows {
+            return Err(ReferenceError::Decode(format!(
+                "residual len {} must match rows {} for {tensor_name}",
+                residual.len(), rows
+            )));
+        }
+        let prepared = self.prepare_projection_runner(tensor_name, rows, cols)?;
+        let report = prepared
+            .runner
+            .borrow_mut()
+            .run_resident(input)
+            .map_err(|error| {
+                ReferenceError::Decode(format!("gpu projection failed for {tensor_name}: {error}"))
+            })?;
+        let download_started = Instant::now();
+        let summed = {
+            let runner_ref = prepared.runner.borrow();
+            let output = runner_ref.output_slice().map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection output borrow failed for {tensor_name}: {error}"
+                ))
+            })?;
+            residual
+                .iter()
+                .zip(output.iter())
+                .map(|(left, right)| left + right)
+                .collect::<Vec<_>>()
+        };
+        let report = crate::gpu::packed_matvec::GpuPackedMatvecReport {
+            download_duration: download_started.elapsed(),
+            ..report
+        };
+        let weight_upload_bytes = usize::from(!prepared.gpu_cache_hit)
+            * (prepared.packed.code_words.len() * std::mem::size_of::<u32>()
+                + prepared.packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        let download_bytes = rows * std::mem::size_of::<f32>();
+        self.account_projection_report(
+            &prepared.packed,
+            cols,
+            prepared.weight_upload_duration,
+            prepared.gpu_cache_hit,
+            &report,
+            download_bytes,
+        );
+        self.push_dispatch_trace(
+            tensor_name,
+            "single",
+            rows,
+            cols,
+            prepared.pack_cache_hit,
+            prepared.gpu_cache_hit,
+            prepared.compile_duration,
+            prepared.weight_upload_duration,
+            report.upload_duration,
+            report.gpu_duration,
+            report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            download_bytes,
+        );
+        Ok(summed)
+    }
 }
 
 impl<'a> PersistentPackedDecodeSession<'a> {
