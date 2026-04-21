@@ -7794,8 +7794,6 @@ impl ReferenceModel {
         }
 
         let (cos, sin) = rope_cos_sin(&self.rope, &[position]);
-        *resident_decode_state = PackedResidentDecodeState::default();
-
         for (layer_idx, layer_cache) in cache
             .iter_mut()
             .enumerate()

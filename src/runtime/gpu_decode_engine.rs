@@ -163,6 +163,7 @@ impl<'a> PersistentPackedDecodeSession<'a> {
     }
 
     fn step_token(&mut self, token_id: usize) -> Result<PackedDecodeStepResult, ReferenceError> {
+        self.resident_decode_state = PackedResidentDecodeState::default();
         let result = self.model.forward_step_packed_decode(
             token_id,
             self.next_position,
