@@ -4,7 +4,9 @@ use crate::runtime::gpu_decode_metrics::{
     DecodeMetrics, PackedAttentionStageMetrics, PackedDecodeMetrics, PackedMlpStageMetrics,
 };
 use crate::runtime::gpu_decode_output::PackedDecodeResult;
-use crate::runtime::gpu_decode_session_state::{LayerCache, PackedDecodeStepResult};
+use crate::runtime::gpu_decode_session_state::{
+    LayerCache, PackedDecodeStepResult, allocate_layer_cache_vec,
+};
 use crate::runtime::reference::{GpuFirstRunnerCache, PackedGpuSession, ReferenceModel};
 use crate::runtime::reference_error::ReferenceError;
 
@@ -66,6 +68,48 @@ pub struct GpuFirstPackedDecodeSession<'a> {
 }
 
 impl<'a> PersistentPackedDecodeSession<'a> {
+    pub(crate) fn new_with_cpu_kv_preallocation(
+        model: &'a ReferenceModel,
+        expected_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        argmax_only: bool,
+        preallocate_cpu_kv: bool,
+    ) -> Self {
+        Self {
+            model,
+            cache: allocate_layer_cache_vec(
+                model.config.num_hidden_layers,
+                expected_tokens,
+                model.config.num_key_value_heads * model.config.head_dim,
+                preallocate_cpu_kv,
+            ),
+            gpu_session: PackedGpuSession::new(model),
+            gpu_first_session: GpuFirstRunnerCache::new(model, expected_tokens),
+            metrics: DecodeMetrics {
+                prompt_tokens: 0,
+                generated_tokens: 0,
+                total_duration: std::time::Duration::ZERO,
+                embedding_duration: std::time::Duration::ZERO,
+                norm_duration: std::time::Duration::ZERO,
+                qkv_duration: std::time::Duration::ZERO,
+                attention_duration: std::time::Duration::ZERO,
+                mlp_duration: std::time::Duration::ZERO,
+                logits_duration: std::time::Duration::ZERO,
+            },
+            attention_stage_metrics: PackedAttentionStageMetrics::default(),
+            mlp_stage_metrics: PackedMlpStageMetrics::default(),
+            non_offloaded_dense_duration: std::time::Duration::ZERO,
+            next_position: 0,
+            use_attention_qkv,
+            use_mlp_gu,
+            use_attention_full: use_attention_qkv
+                && crate::runtime::gpu_decode_env::packed_use_attention_full(),
+            use_mlp_full: use_mlp_gu && crate::runtime::gpu_decode_env::packed_use_mlp_full(),
+            argmax_only,
+        }
+    }
+
     pub(crate) fn new(
         model: &'a ReferenceModel,
         expected_tokens: usize,
@@ -81,6 +125,15 @@ impl<'a> PersistentPackedDecodeSession<'a> {
             argmax_only,
             true,
         )
+    }
+
+    pub(crate) fn set_full_modes(&mut self, use_attention_full: bool, use_mlp_full: bool) {
+        self.use_attention_full = use_attention_full;
+        self.use_mlp_full = use_mlp_full;
+    }
+
+    pub fn dispatch_trace(&self) -> &[crate::runtime::gpu_decode_output::PackedDispatchTrace] {
+        &self.gpu_session.dispatch_trace
     }
 
     pub(crate) fn next_position(&self) -> usize {

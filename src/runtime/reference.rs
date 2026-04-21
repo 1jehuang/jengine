@@ -30,7 +30,6 @@ use crate::runtime::gpu_decode_env::{
     packed_use_gpu_full_last_layer, packed_use_gpu_mlp_entry, packed_use_gpu_swiglu_block,
     packed_use_gpu_tail, packed_use_mlp_full,
 };
-use crate::runtime::gpu_decode_engine::PersistentPackedDecodeSession;
 use crate::runtime::gpu_decode_metrics::{
     AttentionProjectionMixMetrics, DecodeMetrics, HybridDecodeMetrics,
     HybridProjectionDecodeMetrics, MlpProjectionMixMetrics, PackedAttentionStageMetrics,
@@ -135,58 +134,6 @@ type GpuSwigluBlockExecution = (
     Instant,
 );
 
-impl<'a> PersistentPackedDecodeSession<'a> {
-    pub(crate) fn new_with_cpu_kv_preallocation(
-        model: &'a ReferenceModel,
-        expected_tokens: usize,
-        use_attention_qkv: bool,
-        use_mlp_gu: bool,
-        argmax_only: bool,
-        preallocate_cpu_kv: bool,
-    ) -> Self {
-        Self {
-            model,
-            cache: allocate_layer_cache_vec(
-                model.config.num_hidden_layers,
-                expected_tokens,
-                model.config.num_key_value_heads * model.config.head_dim,
-                preallocate_cpu_kv,
-            ),
-            gpu_session: PackedGpuSession::new(model),
-            gpu_first_session: GpuFirstRunnerCache::new(model, expected_tokens),
-            metrics: DecodeMetrics {
-                prompt_tokens: 0,
-                generated_tokens: 0,
-                total_duration: Duration::ZERO,
-                embedding_duration: Duration::ZERO,
-                norm_duration: Duration::ZERO,
-                qkv_duration: Duration::ZERO,
-                attention_duration: Duration::ZERO,
-                mlp_duration: Duration::ZERO,
-                logits_duration: Duration::ZERO,
-            },
-            attention_stage_metrics: PackedAttentionStageMetrics::default(),
-            mlp_stage_metrics: PackedMlpStageMetrics::default(),
-            non_offloaded_dense_duration: Duration::ZERO,
-            next_position: 0,
-            use_attention_qkv,
-            use_mlp_gu,
-            use_attention_full: use_attention_qkv && packed_use_attention_full(),
-            use_mlp_full: use_mlp_gu && packed_use_mlp_full(),
-            argmax_only,
-        }
-    }
-
-    pub(crate) fn set_full_modes(&mut self, use_attention_full: bool, use_mlp_full: bool) {
-        self.use_attention_full = use_attention_full;
-        self.use_mlp_full = use_mlp_full;
-    }
-
-    pub fn dispatch_trace(&self) -> &[PackedDispatchTrace] {
-        &self.gpu_session.dispatch_trace
-    }
-}
-
 pub(crate) struct GpuFirstRunnerCache<'a> {
     model: &'a ReferenceModel,
     kv_capacity_tokens: usize,
@@ -203,7 +150,7 @@ pub(crate) struct GpuFirstRunnerCache<'a> {
 }
 
 impl<'a> GpuFirstRunnerCache<'a> {
-    fn new(model: &'a ReferenceModel, expected_tokens: usize) -> Self {
+    pub(crate) fn new(model: &'a ReferenceModel, expected_tokens: usize) -> Self {
         Self {
             model,
             kv_capacity_tokens: expected_tokens,
@@ -1810,7 +1757,7 @@ enum PackedDecodeLayerStepOutcome {
 }
 
 impl<'a> PackedGpuSession<'a> {
-    fn new(model: &'a ReferenceModel) -> Self {
+    pub(crate) fn new(model: &'a ReferenceModel) -> Self {
         Self {
             model,
             metrics: PackedGpuSessionMetrics::default(),
