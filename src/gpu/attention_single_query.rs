@@ -379,6 +379,18 @@ impl CachedGpuAttentionSingleQueryRunner {
             },
         ))
     }
+
+    pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> {
+        &self._shared_context
+    }
+
+    pub fn output_buffer_handle(&self) -> vk::Buffer {
+        self.output_buffer.buffer
+    }
+
+    pub fn output_buffer_size(&self) -> u64 {
+        self.output_buffer.size
+    }
 }
 
 impl CachedGpuAttentionSingleQueryRunner {
