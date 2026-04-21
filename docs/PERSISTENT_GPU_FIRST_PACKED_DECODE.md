@@ -98,28 +98,56 @@ So the next architectural focus should be:
 2. keep moving dense CPU glue off the host path
 3. collapse dispatch count once the GPU-first branch is stable
 
-### Current bundled branch matrix checkpoint
+### Hotspot summarizer helper
 
-The current bundled profiler script is:
+A helper script now exists to summarize per-stage hotspots from `profile_packed_decode` JSON output:
 
-- `scripts/profile_gpu_first_matrix.sh`
+- `scripts/summarize_packed_profile_hotspots.py <profile.json> [top_n]`
 
-A fresh matrix capture was written to:
+Using it on the latest matrix checkpoint makes the blocker hierarchy much clearer.
 
-- `.artifacts/gpu-first-matrix/20260421-000412/`
+#### Strong packed baseline hotspot summary
 
-with summary:
+From `.artifacts/gpu-first-matrix/20260421-000412/strong_packed.json`:
 
-- `strong_packed`: `426.096 ms` total, `199.039 ms` GPU, `34.196 ms` download, `45.452 ms` compile, `102.299 ms` non-offloaded dense, `226` dispatches
-- `gpu_full_last_layer`: `542.730 ms` total, `299.385 ms` GPU, `43.097 ms` download, `19.257 ms` compile, `106.955 ms` non-offloaded dense, `238` dispatches
-- `gpu_attention_swiglu_block`: `38444.302 ms` total, `2096.847 ms` GPU, `25.174 ms` download, `35840.335 ms` compile, `80.458 ms` non-offloaded dense, `58` dispatches
+- `logits_argmax`: `130.659 ms` total
+  - `49.867 ms` CPU
+  - `24.744 ms` GPU
+  - `10.597 ms` download
+  - `45.452 ms` compile
+- `mlp_gu`: `84.032 ms`
+- `mlp_down`: `45.770 ms`
+- `attention_qkv`: `40.573 ms`
+- `attention_oproj`: `27.718 ms`
+- dense CPU glue still led by:
+  - `mlp_swiglu`: `8.110 ms`
+  - `qk_norm_rope`: `5.543 ms`
+  - `attention_core`: `4.454 ms`
 
-Interpretation:
+#### Full-last-layer branch hotspot summary
 
-- the broad attention+swiglu block path remains unusable
-- the latest branch matrix is noisier than the previous checkpoint, but it still shows that the real remaining bottlenecks are not hot-path compile in the viable branches
-- the strongest recent localized win is on logits-side mapped-buffer handling: `argmax_f32_buffer` now copies into normal RAM and uses a parallel scan for large vocab buffers, which helps keep logits download/scan cost from dominating as badly as direct mapped-memory traversal
-- the practical next focus remains reducing CPU dense glue and dispatch count in the viable strong-packed and full-last-layer branches
+From `.artifacts/gpu-first-matrix/20260421-000412/gpu_full_last_layer.json`:
+
+- `mlp_gu`: `157.852 ms`
+- `logits_argmax`: `85.806 ms` total
+  - `25.673 ms` CPU
+  - `26.103 ms` GPU
+  - `14.772 ms` download
+  - `19.257 ms` compile
+- `mlp_down`: `57.757 ms`
+- `attention_qkv`: `45.951 ms`
+- `attention_oproj`: `34.365 ms`
+- dense CPU glue still led by:
+  - `mlp_swiglu`: `9.140 ms`
+  - `qk_norm_rope`: `6.295 ms`
+  - `attention_core`: `5.231 ms`
+
+This reinforces that the remaining meaningful work is now concentrated in:
+
+1. `logits_argmax`
+2. packed matvec-heavy MLP tail work
+3. a smaller but still real band of dense CPU glue
+4. dispatch-count reduction after the viable branch is stable
 
 
 ## Current architecture
