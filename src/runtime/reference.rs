@@ -659,6 +659,41 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
         self.inner.next_position
     }
 
+    pub(crate) fn has_qk_rope_runner(&self) -> bool {
+        self.inner.gpu_first_session.qk_rope_runner.is_some()
+    }
+
+    pub(crate) fn has_raw_f32_projection_runner(&self, key: &str) -> bool {
+        self.inner
+            .gpu_first_session
+            .raw_f32_projection_runners
+            .contains_key(key)
+    }
+
+    pub(crate) fn gpu_kv_len_tokens(&self, layer_idx: usize) -> Option<usize> {
+        self.inner
+            .gpu_first_session
+            .gpu_kv_caches
+            .get(&layer_idx)
+            .map(|cache| cache.len_tokens())
+    }
+
+    pub(crate) fn has_attention_block(&self, layer_idx: usize) -> bool {
+        self.inner.gpu_first_session.attention_blocks.contains_key(&layer_idx)
+    }
+
+    pub(crate) fn has_mlp_block(&self, layer_idx: usize) -> bool {
+        self.inner.gpu_first_session.mlp_blocks.contains_key(&layer_idx)
+    }
+
+    pub(crate) fn has_tail_block(&self) -> bool {
+        self.inner.gpu_first_session.tail_block.is_some()
+    }
+
+    pub(crate) fn has_full_last_layer_block(&self) -> bool {
+        self.inner.gpu_first_session.full_last_layer_block.is_some()
+    }
+
     pub fn finish_metrics(
         self,
         enabled_projections: String,
@@ -8984,11 +9019,7 @@ mod tests {
         assert!(session.inner.cache[0].keys.is_empty());
         assert!(session.inner.cache[0].values.is_empty());
         assert!(
-            session
-                .inner
-                .gpu_first_session
-                .attention_blocks
-                .contains_key(&0)
+            session.has_attention_block(0)
         );
     }
 
@@ -9061,11 +9092,7 @@ mod tests {
             model.layer_tensors[0].v_proj_weight,
         );
         assert!(
-            session
-                .inner
-                .gpu_first_session
-                .raw_f32_projection_runners
-                .contains_key(&expected_key)
+            session.has_raw_f32_projection_runner(&expected_key)
         );
     }
 
@@ -9115,44 +9142,24 @@ mod tests {
             model.layer_tensors[0].v_proj_weight,
         );
         assert!(
-            session
-                .inner
-                .gpu_first_session
-                .raw_f32_projection_runners
-                .contains_key(&expected_q_key)
+            session.has_raw_f32_projection_runner(&expected_q_key)
         );
         assert!(
-            session
-                .inner
-                .gpu_first_session
-                .raw_f32_projection_runners
-                .contains_key(&expected_k_key)
+            session.has_raw_f32_projection_runner(&expected_k_key)
         );
         assert!(
-            session
-                .inner
-                .gpu_first_session
-                .raw_f32_projection_runners
-                .contains_key(&expected_v_key)
+            session.has_raw_f32_projection_runner(&expected_v_key)
         );
         assert!(
-            !session
-                .inner
-                .gpu_first_session
-                .raw_f32_projection_runners
-                .contains_key(&legacy_triplet_key)
+            !session.has_raw_f32_projection_runner(&legacy_triplet_key)
         );
-        assert!(session.inner.gpu_first_session.qk_rope_runner.is_some());
+        assert!(session.has_qk_rope_runner());
         assert!(session.inner.cache[0].keys.is_empty());
         assert!(session.inner.cache[0].values.is_empty());
         assert_eq!(
             session
-                .inner
-                .gpu_first_session
-                .gpu_kv_caches
-                .get(&0)
-                .expect("layer 0 gpu kv cache should exist")
-                .len_tokens(),
+                .gpu_kv_len_tokens(0)
+                .expect("layer 0 gpu kv cache should exist"),
             1
         );
     }
@@ -9196,25 +9203,13 @@ mod tests {
             model.layer_tensors[1].v_proj_weight,
         );
         assert!(
-            session
-                .inner
-                .gpu_first_session
-                .raw_f32_projection_runners
-                .contains_key(&expected_q_key)
+            session.has_raw_f32_projection_runner(&expected_q_key)
         );
         assert!(
-            session
-                .inner
-                .gpu_first_session
-                .raw_f32_projection_runners
-                .contains_key(&expected_k_key)
+            session.has_raw_f32_projection_runner(&expected_k_key)
         );
         assert!(
-            session
-                .inner
-                .gpu_first_session
-                .raw_f32_projection_runners
-                .contains_key(&expected_v_key)
+            session.has_raw_f32_projection_runner(&expected_v_key)
         );
         assert!(session.inner.cache[0].keys.is_empty());
         assert!(session.inner.cache[0].values.is_empty());
@@ -9222,22 +9217,14 @@ mod tests {
         assert!(session.inner.cache[1].values.is_empty());
         assert_eq!(
             session
-                .inner
-                .gpu_first_session
-                .gpu_kv_caches
-                .get(&0)
-                .expect("layer 0 gpu kv cache should exist")
-                .len_tokens(),
+                .gpu_kv_len_tokens(0)
+                .expect("layer 0 gpu kv cache should exist"),
             1
         );
         assert_eq!(
             session
-                .inner
-                .gpu_first_session
-                .gpu_kv_caches
-                .get(&1)
-                .expect("layer 1 gpu kv cache should exist")
-                .len_tokens(),
+                .gpu_kv_len_tokens(1)
+                .expect("layer 1 gpu kv cache should exist"),
             1
         );
     }
@@ -9266,7 +9253,7 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when gpu mlp is enabled");
         };
-        assert!(session.inner.gpu_first_session.mlp_blocks.contains_key(&0));
+        assert!(session.has_mlp_block(0));
     }
 
     #[test]
@@ -9290,7 +9277,7 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when gpu mlp is enabled");
         };
-        assert!(session.inner.gpu_first_session.mlp_blocks.contains_key(&0));
+        assert!(session.has_mlp_block(0));
     }
 
     #[test]
@@ -9314,7 +9301,7 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when gpu tail is enabled");
         };
-        assert!(session.inner.gpu_first_session.tail_block.is_some());
+        assert!(session.has_tail_block());
     }
 
     #[test]
@@ -9343,13 +9330,9 @@ mod tests {
             panic!("gpu-first session should be selected when gpu attention tail is enabled");
         };
         assert!(
-            session
-                .inner
-                .gpu_first_session
-                .attention_blocks
-                .contains_key(&0)
+            session.has_attention_block(0)
         );
-        assert!(session.inner.gpu_first_session.tail_block.is_some());
+        assert!(session.has_tail_block());
     }
 
     #[test]
@@ -9377,8 +9360,8 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when gpu mlp tail is enabled");
         };
-        assert!(session.inner.gpu_first_session.mlp_blocks.contains_key(&0));
-        assert!(session.inner.gpu_first_session.tail_block.is_some());
+        assert!(session.has_mlp_block(0));
+        assert!(session.has_tail_block());
     }
 
     #[test]
@@ -9409,11 +9392,7 @@ mod tests {
             panic!("gpu-first session should be selected when gpu full last layer is enabled");
         };
         assert!(
-            session
-                .inner
-                .gpu_first_session
-                .full_last_layer_block
-                .is_some()
+            session.has_full_last_layer_block()
         );
         assert!(session.inner.cache[0].keys.is_empty());
         assert!(session.inner.cache[0].values.is_empty());
@@ -9421,22 +9400,14 @@ mod tests {
         assert!(session.inner.cache[1].values.is_empty());
         assert_eq!(
             session
-                .inner
-                .gpu_first_session
-                .gpu_kv_caches
-                .get(&0)
-                .expect("layer 0 gpu kv cache should exist")
-                .len_tokens(),
+                .gpu_kv_len_tokens(0)
+                .expect("layer 0 gpu kv cache should exist"),
             1
         );
         assert_eq!(
             session
-                .inner
-                .gpu_first_session
-                .gpu_kv_caches
-                .get(&1)
-                .expect("layer 1 gpu kv cache should exist")
-                .len_tokens(),
+                .gpu_kv_len_tokens(1)
+                .expect("layer 1 gpu kv cache should exist"),
             1
         );
     }
@@ -9566,25 +9537,13 @@ mod tests {
             model.layer_tensors[0].v_proj_weight,
         );
         assert!(
-            session
-                .inner
-                .gpu_first_session
-                .raw_f32_projection_runners
-                .contains_key(&expected_q_key)
+            session.has_raw_f32_projection_runner(&expected_q_key)
         );
         assert!(
-            session
-                .inner
-                .gpu_first_session
-                .raw_f32_projection_runners
-                .contains_key(&expected_k_key)
+            session.has_raw_f32_projection_runner(&expected_k_key)
         );
         assert!(
-            session
-                .inner
-                .gpu_first_session
-                .raw_f32_projection_runners
-                .contains_key(&expected_v_key)
+            session.has_raw_f32_projection_runner(&expected_v_key)
         );
         for (layer_idx, layer_cache) in session.inner.cache.iter().enumerate().take(2) {
             assert!(layer_cache.cpu_kv_is_empty());
