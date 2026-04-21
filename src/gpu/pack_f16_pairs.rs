@@ -261,13 +261,15 @@ impl CachedGpuPackF16PairsRunner {
         source_len: usize,
         source_buffer_size: u64,
     ) -> Result<GpuPackF16PairsReport, GpuPackF16PairsError> {
-        let upload_duration = self.copy_input_from_buffer(
+        let upload_started = Instant::now();
+        self.copy_input_from_buffer(
             source_context,
             source_buffer,
             source_len,
             source_buffer_size,
         )?;
-        let gpu_duration = self.submit_and_wait()?;
+        let upload_duration = upload_started.elapsed();
+        let gpu_duration = self.submit_copy_and_compute_and_wait()?;
         Ok(GpuPackF16PairsReport {
             len: self.len,
             compile_duration: Duration::ZERO,
@@ -293,13 +295,10 @@ impl CachedGpuPackF16PairsRunner {
         self.output_buffer.size
     }
 
-    fn submit_and_wait(&self) -> Result<Duration, GpuPackF16PairsError> {
-        let submit_info = [
-            vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer))
-        ];
-        unsafe {
-            self.device.reset_fences(&[self.fence])?;
-        }
+    fn submit_copy_and_compute_and_wait(&self) -> Result<Duration, GpuPackF16PairsError> {
+        unsafe { self.device.reset_fences(&[self.fence])? };
+        let command_buffers = [self.copy_command_buffer, self.command_buffer];
+        let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
         let gpu_started = Instant::now();
         unsafe {
             self.device
@@ -315,7 +314,7 @@ impl CachedGpuPackF16PairsRunner {
         source_buffer: vk::Buffer,
         source_len: usize,
         source_buffer_size: u64,
-    ) -> Result<Duration, GpuPackF16PairsError> {
+    ) -> Result<(), GpuPackF16PairsError> {
         if source_len != self.len {
             return Err(GpuPackF16PairsError::Shape(format!(
                 "source len {} does not match destination len {}",
@@ -347,18 +346,26 @@ impl CachedGpuPackF16PairsRunner {
                 self.input_buffer.buffer,
                 &region,
             );
+            let barrier = [vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(self.input_buffer.buffer)
+                .offset(0)
+                .size(byte_len as u64)];
+            self.device.cmd_pipeline_barrier(
+                copy_command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &barrier,
+                &[],
+            );
             self.device.end_command_buffer(copy_command)?;
-            self.device.reset_fences(&[self.fence])?;
         }
-        let submit_info =
-            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
-        let started = Instant::now();
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &submit_info, self.fence)?;
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
-        Ok(started.elapsed())
+        Ok(())
     }
 }
 
