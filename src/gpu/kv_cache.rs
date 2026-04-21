@@ -107,6 +107,26 @@ impl GpuKvCache {
         self.len_tokens
     }
 
+    pub fn kv_width(&self) -> usize {
+        self.kv_width
+    }
+
+    pub fn key_buffer_handle(&self) -> vk::Buffer {
+        self.key_buffer.buffer
+    }
+
+    pub fn value_buffer_handle(&self) -> vk::Buffer {
+        self.value_buffer.buffer
+    }
+
+    pub fn key_buffer_size(&self) -> u64 {
+        self.key_buffer.size
+    }
+
+    pub fn value_buffer_size(&self) -> u64 {
+        self.value_buffer.size
+    }
+
     pub fn snapshot_keys(&self) -> Result<Vec<f32>, GpuKvCacheError> {
         read_f32_prefix(&self.key_buffer, self.len_tokens * self.kv_width)
     }

@@ -416,6 +416,52 @@ impl CachedGpuAttentionSingleQueryRunner {
         })
     }
 
+    pub fn run_resident_with_query_and_kv_buffers(
+        &mut self,
+        query: &[f32],
+        source_context: &Arc<SharedGpuPackedContext>,
+        key_buffer: vk::Buffer,
+        key_len: usize,
+        key_buffer_size: u64,
+        value_buffer: vk::Buffer,
+        value_len: usize,
+        value_buffer_size: u64,
+    ) -> Result<GpuAttentionSingleQueryReport, GpuAttentionSingleQueryError> {
+        if query.len() != self.query_len || key_len != self.kv_len || value_len != self.kv_len {
+            return Err(GpuAttentionSingleQueryError::Shape(format!(
+                "query len {}, key len {}, value len {} must match {}, {}, {}",
+                query.len(),
+                key_len,
+                value_len,
+                self.query_len,
+                self.kv_len,
+                self.kv_len
+            )));
+        }
+        let query_upload_started = Instant::now();
+        write_f32_buffer(&self.query_buffer, query)?;
+        let query_upload_duration = query_upload_started.elapsed();
+        let kv_copy_duration = self.copy_kv_from_buffers(
+            source_context,
+            key_buffer,
+            key_buffer_size,
+            value_buffer,
+            value_buffer_size,
+        )?;
+        let upload_duration = query_upload_duration + kv_copy_duration;
+        let gpu_duration = self.submit_and_wait()?;
+        Ok(GpuAttentionSingleQueryReport {
+            query_len: self.query_len,
+            seq_len: self.seq_len,
+            compile_duration: Duration::ZERO,
+            upload_duration,
+            gpu_duration,
+            download_duration: Duration::ZERO,
+            max_abs_diff: 0.0,
+            mean_abs_diff: 0.0,
+        })
+    }
+
     pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> {
         &self._shared_context
     }
@@ -442,6 +488,64 @@ impl CachedGpuAttentionSingleQueryRunner {
             self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
         }
         Ok(gpu_started.elapsed())
+    }
+
+    fn copy_kv_from_buffers(
+        &self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        key_buffer: vk::Buffer,
+        key_buffer_size: u64,
+        value_buffer: vk::Buffer,
+        value_buffer_size: u64,
+    ) -> Result<Duration, GpuAttentionSingleQueryError> {
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuAttentionSingleQueryError::Shape(
+                "resident KV chaining requires runners to share the same Vulkan context"
+                    .to_string(),
+            ));
+        }
+        let byte_len = self.kv_len * std::mem::size_of::<f32>();
+        if byte_len as u64 > key_buffer_size
+            || byte_len as u64 > value_buffer_size
+            || byte_len as u64 > self.keys_buffer.size
+            || byte_len as u64 > self.values_buffer.size
+        {
+            return Err(GpuAttentionSingleQueryError::Shape(format!(
+                "kv copy {} bytes exceeds source or destination buffer sizes",
+                byte_len
+            )));
+        }
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let copy_command = unsafe { self.device.allocate_command_buffers(&alloc)?[0] };
+        unsafe {
+            self.device
+                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
+            let region = [vk::BufferCopy::default().size(byte_len as u64)];
+            self.device
+                .cmd_copy_buffer(copy_command, key_buffer, self.keys_buffer.buffer, &region);
+            self.device.cmd_copy_buffer(
+                copy_command,
+                value_buffer,
+                self.values_buffer.buffer,
+                &region,
+            );
+            self.device.end_command_buffer(copy_command)?;
+            self.device.reset_fences(&[self.fence])?;
+        }
+        let submit_info =
+            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
+        let started = Instant::now();
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.device
+                .free_command_buffers(self.command_pool, &[copy_command]);
+        }
+        Ok(started.elapsed())
     }
 }
 

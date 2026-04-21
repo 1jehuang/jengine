@@ -927,6 +927,23 @@ impl<'a> GpuFirstRunnerCache<'a> {
             })
     }
 
+    fn gpu_kv_state(
+        &self,
+        layer_idx: usize,
+    ) -> Option<(vk::Buffer, usize, u64, vk::Buffer, usize, u64)> {
+        self.gpu_kv_caches.get(&layer_idx).map(|cache| {
+            let kv_len = cache.len_tokens() * cache.kv_width();
+            (
+                cache.key_buffer_handle(),
+                kv_len,
+                cache.key_buffer_size(),
+                cache.value_buffer_handle(),
+                kv_len,
+                cache.value_buffer_size(),
+            )
+        })
+    }
+
     fn packed_linear_spec(
         &self,
         tensor_name: &str,
@@ -1149,11 +1166,29 @@ impl<'a> GpuFirstRunnerCache<'a> {
         residual: &[f32],
         post_norm_weight: &[f32],
     ) -> Result<(Vec<f32>, GpuAttentionBlockReport, GpuMlpBlockReport, Duration, Duration), ReferenceError> {
+        let kv_state = self.gpu_kv_state(layer_idx);
         let (attention_compile_duration, attention_block) =
             self.ensure_attention_block(layer_idx, seq_len)?;
-        let attention_report = attention_block
-            .run_resident(q, keys, values, residual)
-            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let attention_report = if let Some((key_buffer, key_len, key_buffer_size, value_buffer, value_len, value_buffer_size)) =
+            kv_state
+        {
+            attention_block
+                .run_with_resident_kv(
+                    q,
+                    key_buffer,
+                    key_len,
+                    key_buffer_size,
+                    value_buffer,
+                    value_len,
+                    value_buffer_size,
+                    residual,
+                )
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+        } else {
+            attention_block
+                .run_resident(q, keys, values, residual)
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+        };
         let attention_context = attention_block.shared_context().clone();
         let attention_output = attention_block.output_buffer_handle();
         let attention_output_size = attention_block.output_buffer_size();
@@ -1194,11 +1229,29 @@ impl<'a> GpuFirstRunnerCache<'a> {
         post_norm_weight: &[f32],
         final_norm_weight: &[f32],
     ) -> Result<(usize, GpuAttentionBlockReport, GpuFullLastLayerReport, Duration), ReferenceError> {
+        let kv_state = self.gpu_kv_state(layer_idx);
         let (attention_compile_duration, attention_block) =
             self.ensure_attention_block(layer_idx, seq_len)?;
-        let attention_report = attention_block
-            .run_resident(q, keys, values, residual)
-            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let attention_report = if let Some((key_buffer, key_len, key_buffer_size, value_buffer, value_len, value_buffer_size)) =
+            kv_state
+        {
+            attention_block
+                .run_with_resident_kv(
+                    q,
+                    key_buffer,
+                    key_len,
+                    key_buffer_size,
+                    value_buffer,
+                    value_len,
+                    value_buffer_size,
+                    residual,
+                )
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+        } else {
+            attention_block
+                .run_resident(q, keys, values, residual)
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+        };
         let attention_context = attention_block.shared_context().clone();
         let attention_output = attention_block.output_buffer_handle();
         let attention_output_size = attention_block.output_buffer_size();
