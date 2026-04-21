@@ -576,7 +576,8 @@ mod tests {
     use super::{
         PackedModelStore, benchmark_packed_model_artifact, build_artifact_layout,
         build_packable_tensor_specs, load_packed_model_manifest, sha256_hex_for_path,
-        validate_packed_model_artifact, validate_packed_model_manifest, write_packed_model_artifact,
+        validate_packed_model_artifact, validate_packed_model_manifest,
+        write_packed_model_artifact,
     };
     use crate::model::config::BonsaiModelConfig;
     use std::fs;
@@ -683,8 +684,14 @@ mod tests {
         let validation = validate_packed_model_artifact(root.path(), out.path()).unwrap();
         let bench = benchmark_packed_model_artifact(out.path()).unwrap();
         let expected_sha = sha256_hex_for_path(&root.path().join("model.safetensors")).unwrap();
-        assert_eq!(manifest.source_file_sha256.as_deref(), Some(expected_sha.as_str()));
-        assert_eq!(loaded.source_file_sha256.as_deref(), Some(expected_sha.as_str()));
+        assert_eq!(
+            manifest.source_file_sha256.as_deref(),
+            Some(expected_sha.as_str())
+        );
+        assert_eq!(
+            loaded.source_file_sha256.as_deref(),
+            Some(expected_sha.as_str())
+        );
         assert_eq!(manifest.entries.len(), 8);
         assert_eq!(summary.entry_count, 8);
         assert_eq!(validation.checked_entries, 8);
