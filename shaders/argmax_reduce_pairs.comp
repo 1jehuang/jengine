@@ -1,0 +1,48 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer InputBuffer {
+    uvec2 input_data[];
+};
+
+layout(std430, binding = 1) writeonly buffer OutputBuffer {
+    uvec2 output_data[];
+};
+
+shared float shared_values[256];
+shared uint shared_indices[256];
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+
+    float value = -3.402823466e+38;
+    uint index = 0xffffffffu;
+    if (gid < input_data.length()) {
+        uvec2 pair = input_data[gid];
+        value = uintBitsToFloat(pair.x);
+        index = pair.y;
+    }
+
+    shared_values[lid] = value;
+    shared_indices[lid] = index;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            float other_value = shared_values[lid + stride];
+            uint other_index = shared_indices[lid + stride];
+            if (other_value > shared_values[lid] ||
+                (other_value == shared_values[lid] && other_index < shared_indices[lid])) {
+                shared_values[lid] = other_value;
+                shared_indices[lid] = other_index;
+            }
+        }
+        barrier();
+    }
+
+    if (lid == 0u) {
+        output_data[0] = uvec2(floatBitsToUint(shared_values[0]), shared_indices[0]);
+    }
+}
