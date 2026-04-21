@@ -16,21 +16,21 @@ Strong current configuration:
 
 Observed direct benchmark:
 
-- iteration 1: `352.139 ms`, `2.840 tok/s`
-- iteration 2: `278.126 ms`, `3.595 tok/s`
-- average: `315.133 ms`, `3.218 tok/s`
+- iteration 1: `402.967 ms`, `2.481 tok/s`
+- iteration 2: `377.574 ms`, `2.649 tok/s`
+- average: `390.270 ms`, `2.562 tok/s`
 
 ### Explicit one-token packed step
 
 Same strong configuration on an explicit one-token step:
 
-- total: `184.738 ms`
-- throughput: about `5.41 tok/s`
-- `gpu_ms=129.879`
-- `download_ms=36.109`
-- `non_offloaded_dense_ms=17.041`
-- `orchestration_ms=1.658`
-- `dispatch_count=113`
+- total: `385.757 ms`
+- throughput: about `2.59 tok/s`
+- `gpu_ms=207.394`
+- `download_ms=99.307`
+- `non_offloaded_dense_ms=73.934`
+- `orchestration_ms=5.015`
+- `dispatch_count=226`
 
 ## Current architecture
 
@@ -79,9 +79,9 @@ The current runtime does not satisfy those assumptions.
 
 Even after recent wins, the explicit one-token step still has:
 
-- `113` dispatches
-- `36 ms` download time
-- about `130 ms` GPU time
+- `226` dispatches
+- `99 ms` download time
+- about `207 ms` GPU time
 
 That is already enough to show that the current architecture shape is many times away from a `5 ms/token` goal.
 
@@ -124,9 +124,9 @@ A reasonable stretch budget split would be:
 
 The current explicit one-token packed step is far from this:
 
-- total: `184.738 ms`
-- GPU time: `129.879 ms`
-- download: `36.109 ms`
+- total: `385.757 ms`
+- GPU time: `207.394 ms`
+- download: `99.307 ms`
 
 So the required change is architectural, not incremental.
 
@@ -218,7 +218,7 @@ This removes the need for large logits downloads and reduces CPU-side decode glu
 
 ### Milestone 4: dispatch collapse
 
-Reduce dispatch count from the current `113` per token toward:
+Reduce dispatch count from the current `226` per token toward:
 
 - low teens at minimum
 - single digits as the real target
