@@ -704,15 +704,23 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
         use_mlp_gu: bool,
         argmax_only: bool,
     ) -> Self {
-        Self {
-            inner: PersistentPackedDecodeSession::new(
-                model,
-                expected_tokens,
-                use_attention_qkv,
-                use_mlp_gu,
-                argmax_only,
-            ),
-        }
+        let mut inner = PersistentPackedDecodeSession::new(
+            model,
+            expected_tokens,
+            use_attention_qkv,
+            use_mlp_gu,
+            argmax_only,
+        );
+        inner.use_attention_full = use_attention_qkv
+            && (ReferenceModel::packed_use_attention_full()
+                || ReferenceModel::packed_use_gpu_attention_block()
+                || ReferenceModel::packed_use_gpu_full_last_layer());
+        inner.use_mlp_full = use_mlp_gu
+            && (ReferenceModel::packed_use_mlp_full()
+                || ReferenceModel::packed_use_gpu_swiglu_block()
+                || ReferenceModel::packed_use_gpu_full_last_layer()
+                || ReferenceModel::packed_use_gpu_mlp_entry());
+        Self { inner }
     }
 
     pub fn push_prompt_token(
@@ -8453,6 +8461,36 @@ mod tests {
     }
 
     #[test]
+    fn gpu_attention_block_path_does_not_require_packed_attention_full_flag() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let _guard = lock_env();
+        let _env = ScopedEnvVars::set(&[("JENGINE_GPU_ATTENTION_BLOCK", "1")]);
+
+        let mut session = model.begin_packed_decode_session(2, true, true, true);
+        let _ = session
+            .push_prompt_token(2)
+            .expect("gpu attention token should decode without packed attention full flag");
+
+        let PackedDecodeSession::GpuFirst(session) = session else {
+            panic!("gpu-first session should be selected when gpu attention is enabled");
+        };
+        assert!(session.inner.cache[0].keys.is_empty());
+        assert!(session.inner.cache[0].values.is_empty());
+        assert!(session
+            .inner
+            .gpu_first_session
+            .attention_blocks
+            .contains_key(&(0, 1)));
+    }
+
+    #[test]
     fn creates_gpu_embedding_runner_and_matches_reference_embedding_row() {
         let dir = tempdir().expect("tempdir should be created");
         write_synthetic_model(dir.path());
@@ -8641,6 +8679,30 @@ mod tests {
     }
 
     #[test]
+    fn gpu_mlp_block_path_does_not_require_packed_mlp_full_flag() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let _guard = lock_env();
+        let _env = ScopedEnvVars::set(&[("JENGINE_GPU_SWIGLU_BLOCK", "1")]);
+
+        let mut session = model.begin_packed_decode_session(2, false, true, true);
+        let _ = session
+            .push_prompt_token(2)
+            .expect("gpu mlp token should decode without packed mlp full flag");
+
+        let PackedDecodeSession::GpuFirst(session) = session else {
+            panic!("gpu-first session should be selected when gpu mlp is enabled");
+        };
+        assert!(session.inner.gpu_first_session.mlp_blocks.contains_key(&0));
+    }
+
+    #[test]
     fn runs_gpu_tail_block_without_resident_hidden_pipeline() {
         let dir = tempdir().expect("tempdir should be created");
         write_synthetic_model(dir.path());
@@ -8781,6 +8843,7 @@ mod tests {
         let model =
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed-first model should load");
+        let _guard = lock_env();
         let result = model
             .generate_greedy("tok2", 1)
             .expect("packed-first decode should succeed");
