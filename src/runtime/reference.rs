@@ -2512,7 +2512,10 @@ struct ResidentPackedPairProjection {
 }
 
 struct ResidentGpuFinalNorm {
+    #[allow(dead_code)]
     runner: CachedWeightedRmsNormGpuRunner,
+    tensor: GpuResidentBuffer,
+    len: usize,
     report: crate::gpu::weighted_rms_norm::GpuWeightedRmsNormReport,
     compile_duration: Duration,
     gpu_cache_hit: bool,
@@ -2520,6 +2523,8 @@ struct ResidentGpuFinalNorm {
 
 struct ResidentGpuVectorAdd {
     runner: CachedVectorAddGpuRunner,
+    tensor: GpuResidentBuffer,
+    len: usize,
     report: crate::gpu::vector_add::GpuVectorAddReport,
     compile_duration: Duration,
     gpu_cache_hit: bool,
@@ -2839,8 +2844,12 @@ impl<'a> PackedGpuSession<'a> {
             .borrow_mut()
             .run_resident(input, weight)
             .map_err(|error| ReferenceError::Decode(format!("gpu final norm failed: {error}")))?;
+        let len = runner.borrow().len();
+        let tensor = runner.borrow().resident_output();
         Ok(ResidentGpuFinalNorm {
+            tensor,
             runner,
+            len,
             report,
             compile_duration,
             gpu_cache_hit,
@@ -2853,14 +2862,14 @@ impl<'a> PackedGpuSession<'a> {
     ) -> Result<ResidentGpuPackedActivation, ReferenceError> {
         let (runner, compile_duration, gpu_cache_hit) = self
             .model
-            .get_or_create_pack_f16_pairs_gpu(final_norm.runner.borrow().len())?;
+            .get_or_create_pack_f16_pairs_gpu(final_norm.len)?;
         let report = runner
             .borrow_mut()
             .run_resident_from_f32_buffer(
-                final_norm.runner.borrow().shared_context(),
-                final_norm.runner.borrow().output_buffer_handle(),
-                final_norm.runner.borrow().len(),
-                (final_norm.runner.borrow().len() * std::mem::size_of::<f32>()) as u64,
+                &final_norm.tensor.shared_context,
+                final_norm.tensor.buffer,
+                final_norm.len,
+                final_norm.tensor.buffer_size,
             )
             .map_err(|error| {
                 ReferenceError::Decode(format!("gpu pack f16 pairs failed: {error}"))
@@ -2870,12 +2879,9 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.upload_duration += final_norm.report.upload_duration;
         self.metrics.gpu_duration += final_norm.report.gpu_duration;
         self.metrics.dispatch_count += 1;
-        self.metrics.weight_upload_bytes +=
-            final_norm.runner.borrow().len() * std::mem::size_of::<f32>();
-        self.metrics.activation_upload_bytes +=
-            final_norm.runner.borrow().len() * std::mem::size_of::<f32>();
-        self.metrics.upload_bytes +=
-            2 * final_norm.runner.borrow().len() * std::mem::size_of::<f32>();
+        self.metrics.weight_upload_bytes += final_norm.len * std::mem::size_of::<f32>();
+        self.metrics.activation_upload_bytes += final_norm.len * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes += 2 * final_norm.len * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(final_norm.gpu_cache_hit);
         self.dispatch_trace.push(PackedDispatchTrace {
             index: self.dispatch_trace.len() + 1,
@@ -2883,8 +2889,8 @@ impl<'a> PackedGpuSession<'a> {
             path: "gpu_dense".to_string(),
             stage: "final_norm_gpu".to_string(),
             tensor_name: "model.norm.weight".to_string(),
-            rows: final_norm.runner.borrow().len(),
-            cols: final_norm.runner.borrow().len(),
+            rows: final_norm.len,
+            cols: final_norm.len,
             pack_cache_hit: false,
             gpu_cache_hit: final_norm.gpu_cache_hit,
             cpu_ms: (final_norm.compile_duration + final_norm.report.upload_duration).as_secs_f64()
@@ -2894,8 +2900,8 @@ impl<'a> PackedGpuSession<'a> {
             activation_upload_ms: 0.0,
             gpu_ms: final_norm.report.gpu_duration.as_secs_f64() * 1_000.0,
             download_ms: 0.0,
-            weight_upload_bytes: final_norm.runner.borrow().len() * std::mem::size_of::<f32>(),
-            activation_upload_bytes: final_norm.runner.borrow().len() * std::mem::size_of::<f32>(),
+            weight_upload_bytes: final_norm.len * std::mem::size_of::<f32>(),
+            activation_upload_bytes: final_norm.len * std::mem::size_of::<f32>(),
             download_bytes: 0,
         });
         Ok(ResidentGpuPackedActivation {
@@ -2906,7 +2912,7 @@ impl<'a> PackedGpuSession<'a> {
                 runner.borrow().packed_len(),
                 runner.borrow().output_buffer_size(),
             ),
-            logical_len: final_norm.runner.borrow().len(),
+            logical_len: final_norm.len,
             upload_duration: report.upload_duration,
             gpu_duration: report.gpu_duration,
             compile_duration,
@@ -3258,8 +3264,12 @@ impl<'a> PackedGpuSession<'a> {
                 right,
             )
             .map_err(|error| ReferenceError::Decode(format!("gpu vector add failed: {error}")))?;
+        let len = runner.borrow().len();
+        let tensor = runner.borrow().resident_output();
         Ok(ResidentGpuVectorAdd {
+            tensor,
             runner,
+            len,
             report,
             compile_duration,
             gpu_cache_hit,
@@ -3275,10 +3285,8 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.upload_duration += activation.report.upload_duration;
         self.metrics.gpu_duration += activation.report.gpu_duration;
         self.metrics.dispatch_count += 1;
-        self.metrics.activation_upload_bytes +=
-            2 * activation.runner.borrow().len() * std::mem::size_of::<f32>();
-        self.metrics.upload_bytes +=
-            2 * activation.runner.borrow().len() * std::mem::size_of::<f32>();
+        self.metrics.activation_upload_bytes += 2 * activation.len * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes += 2 * activation.len * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(activation.gpu_cache_hit);
         self.dispatch_trace.push(PackedDispatchTrace {
             index: self.dispatch_trace.len() + 1,
@@ -3286,8 +3294,8 @@ impl<'a> PackedGpuSession<'a> {
             path: "gpu_dense".to_string(),
             stage: "vector_add_gpu".to_string(),
             tensor_name: "vector_add".to_string(),
-            rows: activation.runner.borrow().len(),
-            cols: activation.runner.borrow().len(),
+            rows: activation.len,
+            cols: activation.len,
             pack_cache_hit: false,
             gpu_cache_hit: activation.gpu_cache_hit,
             cpu_ms: (activation.compile_duration + activation.report.upload_duration).as_secs_f64()
@@ -3298,9 +3306,7 @@ impl<'a> PackedGpuSession<'a> {
             gpu_ms: activation.report.gpu_duration.as_secs_f64() * 1_000.0,
             download_ms: 0.0,
             weight_upload_bytes: 0,
-            activation_upload_bytes: 2
-                * activation.runner.borrow().len()
-                * std::mem::size_of::<f32>(),
+            activation_upload_bytes: 2 * activation.len * std::mem::size_of::<f32>(),
             download_bytes: 0,
         });
 
@@ -3309,15 +3315,19 @@ impl<'a> PackedGpuSession<'a> {
         let report = runner
             .borrow_mut()
             .run_resident_from_f32_buffer(
-                activation.runner.borrow().shared_context(),
-                activation.runner.borrow().output_buffer_handle(),
-                activation.runner.borrow().len(),
-                activation.runner.borrow().output_buffer_size(),
+                &activation.tensor.shared_context,
+                activation.tensor.buffer,
+                activation.len,
+                activation.tensor.buffer_size,
                 weight,
             )
             .map_err(|error| ReferenceError::Decode(format!("gpu final norm failed: {error}")))?;
+        let len = runner.borrow().len();
+        let tensor = runner.borrow().resident_output();
         Ok(ResidentGpuFinalNorm {
+            tensor,
             runner,
+            len,
             report,
             compile_duration,
             gpu_cache_hit,
@@ -3632,7 +3642,7 @@ impl<'a> PackedGpuSession<'a> {
         cols: usize,
         final_norm: ResidentGpuFinalNorm,
     ) -> Result<ResidentPackedPairProjection, ReferenceError> {
-        let len = final_norm.runner.borrow().len();
+        let len = final_norm.len;
         self.metrics.compile_duration += final_norm.compile_duration;
         self.metrics.upload_duration += final_norm.report.upload_duration;
         self.metrics.gpu_duration += final_norm.report.gpu_duration;
@@ -3684,10 +3694,10 @@ impl<'a> PackedGpuSession<'a> {
         let report = runner
             .borrow_mut()
             .run_resident_from_f32_buffer(
-                final_norm.runner.borrow().shared_context(),
-                final_norm.runner.borrow().output_buffer_handle(),
+                &final_norm.tensor.shared_context,
+                final_norm.tensor.buffer,
                 len,
-                final_norm.runner.borrow().output_buffer_size(),
+                final_norm.tensor.buffer_size,
             )
             .map_err(|error| {
                 ReferenceError::Decode(format!(
