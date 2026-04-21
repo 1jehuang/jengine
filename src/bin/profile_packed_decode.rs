@@ -1,5 +1,6 @@
 use jengine::report::{timestamped_profile_path, write_json_value};
-use jengine::runtime::reference::{DecodeMetrics, PackedDecodeMetrics, ReferenceModel};
+use jengine::runtime::gpu_decode_metrics::{DecodeMetrics, PackedDecodeMetrics};
+use jengine::runtime::reference::ReferenceModel;
 use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -89,8 +90,6 @@ fn main() {
     let model = ReferenceModel::load_from_root_with_packed_artifact(&root, &artifact_dir)
         .expect("packed reference model should load");
     if std::env::var_os("JENGINE_PREWARM_PACKED").is_some() {
-        let use_attention_full = std::env::var_os("JENGINE_PACKED_ATTENTION_FULL").is_some();
-        let use_mlp_full = std::env::var_os("JENGINE_PACKED_MLP_FULL").is_some();
         let expected_tokens = model
             .prompt_analysis(&prompt)
             .expect("prompt analysis should succeed")
@@ -101,8 +100,7 @@ fn main() {
                 expected_tokens,
                 use_attention_qkv,
                 use_mlp_gu,
-                use_attention_full,
-                use_mlp_full,
+                false,
             )
             .expect("packed decode prewarm should succeed");
     }

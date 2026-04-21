@@ -74,8 +74,6 @@ fn main() {
         other => panic!("unsupported variant: {other}"),
     };
     if std::env::var_os("JENGINE_PREWARM_PACKED").is_some() {
-        let use_attention_full = std::env::var_os("JENGINE_PACKED_ATTENTION_FULL").is_some();
-        let use_mlp_full = std::env::var_os("JENGINE_PACKED_MLP_FULL").is_some();
         let expected_tokens = packed
             .prompt_analysis(&prompt)
             .expect("prompt analysis should succeed")
@@ -87,8 +85,7 @@ fn main() {
                     expected_tokens,
                     use_attention_qkv,
                     use_mlp_gu,
-                    use_attention_full,
-                    use_mlp_full,
+                    false,
                 )
                 .expect("packed decode prewarm should succeed")
         });
