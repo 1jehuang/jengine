@@ -96,10 +96,9 @@ pub struct CachedGpuVectorAddRunner {
     shader_module: vk::ShaderModule,
     pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
-    _descriptor_set: vk::DescriptorSet,
+    descriptor_set: vk::DescriptorSet,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
-    copy_command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     left_buffer: BufferAllocation,
     right_buffer: BufferAllocation,
@@ -236,10 +235,8 @@ impl CachedGpuVectorAddRunner {
         let command_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(2);
-        let command_buffers = unsafe { device.allocate_command_buffers(&command_alloc)? };
-        let command_buffer = command_buffers[0];
-        let copy_command_buffer = command_buffers[1];
+            .command_buffer_count(1);
+        let command_buffer = unsafe { device.allocate_command_buffers(&command_alloc)?[0] };
         unsafe {
             device.begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())?;
             device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
@@ -275,10 +272,9 @@ impl CachedGpuVectorAddRunner {
                 shader_module,
                 pipeline,
                 descriptor_pool,
-                _descriptor_set: descriptor_set,
+                descriptor_set,
                 command_pool,
                 command_buffer,
-                copy_command_buffer,
                 fence,
                 left_buffer,
                 right_buffer,
@@ -303,6 +299,7 @@ impl CachedGpuVectorAddRunner {
             )));
         }
         let upload_started = Instant::now();
+        self.bind_internal_buffers();
         write_f32_buffer(&self.left_buffer, left)?;
         write_f32_buffer(&self.right_buffer, right)?;
         let upload_duration = upload_started.elapsed();
@@ -342,6 +339,7 @@ impl CachedGpuVectorAddRunner {
             )));
         }
         let upload_started = Instant::now();
+        self.bind_internal_buffers();
         write_f32_buffer(&self.left_buffer, left)?;
         write_f32_buffer(&self.right_buffer, right)?;
         let upload_duration = upload_started.elapsed();
@@ -373,15 +371,28 @@ impl CachedGpuVectorAddRunner {
             )));
         }
         let upload_started = Instant::now();
-        self.copy_left_from_buffer(
-            source_context,
-            source_buffer,
-            source_len,
-            source_buffer_size,
-        )?;
+        if source_len != self.len {
+            return Err(GpuVectorAddError::Shape(format!(
+                "source len {} does not match destination len {}",
+                source_len, self.len
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuVectorAddError::Shape(
+                "resident chaining requires runners to share the same Vulkan context".to_string(),
+            ));
+        }
+        let byte_len = self.len * std::mem::size_of::<f32>();
+        if byte_len as u64 > source_buffer_size {
+            return Err(GpuVectorAddError::Shape(format!(
+                "source {} bytes exceeds provided buffer size {}",
+                byte_len, source_buffer_size
+            )));
+        }
+        self.bind_buffers(source_buffer, self.right_buffer.buffer);
         write_f32_buffer(&self.right_buffer, right)?;
         let upload_duration = upload_started.elapsed();
-        let gpu_duration = self.submit_copy_and_compute_and_wait()?;
+        let gpu_duration = self.submit_and_wait()?;
         Ok(GpuVectorAddReport {
             len: self.len,
             compile_duration: Duration::ZERO,
@@ -404,22 +415,27 @@ impl CachedGpuVectorAddRunner {
         right_len: usize,
         right_buffer_size: u64,
     ) -> Result<GpuVectorAddReport, GpuVectorAddError> {
-        let upload_started = Instant::now();
-        self.copy_buffers_to_inputs(
-            source_context,
-            left_buffer,
-            left_len,
-            left_buffer_size,
-            self.left_buffer.buffer,
-            self.left_buffer.size,
-            right_buffer,
-            right_len,
-            right_buffer_size,
-            self.right_buffer.buffer,
-            self.right_buffer.size,
-        )?;
-        let upload_duration = upload_started.elapsed();
-        let gpu_duration = self.submit_copy_and_compute_and_wait()?;
+        if left_len != self.len || right_len != self.len {
+            return Err(GpuVectorAddError::Shape(format!(
+                "source lens {}/{} do not match destination len {}",
+                left_len, right_len, self.len
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuVectorAddError::Shape(
+                "resident chaining requires runners to share the same Vulkan context".to_string(),
+            ));
+        }
+        let byte_len = self.len * std::mem::size_of::<f32>();
+        if byte_len as u64 > left_buffer_size || byte_len as u64 > right_buffer_size {
+            return Err(GpuVectorAddError::Shape(format!(
+                "paired source {} bytes exceeds one or more source buffer sizes",
+                byte_len
+            )));
+        }
+        self.bind_buffers(left_buffer, right_buffer);
+        let upload_duration = Duration::ZERO;
+        let gpu_duration = self.submit_and_wait()?;
         Ok(GpuVectorAddReport {
             len: self.len,
             compile_duration: Duration::ZERO,
@@ -445,179 +461,41 @@ impl CachedGpuVectorAddRunner {
         Ok(gpu_started.elapsed())
     }
 
-    fn submit_copy_and_compute_and_wait(&self) -> Result<Duration, GpuVectorAddError> {
-        unsafe { self.device.reset_fences(&[self.fence])? };
-        let command_buffers = [self.copy_command_buffer, self.command_buffer];
-        let submit_info = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
-        let gpu_started = Instant::now();
-        unsafe {
-            self.device
-                .queue_submit(self.queue, &submit_info, self.fence)?;
-            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
-        }
-        Ok(gpu_started.elapsed())
+    fn bind_internal_buffers(&self) {
+        self.bind_buffers(self.left_buffer.buffer, self.right_buffer.buffer);
     }
 
-    fn copy_left_from_buffer(
-        &self,
-        source_context: &Arc<SharedGpuPackedContext>,
-        source_buffer: vk::Buffer,
-        source_len: usize,
-        source_buffer_size: u64,
-    ) -> Result<(), GpuVectorAddError> {
-        self.copy_buffer_to_input(
-            source_context,
-            source_buffer,
-            source_len,
-            source_buffer_size,
-            self.left_buffer.buffer,
-            self.left_buffer.size,
-        )
-    }
-
-    fn copy_buffer_to_input(
-        &self,
-        source_context: &Arc<SharedGpuPackedContext>,
-        source_buffer: vk::Buffer,
-        source_len: usize,
-        source_buffer_size: u64,
-        destination_buffer: vk::Buffer,
-        destination_buffer_size: u64,
-    ) -> Result<(), GpuVectorAddError> {
-        if source_len != self.len {
-            return Err(GpuVectorAddError::Shape(format!(
-                "source len {} does not match destination len {}",
-                source_len, self.len
-            )));
-        }
-        if !Arc::ptr_eq(&self._shared_context, source_context) {
-            return Err(GpuVectorAddError::Shape(
-                "resident chaining requires runners to share the same Vulkan context".to_string(),
-            ));
-        }
-        let byte_len = self.len * std::mem::size_of::<f32>();
-        if byte_len as u64 > source_buffer_size || byte_len as u64 > destination_buffer_size {
-            return Err(GpuVectorAddError::Shape(format!(
-                "copy {} bytes exceeds source {} or destination {} buffer size",
-                byte_len, source_buffer_size, destination_buffer_size
-            )));
-        }
-        let copy_command = self.copy_command_buffer;
-        unsafe {
-            self.device
-                .reset_command_buffer(copy_command, vk::CommandBufferResetFlags::empty())?;
-            self.device
-                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
-            let region = [vk::BufferCopy::default().size(byte_len as u64)];
-            self.device
-                .cmd_copy_buffer(copy_command, source_buffer, destination_buffer, &region);
-            let barrier = [vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(destination_buffer)
-                .offset(0)
-                .size(byte_len as u64)];
-            self.device.cmd_pipeline_barrier(
-                copy_command,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &barrier,
-                &[],
-            );
-            self.device.end_command_buffer(copy_command)?;
-        }
-        Ok(())
-    }
-
-    fn copy_buffers_to_inputs(
-        &self,
-        source_context: &Arc<SharedGpuPackedContext>,
-        left_source_buffer: vk::Buffer,
-        left_source_len: usize,
-        left_source_buffer_size: u64,
-        left_destination_buffer: vk::Buffer,
-        left_destination_buffer_size: u64,
-        right_source_buffer: vk::Buffer,
-        right_source_len: usize,
-        right_source_buffer_size: u64,
-        right_destination_buffer: vk::Buffer,
-        right_destination_buffer_size: u64,
-    ) -> Result<(), GpuVectorAddError> {
-        if left_source_len != self.len || right_source_len != self.len {
-            return Err(GpuVectorAddError::Shape(format!(
-                "source lens {}/{} do not match destination len {}",
-                left_source_len, right_source_len, self.len
-            )));
-        }
-        if !Arc::ptr_eq(&self._shared_context, source_context) {
-            return Err(GpuVectorAddError::Shape(
-                "resident chaining requires runners to share the same Vulkan context".to_string(),
-            ));
-        }
-        let byte_len = self.len * std::mem::size_of::<f32>();
-        if byte_len as u64 > left_source_buffer_size
-            || byte_len as u64 > left_destination_buffer_size
-            || byte_len as u64 > right_source_buffer_size
-            || byte_len as u64 > right_destination_buffer_size
-        {
-            return Err(GpuVectorAddError::Shape(format!(
-                "paired copy {} bytes exceeds one or more source/destination buffer sizes",
-                byte_len
-            )));
-        }
-        let copy_command = self.copy_command_buffer;
-        unsafe {
-            self.device
-                .reset_command_buffer(copy_command, vk::CommandBufferResetFlags::empty())?;
-            self.device
-                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
-            let region = [vk::BufferCopy::default().size(byte_len as u64)];
-            self.device.cmd_copy_buffer(
-                copy_command,
-                left_source_buffer,
-                left_destination_buffer,
-                &region,
-            );
-            self.device.cmd_copy_buffer(
-                copy_command,
-                right_source_buffer,
-                right_destination_buffer,
-                &region,
-            );
-            let barriers = [
-                vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(left_destination_buffer)
-                    .offset(0)
-                    .size(byte_len as u64),
-                vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(right_destination_buffer)
-                    .offset(0)
-                    .size(byte_len as u64),
-            ];
-            self.device.cmd_pipeline_barrier(
-                copy_command,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &barriers,
-                &[],
-            );
-            self.device.end_command_buffer(copy_command)?;
-        }
-        Ok(())
+    fn bind_buffers(&self, left_buffer: vk::Buffer, right_buffer: vk::Buffer) {
+        let left_info = [vk::DescriptorBufferInfo::default()
+            .buffer(left_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let right_info = [vk::DescriptorBufferInfo::default()
+            .buffer(right_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let output_info = [vk::DescriptorBufferInfo::default()
+            .buffer(self.output_buffer.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&left_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&right_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&output_info),
+        ];
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
     }
 
     pub fn shared_context(&self) -> &Arc<SharedGpuPackedContext> {
