@@ -314,11 +314,15 @@ struct LayerTensorNames {
 }
 
 type CachedProjectionGpuRunner = Rc<RefCell<CachedGpuPackedMatvecRunner>>;
+type CachedEmbeddingLookupGpuRunner = Rc<RefCell<CachedGpuEmbeddingLookupRunner>>;
+type CachedQkRopeGpuRunner = Rc<RefCell<CachedGpuQkRopeRunner>>;
 type CachedTailBlockGpuRunner = Rc<RefCell<CachedGpuTailBlockRunner>>;
 type CachedFullLastLayerGpuRunner = Rc<RefCell<CachedGpuFullLastLayerRunner>>;
 type CachedAttentionBlockGpuRunner = Rc<RefCell<CachedGpuAttentionBlockRunner>>;
 type CachedMlpBlockGpuRunner = Rc<RefCell<CachedGpuMlpBlockRunner>>;
 type CachedProjectionGpuCacheEntry = (CachedProjectionGpuRunner, Duration, Duration, bool);
+type CachedEmbeddingLookupGpuCacheEntry = (CachedEmbeddingLookupGpuRunner, Duration, bool);
+type CachedQkRopeGpuCacheEntry = (CachedQkRopeGpuRunner, Duration, bool);
 type CachedWeightedRmsNormGpuRunner = Rc<RefCell<CachedGpuWeightedRmsNormRunner>>;
 type CachedWeightedRmsNormGpuCacheEntry = (CachedWeightedRmsNormGpuRunner, Duration, bool);
 type CachedPackF16PairsGpuRunner = Rc<RefCell<CachedGpuPackF16PairsRunner>>;
@@ -914,9 +918,9 @@ struct GpuFirstRunnerCache<'a> {
     model: &'a ReferenceModel,
     kv_capacity_tokens: usize,
     shared_context: Option<Arc<SharedGpuPackedContext>>,
-    embedding_lookup_runner: Option<CachedGpuEmbeddingLookupRunner>,
-    input_norm_runner: Option<CachedGpuWeightedRmsNormRunner>,
-    qk_rope_runner: Option<CachedGpuQkRopeRunner>,
+    embedding_lookup_runner: Option<CachedEmbeddingLookupGpuRunner>,
+    input_norm_runner: Option<CachedWeightedRmsNormGpuRunner>,
+    qk_rope_runner: Option<CachedQkRopeGpuRunner>,
     raw_f32_projection_runners: HashMap<String, CachedProjectionGpuRunner>,
     gpu_kv_caches: HashMap<usize, GpuKvCache>,
     attention_blocks: HashMap<usize, CachedAttentionBlockGpuRunner>,
@@ -1036,77 +1040,35 @@ impl<'a> GpuFirstRunnerCache<'a> {
 
     fn ensure_embedding_lookup_runner(
         &mut self,
-    ) -> Result<(Duration, &mut CachedGpuEmbeddingLookupRunner), ReferenceError> {
-        let compile_duration = if self.embedding_lookup_runner.is_some() {
-            Duration::ZERO
-        } else {
-            let (vocab, hidden, words) = self
-                .model
-                .weights
-                .embedding_lookup_u32_words("model.embed_tokens.weight")
-                .map_err(ReferenceError::Weight)?;
-            let context = self.get_or_create_shared_context()?;
-            let (runner, compile_duration) =
-                CachedGpuEmbeddingLookupRunner::new_with_context(context, &words, vocab, hidden)
-                    .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-            self.embedding_lookup_runner = Some(runner);
-            compile_duration
-        };
-        Ok((
-            compile_duration,
-            self.embedding_lookup_runner
-                .as_mut()
-                .expect("embedding lookup runner should exist after creation"),
-        ))
+    ) -> Result<(Duration, CachedEmbeddingLookupGpuRunner), ReferenceError> {
+        if let Some(runner) = self.embedding_lookup_runner.as_ref().cloned() {
+            return Ok((Duration::ZERO, runner));
+        }
+        let (runner, compile_duration, _gpu_cache_hit) = self.model.get_or_create_embedding_lookup_gpu()?;
+        self.embedding_lookup_runner = Some(runner.clone());
+        Ok((compile_duration, runner))
     }
 
     fn ensure_input_norm_runner(
         &mut self,
-    ) -> Result<(Duration, &mut CachedGpuWeightedRmsNormRunner), ReferenceError> {
-        let compile_duration = if self.input_norm_runner.is_some() {
-            Duration::ZERO
-        } else {
-            let context = self.get_or_create_shared_context()?;
-            let (runner, compile_duration) = CachedGpuWeightedRmsNormRunner::new_with_context(
-                context,
-                self.model.config.hidden_size,
-                self.model.config.rms_norm_eps as f32,
-            )
-            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-            self.input_norm_runner = Some(runner);
-            compile_duration
-        };
-        Ok((
-            compile_duration,
-            self.input_norm_runner
-                .as_mut()
-                .expect("input norm runner should exist after creation"),
-        ))
+    ) -> Result<(Duration, CachedWeightedRmsNormGpuRunner), ReferenceError> {
+        if let Some(runner) = self.input_norm_runner.as_ref().cloned() {
+            return Ok((Duration::ZERO, runner));
+        }
+        let (runner, compile_duration, _gpu_cache_hit) = self.model.get_or_create_input_norm_gpu()?;
+        self.input_norm_runner = Some(runner.clone());
+        Ok((compile_duration, runner))
     }
 
     fn ensure_qk_rope_runner(
         &mut self,
-    ) -> Result<(Duration, &mut CachedGpuQkRopeRunner), ReferenceError> {
-        let compile_duration = if self.qk_rope_runner.is_some() {
-            Duration::ZERO
-        } else {
-            let context = self.get_or_create_shared_context()?;
-            let (runner, compile_duration) = CachedGpuQkRopeRunner::new_with_context(
-                context,
-                self.model.config.num_attention_heads,
-                self.model.config.num_key_value_heads,
-                self.model.config.head_dim,
-            )
-            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-            self.qk_rope_runner = Some(runner);
-            compile_duration
-        };
-        Ok((
-            compile_duration,
-            self.qk_rope_runner
-                .as_mut()
-                .expect("qk rope runner should exist after creation"),
-        ))
+    ) -> Result<(Duration, CachedQkRopeGpuRunner), ReferenceError> {
+        if let Some(runner) = self.qk_rope_runner.as_ref().cloned() {
+            return Ok((Duration::ZERO, runner));
+        }
+        let (runner, compile_duration, _gpu_cache_hit) = self.model.get_or_create_qk_rope_gpu()?;
+        self.qk_rope_runner = Some(runner.clone());
+        Ok((compile_duration, runner))
     }
 
     fn gpu_kv_tensors(&self, layer_idx: usize) -> Option<(GpuResidentBuffer, GpuResidentBuffer)> {
@@ -1145,13 +1107,15 @@ impl<'a> GpuFirstRunnerCache<'a> {
     ) -> Result<((Vec<f32>, GpuResidentBuffer), GpuQkRopeReport, Duration), ReferenceError> {
         let (compile_duration, runner) = self.ensure_qk_rope_runner()?;
         let mut report = runner
+            .borrow_mut()
             .run_resident(q, k, q_weight, k_weight, cos, sin)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let (q_out, download_duration) = runner
+            .borrow()
             .read_query_output()
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         report.download_duration = download_duration;
-        let key_out = runner.key_resident_output();
+        let key_out = runner.borrow().key_resident_output();
         Ok(((q_out, key_out), report, compile_duration))
     }
 
@@ -1194,10 +1158,11 @@ impl<'a> GpuFirstRunnerCache<'a> {
     {
         let (compile_duration, runner) = self.ensure_qk_rope_runner()?;
         let report = runner
+            .borrow_mut()
             .run_resident_from_tensors(q, k, q_weight, k_weight, cos, sin)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-        let query_out = runner.query_resident_output();
-        let key_out = runner.key_resident_output();
+        let query_out = runner.borrow().query_resident_output();
+        let key_out = runner.borrow().key_resident_output();
         Ok((query_out, key_out, report, compile_duration))
     }
 
@@ -1228,10 +1193,11 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let (embedding_compile_duration, embedding_runner) =
             self.ensure_embedding_lookup_runner()?;
         let embedding_report = embedding_runner
+            .borrow_mut()
             .run_resident(token_id)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let hidden = vec![0.0; hidden_size];
-        let embedding_output = embedding_runner.resident_output();
+        let embedding_output = embedding_runner.borrow().resident_output();
 
         let cache_key = format!(
             "gpu_first::layer::{layer_idx}::qkv_triplet::{q_proj_name}||{k_proj_name}||{v_proj_name}"
@@ -1250,11 +1216,12 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let (norm_compile_duration, norm_context, norm_report) = {
             let (norm_compile_duration, input_norm_runner) = self.ensure_input_norm_runner()?;
             let norm_report = input_norm_runner
+                .borrow_mut()
                 .run_resident_from_tensor(&embedding_output, input_norm_weight)
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?;
             (
                 norm_compile_duration,
-                input_norm_runner.resident_output(),
+                input_norm_runner.borrow().resident_output(),
                 norm_report,
             )
         };
@@ -1316,18 +1283,20 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let (embedding_compile_duration, embedding_runner) =
             self.ensure_embedding_lookup_runner()?;
         let (hidden, embedding_report) = embedding_runner
+            .borrow_mut()
             .run_with_output(token_id)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-        let embedding_output = embedding_runner.resident_output();
+        let embedding_output = embedding_runner.borrow().resident_output();
 
         let (norm_compile_duration, norm_context, norm_report) = {
             let (norm_compile_duration, input_norm_runner) = self.ensure_input_norm_runner()?;
             let norm_report = input_norm_runner
+                .borrow_mut()
                 .run_resident_from_tensor(&embedding_output, input_norm_weight)
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?;
             (
                 norm_compile_duration,
-                input_norm_runner.resident_output(),
+                input_norm_runner.borrow().resident_output(),
                 norm_report,
             )
         };
@@ -1433,15 +1402,17 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let (embedding_compile_duration, embedding_runner) =
             self.ensure_embedding_lookup_runner()?;
         let (hidden, embedding_report) = embedding_runner
+            .borrow_mut()
             .run_with_output(token_id)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-        let embedding_context = embedding_runner.shared_context().clone();
-        let embedding_buffer = embedding_runner.output_buffer_handle();
-        let embedding_buffer_size = embedding_runner.output_buffer_size();
-        let hidden_len = embedding_runner.hidden();
+        let embedding_context = embedding_runner.borrow().shared_context().clone();
+        let embedding_buffer = embedding_runner.borrow().output_buffer_handle();
+        let embedding_buffer_size = embedding_runner.borrow().output_buffer_size();
+        let hidden_len = embedding_runner.borrow().hidden();
 
         let (norm_compile_duration, input_norm_runner) = self.ensure_input_norm_runner()?;
         let norm_report = input_norm_runner
+            .borrow_mut()
             .run_resident_from_f32_buffer(
                 &embedding_context,
                 embedding_buffer,
@@ -1451,6 +1422,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
             )
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let (hidden_states, norm_download_duration) = input_norm_runner
+            .borrow()
             .read_output()
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let norm_report = GpuWeightedRmsNormReport {
@@ -1542,11 +1514,12 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let (norm_compile_duration, norm_context, norm_report) = {
             let (norm_compile_duration, input_norm_runner) = self.ensure_input_norm_runner()?;
             let norm_report = input_norm_runner
+                .borrow_mut()
                 .run_resident_from_tensor(&hidden_resident, input_norm_weight)
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?;
             (
                 norm_compile_duration,
-                input_norm_runner.resident_output(),
+                input_norm_runner.borrow().resident_output(),
                 norm_report,
             )
         };
@@ -1607,11 +1580,12 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let (norm_compile_duration, norm_context, norm_report) = {
             let (norm_compile_duration, input_norm_runner) = self.ensure_input_norm_runner()?;
             let norm_report = input_norm_runner
+                .borrow_mut()
                 .run_resident_from_tensor(&hidden_resident, input_norm_weight)
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?;
             (
                 norm_compile_duration,
-                input_norm_runner.resident_output(),
+                input_norm_runner.borrow().resident_output(),
                 norm_report,
             )
         };
@@ -3839,6 +3813,9 @@ pub struct ReferenceModel {
     cached_projection_packed: RefCell<HashMap<String, Rc<PackedProjectionCache>>>,
     cached_projection_gpu: RefCell<HashMap<String, CachedProjectionGpuRunner>>,
     cached_projection_gpu_raw_f32: RefCell<HashMap<String, CachedProjectionGpuRunner>>,
+    cached_embedding_lookup_gpu: RefCell<Option<CachedEmbeddingLookupGpuRunner>>,
+    cached_input_norm_gpu: RefCell<Option<CachedWeightedRmsNormGpuRunner>>,
+    cached_qk_rope_gpu: RefCell<Option<CachedQkRopeGpuRunner>>,
     cached_final_norm_gpu: RefCell<Option<CachedWeightedRmsNormGpuRunner>>,
     cached_pack_f16_pairs_gpu: RefCell<HashMap<usize, CachedPackF16PairsGpuRunner>>,
     cached_vector_add_gpu: RefCell<HashMap<usize, CachedVectorAddGpuRunner>>,
@@ -4020,6 +3997,9 @@ impl ReferenceModel {
             cached_projection_packed: RefCell::new(HashMap::new()),
             cached_projection_gpu: RefCell::new(HashMap::new()),
             cached_projection_gpu_raw_f32: RefCell::new(HashMap::new()),
+            cached_embedding_lookup_gpu: RefCell::new(None),
+            cached_input_norm_gpu: RefCell::new(None),
+            cached_qk_rope_gpu: RefCell::new(None),
             cached_final_norm_gpu: RefCell::new(None),
             cached_pack_f16_pairs_gpu: RefCell::new(HashMap::new()),
             cached_vector_add_gpu: RefCell::new(HashMap::new()),
@@ -5007,6 +4987,66 @@ impl ReferenceModel {
             .borrow_mut()
             .insert(cache_key, runner.clone());
         Ok((runner, duration, weight_upload_duration, false))
+    }
+
+    fn get_or_create_embedding_lookup_gpu(
+        &self,
+    ) -> Result<CachedEmbeddingLookupGpuCacheEntry, ReferenceError> {
+        if let Some(cached) = self.cached_embedding_lookup_gpu.borrow().as_ref().cloned() {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let (vocab, hidden, words) = self
+            .weights
+            .embedding_lookup_u32_words("model.embed_tokens.weight")
+            .map_err(ReferenceError::Weight)?;
+        let context = self.get_or_create_packed_gpu_context()?;
+        let (runner, duration) = CachedGpuEmbeddingLookupRunner::new_with_context(
+            context,
+            &words,
+            vocab,
+            hidden,
+        )
+        .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let runner = Rc::new(RefCell::new(runner));
+        *self.cached_embedding_lookup_gpu.borrow_mut() = Some(runner.clone());
+        Ok((runner, duration, false))
+    }
+
+    fn get_or_create_input_norm_gpu(
+        &self,
+    ) -> Result<CachedWeightedRmsNormGpuCacheEntry, ReferenceError> {
+        if let Some(cached) = self.cached_input_norm_gpu.borrow().as_ref().cloned() {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let context = self.get_or_create_packed_gpu_context()?;
+        let (runner, duration) = CachedGpuWeightedRmsNormRunner::new_with_context(
+            context,
+            self.config.hidden_size,
+            self.config.rms_norm_eps as f32,
+        )
+        .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let runner = Rc::new(RefCell::new(runner));
+        *self.cached_input_norm_gpu.borrow_mut() = Some(runner.clone());
+        Ok((runner, duration, false))
+    }
+
+    fn get_or_create_qk_rope_gpu(
+        &self,
+    ) -> Result<CachedQkRopeGpuCacheEntry, ReferenceError> {
+        if let Some(cached) = self.cached_qk_rope_gpu.borrow().as_ref().cloned() {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let context = self.get_or_create_packed_gpu_context()?;
+        let (runner, duration) = CachedGpuQkRopeRunner::new_with_context(
+            context,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+        )
+        .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let runner = Rc::new(RefCell::new(runner));
+        *self.cached_qk_rope_gpu.borrow_mut() = Some(runner.clone());
+        Ok((runner, duration, false))
     }
 
     fn get_or_create_final_norm_gpu(
@@ -7246,6 +7286,7 @@ impl ReferenceModel {
                             .qk_rope_runner
                             .as_ref()
                             .expect("qk rope runner should exist after execution")
+                            .borrow()
                             .query_resident_output(),
                     );
                     gpu_first_session
@@ -9033,6 +9074,7 @@ mod tests {
             .as_mut()
             .expect("embedding runner should be created");
         let (gpu_hidden, _) = runner
+            .borrow_mut()
             .run_with_output(2)
             .expect("gpu embedding lookup should succeed");
         assert_eq!(gpu_hidden, reference_hidden);
