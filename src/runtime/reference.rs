@@ -33,7 +33,7 @@ use crate::runtime::gpu_decode_env::{
 use crate::runtime::gpu_decode_metrics::{
     AttentionProjectionMixMetrics, DecodeMetrics, HybridDecodeMetrics,
     HybridProjectionDecodeMetrics, MlpProjectionMixMetrics, PackedAttentionStageMetrics,
-    PackedDecodeMetrics, PackedDecodeValidationReport, PackedGpuSessionMetrics,
+    PackedDecodeMetrics, PackedGpuSessionMetrics,
     PackedMlpStageMetrics, ProjectionComparison, account_projection_report,
     finish_packed_decode_metrics,
 };
@@ -6844,69 +6844,6 @@ impl ReferenceModel {
                 String::new(),
             ),
         ))
-    }
-
-    pub fn benchmark_packed_decode(
-        &self,
-        prompt: &str,
-        max_new_tokens: usize,
-        use_attention_qkv: bool,
-        use_mlp_gu: bool,
-    ) -> Result<PackedDecodeMetrics, ReferenceError> {
-        Ok(self
-            .generate_packed_greedy(prompt, max_new_tokens, use_attention_qkv, use_mlp_gu)?
-            .metrics)
-    }
-
-    pub fn compare_prefill_logits_against(
-        &self,
-        dense_reference: &ReferenceModel,
-        prompt: &str,
-        use_attention_qkv: bool,
-        use_mlp_gu: bool,
-    ) -> Result<PackedDecodeValidationReport, ReferenceError> {
-        let dense_logits = dense_reference.prefill_logits_for_variant(prompt, false, false)?;
-        let packed_logits =
-            self.prefill_logits_for_variant(prompt, use_attention_qkv, use_mlp_gu)?;
-        if dense_logits.len() != packed_logits.len() {
-            return Err(ReferenceError::Decode(format!(
-                "logit length mismatch: dense {} vs packed {}",
-                dense_logits.len(),
-                packed_logits.len()
-            )));
-        }
-        let mut max_abs_diff = 0.0f32;
-        let mut sum_abs_diff = 0.0f32;
-        for (left, right) in dense_logits.iter().zip(packed_logits.iter()) {
-            let diff = (left - right).abs();
-            max_abs_diff = max_abs_diff.max(diff);
-            sum_abs_diff += diff;
-        }
-        let mean_abs_diff = if dense_logits.is_empty() {
-            0.0
-        } else {
-            sum_abs_diff / dense_logits.len() as f32
-        };
-        let prompt_tokens = dense_reference.prompt_analysis(prompt)?.token_count;
-        let mut enabled = String::new();
-        if use_attention_qkv {
-            enabled.push_str("qkv");
-        }
-        if use_mlp_gu {
-            if !enabled.is_empty() {
-                enabled.push('+');
-            }
-            enabled.push_str("gu");
-        }
-        if enabled.is_empty() {
-            enabled.push_str("dense");
-        }
-        Ok(PackedDecodeValidationReport {
-            enabled_projections: enabled,
-            prompt_tokens,
-            max_abs_diff,
-            mean_abs_diff,
-        })
     }
 
     #[allow(clippy::too_many_arguments)]
