@@ -4886,6 +4886,75 @@ impl ReferenceModel {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn apply_dense_attention_fallback(
+        &self,
+        session: &mut PackedGpuSession<'_>,
+        layer_tensors: &LayerTensorNames,
+        q: &[f32],
+        layer_cache: &LayerCache,
+        position: usize,
+        residual: &[f32],
+        use_attention_full: bool,
+        use_attention_qkv: bool,
+        attention_stage_metrics: &mut PackedAttentionStageMetrics,
+        metrics: &mut DecodeMetrics,
+        non_offloaded_dense_duration: &mut Duration,
+    ) -> Result<Vec<f32>, ReferenceError> {
+        let started_at = Instant::now();
+        let attn_started_at = Instant::now();
+        let attn = attention_single_query(
+            q,
+            layer_cache.keys(),
+            layer_cache.values(),
+            position + 1,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+        );
+        let attn_elapsed = attn_started_at.elapsed();
+        attention_stage_metrics.query_duration += attn_elapsed;
+        session.push_dense_stage_trace("attention_core", "attention_single_query", attn_elapsed);
+        let oproj_started_at = Instant::now();
+        let hidden = if use_attention_full {
+            session.run_projection_add_residual(
+                &layer_tensors.o_proj_weight,
+                self.config.hidden_size,
+                self.config.hidden_size,
+                &attn,
+                residual,
+            )?
+        } else {
+            let attn_output = self.matvec_f16_resolved(&layer_tensors.o_proj_weight, &attn)?;
+            residual
+                .iter()
+                .zip(attn_output.iter())
+                .map(|(left, right)| left + right)
+                .collect()
+        };
+        let oproj_elapsed = oproj_started_at.elapsed();
+        attention_stage_metrics.oproj_duration += oproj_elapsed;
+        let residual_elapsed = Duration::ZERO;
+        attention_stage_metrics.residual_duration += residual_elapsed;
+        session.push_dense_stage_trace(
+            "attention_residual",
+            "attention_residual_add",
+            residual_elapsed,
+        );
+        let elapsed = started_at.elapsed();
+        metrics.attention_duration += elapsed;
+        if use_attention_qkv {
+            if use_attention_full {
+                *non_offloaded_dense_duration += attn_elapsed + residual_elapsed;
+            } else {
+                *non_offloaded_dense_duration += elapsed;
+            }
+        } else {
+            *non_offloaded_dense_duration += elapsed;
+        }
+        Ok(hidden)
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -7378,62 +7447,19 @@ impl ReferenceModel {
             }
 
             if !use_gpu_attention_only {
-                let started_at = Instant::now();
-                let attn_started_at = Instant::now();
-                let attn = attention_single_query(
+                hidden = self.apply_dense_attention_fallback(
+                    session,
+                    layer_tensors,
                     &q,
-                    layer_cache.keys(),
-                    layer_cache.values(),
-                    position + 1,
-                    self.config.num_attention_heads,
-                    self.config.num_key_value_heads,
-                    self.config.head_dim,
-                );
-                let attn_elapsed = attn_started_at.elapsed();
-                attention_stage_metrics.query_duration += attn_elapsed;
-                session.push_dense_stage_trace(
-                    "attention_core",
-                    "attention_single_query",
-                    attn_elapsed,
-                );
-                let oproj_started_at = Instant::now();
-                hidden = if use_attention_full {
-                    session.run_projection_add_residual(
-                        &layer_tensors.o_proj_weight,
-                        self.config.hidden_size,
-                        self.config.hidden_size,
-                        &attn,
-                        &residual,
-                    )?
-                } else {
-                    let attn_output =
-                        self.matvec_f16_resolved(&layer_tensors.o_proj_weight, &attn)?;
-                    residual
-                        .iter()
-                        .zip(attn_output.iter())
-                        .map(|(left, right)| left + right)
-                        .collect()
-                };
-                let oproj_elapsed = oproj_started_at.elapsed();
-                attention_stage_metrics.oproj_duration += oproj_elapsed;
-                let residual_elapsed = Duration::ZERO;
-                attention_stage_metrics.residual_duration += residual_elapsed;
-                session.push_dense_stage_trace(
-                    "attention_residual",
-                    "attention_residual_add",
-                    residual_elapsed,
-                );
-                let elapsed = started_at.elapsed();
-                metrics.attention_duration += elapsed;
-                if use_attention_qkv {
-                    if use_attention_full {
-                        *non_offloaded_dense_duration += attn_elapsed + residual_elapsed;
-                    } else {
-                        *non_offloaded_dense_duration += elapsed;
-                    }
-                } else {
-                    *non_offloaded_dense_duration += elapsed;
-                }
+                    layer_cache,
+                    position,
+                    &residual,
+                    use_attention_full,
+                    use_attention_qkv,
+                    attention_stage_metrics,
+                    metrics,
+                    non_offloaded_dense_duration,
+                )?;
             }
 
             if reusable_qkv_scratch {
