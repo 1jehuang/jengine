@@ -692,6 +692,26 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
             .map(|cache| (cache.keys_capacity(), cache.values_capacity()))
     }
 
+    pub(crate) fn gpu_kv_snapshot_lengths(
+        &self,
+        layer_idx: usize,
+    ) -> Result<Option<(usize, usize)>, ReferenceError> {
+        let Some(cache) = self.inner.gpu_first_session.gpu_kv_caches.get(&layer_idx) else {
+            return Ok(None);
+        };
+        let keys = cache.snapshot_keys().map_err(|error| {
+            ReferenceError::Decode(format!(
+                "gpu kv key snapshot failed for layer {layer_idx}: {error}"
+            ))
+        })?;
+        let values = cache.snapshot_values().map_err(|error| {
+            ReferenceError::Decode(format!(
+                "gpu kv value snapshot failed for layer {layer_idx}: {error}"
+            ))
+        })?;
+        Ok(Some((keys.len(), values.len())))
+    }
+
     pub(crate) fn has_attention_block(&self, layer_idx: usize) -> bool {
         self.inner.gpu_first_session.attention_blocks.contains_key(&layer_idx)
     }
@@ -8909,26 +8929,15 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when attention flag is enabled");
         };
-        let kv_cache = session
-            .inner
-            .gpu_first_session
-            .gpu_kv_caches
-            .get(&0)
-            .expect("layer 0 gpu kv cache should exist");
-        assert_eq!(kv_cache.len_tokens(), 1);
+        assert_eq!(session.gpu_kv_len_tokens(0), Some(1));
         assert_eq!(
-            kv_cache
-                .snapshot_keys()
-                .expect("kv keys should read back")
-                .len(),
-            model.config.num_key_value_heads * model.config.head_dim
-        );
-        assert_eq!(
-            kv_cache
-                .snapshot_values()
-                .expect("kv values should read back")
-                .len(),
-            model.config.num_key_value_heads * model.config.head_dim
+            session
+                .gpu_kv_snapshot_lengths(0)
+                .expect("gpu kv snapshots should read back"),
+            Some((
+                model.config.num_key_value_heads * model.config.head_dim,
+                model.config.num_key_value_heads * model.config.head_dim,
+            ))
         );
     }
 
@@ -8961,13 +8970,7 @@ mod tests {
         };
         assert_eq!(session.cpu_kv_is_empty(0), Some(true));
         assert_eq!(session.cpu_kv_capacities(0), Some((0, 0)));
-        let kv_cache = session
-            .inner
-            .gpu_first_session
-            .gpu_kv_caches
-            .get(&0)
-            .expect("layer 0 gpu kv cache should exist");
-        assert_eq!(kv_cache.len_tokens(), 1);
+        assert_eq!(session.gpu_kv_len_tokens(0), Some(1));
     }
 
     #[test]
@@ -8996,13 +8999,7 @@ mod tests {
         };
         assert_eq!(session.cpu_kv_is_empty(0), Some(true));
         assert_eq!(session.cpu_kv_capacities(0), Some((0, 0)));
-        let kv_cache = session
-            .inner
-            .gpu_first_session
-            .gpu_kv_caches
-            .get(&0)
-            .expect("layer 0 gpu kv cache should exist");
-        assert_eq!(kv_cache.len_tokens(), 1);
+        assert_eq!(session.gpu_kv_len_tokens(0), Some(1));
     }
 
     #[test]
