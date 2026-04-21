@@ -342,6 +342,11 @@ impl CachedGpuSwigluPackF16PairsRunner {
     pub fn packed_len(&self) -> usize {
         self.packed_len
     }
+    pub fn read_output(&self) -> Result<(Vec<u32>, Duration), GpuSwigluPackF16PairsError> {
+        let download_started = Instant::now();
+        let output = read_u32_buffer(&self.output_buffer, self.packed_len)?;
+        Ok((output, download_started.elapsed()))
+    }
     pub fn len(&self) -> usize {
         self.len
     }
