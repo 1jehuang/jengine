@@ -322,22 +322,15 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
     }
 
     pub(crate) fn has_qk_rope_runner(&self) -> bool {
-        self.inner.gpu_first_session.qk_rope_runner.is_some()
+        self.inner.gpu_first_session.has_qk_rope_runner()
     }
 
     pub(crate) fn has_raw_f32_projection_runner(&self, key: &str) -> bool {
-        self.inner
-            .gpu_first_session
-            .raw_f32_projection_runners
-            .contains_key(key)
+        self.inner.gpu_first_session.has_raw_f32_projection_runner(key)
     }
 
     pub(crate) fn gpu_kv_len_tokens(&self, layer_idx: usize) -> Option<usize> {
-        self.inner
-            .gpu_first_session
-            .gpu_kv_caches
-            .get(&layer_idx)
-            .map(|cache| cache.len_tokens())
+        self.inner.gpu_first_session.gpu_kv_len_tokens(layer_idx)
     }
 
     pub(crate) fn cpu_kv_is_empty(&self, layer_idx: usize) -> Option<bool> {
@@ -358,49 +351,30 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
         &self,
         layer_idx: usize,
     ) -> Result<Option<(usize, usize)>, ReferenceError> {
-        let Some(cache) = self.inner.gpu_first_session.gpu_kv_caches.get(&layer_idx) else {
-            return Ok(None);
-        };
-        let keys = cache.snapshot_keys().map_err(|error| {
-            ReferenceError::Decode(format!(
-                "gpu kv key snapshot failed for layer {layer_idx}: {error}"
-            ))
-        })?;
-        let values = cache.snapshot_values().map_err(|error| {
-            ReferenceError::Decode(format!(
-                "gpu kv value snapshot failed for layer {layer_idx}: {error}"
-            ))
-        })?;
-        Ok(Some((keys.len(), values.len())))
+        self.inner.gpu_first_session.gpu_kv_snapshot_lengths(layer_idx)
     }
 
     pub(crate) fn has_attention_block(&self, layer_idx: usize) -> bool {
-        self.inner.gpu_first_session.attention_blocks.contains_key(&layer_idx)
+        self.inner.gpu_first_session.has_attention_block(layer_idx)
     }
 
     pub(crate) fn has_mlp_block(&self, layer_idx: usize) -> bool {
-        self.inner.gpu_first_session.mlp_blocks.contains_key(&layer_idx)
+        self.inner.gpu_first_session.has_mlp_block(layer_idx)
     }
 
     pub(crate) fn has_tail_block(&self) -> bool {
-        self.inner.gpu_first_session.tail_block.is_some()
+        self.inner.gpu_first_session.has_tail_block()
     }
 
     pub(crate) fn has_full_last_layer_block(&self) -> bool {
-        self.inner.gpu_first_session.full_last_layer_block.is_some()
+        self.inner.gpu_first_session.has_full_last_layer_block()
     }
 
     pub(crate) fn embedding_lookup_output(
         &mut self,
         token_id: usize,
     ) -> Result<Option<Vec<f32>>, ReferenceError> {
-        let Some(runner) = self.inner.gpu_first_session.embedding_lookup_runner.as_mut() else {
-            return Ok(None);
-        };
-        let (output, _) = runner.borrow_mut().run_with_output(token_id).map_err(|error| {
-            ReferenceError::Decode(format!("gpu embedding lookup failed: {error}"))
-        })?;
-        Ok(Some(output))
+        self.inner.gpu_first_session.embedding_lookup_output(token_id)
     }
 
     pub fn finish_metrics(
@@ -548,6 +522,64 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 value_buffer_size: cache.value_buffer_size(),
             }
         })
+    }
+
+    fn has_qk_rope_runner(&self) -> bool {
+        self.qk_rope_runner.is_some()
+    }
+
+    fn has_raw_f32_projection_runner(&self, key: &str) -> bool {
+        self.raw_f32_projection_runners.contains_key(key)
+    }
+
+    fn gpu_kv_len_tokens(&self, layer_idx: usize) -> Option<usize> {
+        self.gpu_kv_caches.get(&layer_idx).map(|cache| cache.len_tokens())
+    }
+
+    fn gpu_kv_snapshot_lengths(
+        &self,
+        layer_idx: usize,
+    ) -> Result<Option<(usize, usize)>, ReferenceError> {
+        let Some(cache) = self.gpu_kv_caches.get(&layer_idx) else {
+            return Ok(None);
+        };
+        let keys = cache.snapshot_keys().map_err(|error| {
+            ReferenceError::Decode(format!(
+                "gpu kv key snapshot failed for layer {layer_idx}: {error}"
+            ))
+        })?;
+        let values = cache.snapshot_values().map_err(|error| {
+            ReferenceError::Decode(format!(
+                "gpu kv value snapshot failed for layer {layer_idx}: {error}"
+            ))
+        })?;
+        Ok(Some((keys.len(), values.len())))
+    }
+
+    fn has_attention_block(&self, layer_idx: usize) -> bool {
+        self.attention_blocks.contains_key(&layer_idx)
+    }
+
+    fn has_mlp_block(&self, layer_idx: usize) -> bool {
+        self.mlp_blocks.contains_key(&layer_idx)
+    }
+
+    fn has_tail_block(&self) -> bool {
+        self.tail_block.is_some()
+    }
+
+    fn has_full_last_layer_block(&self) -> bool {
+        self.full_last_layer_block.is_some()
+    }
+
+    fn embedding_lookup_output(&mut self, token_id: usize) -> Result<Option<Vec<f32>>, ReferenceError> {
+        let Some(runner) = self.embedding_lookup_runner.as_mut() else {
+            return Ok(None);
+        };
+        let (output, _) = runner.borrow_mut().run_with_output(token_id).map_err(|error| {
+            ReferenceError::Decode(format!("gpu embedding lookup failed: {error}"))
+        })?;
+        Ok(Some(output))
     }
 
     fn ensure_embedding_lookup_runner(
