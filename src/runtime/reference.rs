@@ -30,9 +30,10 @@ use crate::runtime::gpu_decode_env::{
     packed_use_gpu_tail, packed_use_mlp_full,
 };
 use crate::runtime::gpu_decode_metrics::{
-    AttentionProjectionMixMetrics, DecodeMetrics, HybridProjectionDecodeMetrics,
-    MlpProjectionMixMetrics, PackedAttentionStageMetrics, PackedDecodeMetrics,
-    PackedDecodeValidationReport, PackedGpuSessionMetrics, PackedMlpStageMetrics,
+    AttentionProjectionMixMetrics, DecodeMetrics, HybridDecodeMetrics,
+    HybridProjectionDecodeMetrics, MlpProjectionMixMetrics, PackedAttentionStageMetrics,
+    PackedDecodeMetrics, PackedDecodeValidationReport, PackedGpuSessionMetrics,
+    PackedMlpStageMetrics, ProjectionComparison,
 };
 use crate::runtime::gpu_decode_model_state::{HybridQProjCache, LayerTensorNames};
 use crate::runtime::gpu_decode_output::{
@@ -111,61 +112,6 @@ impl From<WeightError> for ReferenceError {
 impl From<PackedModelError> for ReferenceError {
     fn from(value: PackedModelError) -> Self {
         Self::PackedModel(value)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProjectionComparison {
-    pub layer_idx: usize,
-    pub token_id: usize,
-    pub dense_duration: Duration,
-    pub pack_duration: Duration,
-    pub packed_duration: Duration,
-    pub max_abs_diff: f32,
-    pub mean_abs_diff: f32,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct HybridDecodeMetrics {
-    pub total_duration: Duration,
-    pub q_proj_pack_duration: Duration,
-    pub q_proj_pack_cache_hit: bool,
-    pub q_proj_gpu_compile_duration: Duration,
-    pub q_proj_gpu_cache_hit: bool,
-    pub q_proj_gpu_upload_duration: Duration,
-    pub q_proj_gpu_duration: Duration,
-    pub q_proj_gpu_download_duration: Duration,
-    pub output_text: String,
-}
-
-impl HybridDecodeMetrics {
-    pub fn summarize(&self) -> String {
-        format!(
-            "total_ms={:.3} qproj_pack_ms={:.3} qproj_pack_cache_hit={} qproj_gpu_compile_ms={:.3} qproj_gpu_cache_hit={} qproj_gpu_upload_ms={:.3} qproj_gpu_ms={:.3} qproj_gpu_download_ms={:.3} output={}",
-            self.total_duration.as_secs_f64() * 1_000.0,
-            self.q_proj_pack_duration.as_secs_f64() * 1_000.0,
-            self.q_proj_pack_cache_hit,
-            self.q_proj_gpu_compile_duration.as_secs_f64() * 1_000.0,
-            self.q_proj_gpu_cache_hit,
-            self.q_proj_gpu_upload_duration.as_secs_f64() * 1_000.0,
-            self.q_proj_gpu_duration.as_secs_f64() * 1_000.0,
-            self.q_proj_gpu_download_duration.as_secs_f64() * 1_000.0,
-            self.output_text,
-        )
-    }
-}
-impl ProjectionComparison {
-    pub fn summarize(&self) -> String {
-        format!(
-            "layer={} token_id={} dense_ms={:.3} pack_ms={:.3} packed_ms={:.3} max_abs_diff={:.6} mean_abs_diff={:.6}",
-            self.layer_idx,
-            self.token_id,
-            self.dense_duration.as_secs_f64() * 1_000.0,
-            self.pack_duration.as_secs_f64() * 1_000.0,
-            self.packed_duration.as_secs_f64() * 1_000.0,
-            self.max_abs_diff,
-            self.mean_abs_diff,
-        )
     }
 }
 

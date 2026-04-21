@@ -1,6 +1,62 @@
 use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ProjectionComparison {
+    pub layer_idx: usize,
+    pub token_id: usize,
+    pub dense_duration: Duration,
+    pub pack_duration: Duration,
+    pub packed_duration: Duration,
+    pub max_abs_diff: f32,
+    pub mean_abs_diff: f32,
+}
+
+impl ProjectionComparison {
+    pub fn summarize(&self) -> String {
+        format!(
+            "layer={} token_id={} dense_ms={:.3} pack_ms={:.3} packed_ms={:.3} max_abs_diff={:.6} mean_abs_diff={:.6}",
+            self.layer_idx,
+            self.token_id,
+            self.dense_duration.as_secs_f64() * 1_000.0,
+            self.pack_duration.as_secs_f64() * 1_000.0,
+            self.packed_duration.as_secs_f64() * 1_000.0,
+            self.max_abs_diff,
+            self.mean_abs_diff,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HybridDecodeMetrics {
+    pub total_duration: Duration,
+    pub q_proj_pack_duration: Duration,
+    pub q_proj_pack_cache_hit: bool,
+    pub q_proj_gpu_compile_duration: Duration,
+    pub q_proj_gpu_cache_hit: bool,
+    pub q_proj_gpu_upload_duration: Duration,
+    pub q_proj_gpu_duration: Duration,
+    pub q_proj_gpu_download_duration: Duration,
+    pub output_text: String,
+}
+
+impl HybridDecodeMetrics {
+    pub fn summarize(&self) -> String {
+        format!(
+            "total_ms={:.3} qproj_pack_ms={:.3} qproj_pack_cache_hit={} qproj_gpu_compile_ms={:.3} qproj_gpu_cache_hit={} qproj_gpu_upload_ms={:.3} qproj_gpu_ms={:.3} qproj_gpu_download_ms={:.3} output={}",
+            self.total_duration.as_secs_f64() * 1_000.0,
+            self.q_proj_pack_duration.as_secs_f64() * 1_000.0,
+            self.q_proj_pack_cache_hit,
+            self.q_proj_gpu_compile_duration.as_secs_f64() * 1_000.0,
+            self.q_proj_gpu_cache_hit,
+            self.q_proj_gpu_upload_duration.as_secs_f64() * 1_000.0,
+            self.q_proj_gpu_duration.as_secs_f64() * 1_000.0,
+            self.q_proj_gpu_download_duration.as_secs_f64() * 1_000.0,
+            self.output_text,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct DecodeMetrics {
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
