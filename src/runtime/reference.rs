@@ -1928,32 +1928,27 @@ impl<'a> PackedGpuSession<'a> {
     }
 
     fn take_qkv_scratch(&mut self) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-        let PackedDecodeScratch { q, k, v, .. } = &mut self.scratch;
-        (std::mem::take(q), std::mem::take(k), std::mem::take(v))
+        self.scratch.take_qkv()
     }
 
     fn restore_qkv_scratch(&mut self, q: Vec<f32>, k: Vec<f32>, v: Vec<f32>) {
-        self.scratch.q = q;
-        self.scratch.k = k;
-        self.scratch.v = v;
+        self.scratch.restore_qkv(q, k, v)
     }
 
     fn take_gate_up_scratch(&mut self) -> (Vec<f32>, Vec<f32>) {
-        let PackedDecodeScratch { gate, up, .. } = &mut self.scratch;
-        (std::mem::take(gate), std::mem::take(up))
+        self.scratch.take_gate_up()
     }
 
     fn restore_gate_up_scratch(&mut self, gate: Vec<f32>, up: Vec<f32>) {
-        self.scratch.gate = gate;
-        self.scratch.up = up;
+        self.scratch.restore_gate_up(gate, up)
     }
 
     fn take_mlp_scratch(&mut self) -> Vec<f32> {
-        std::mem::take(&mut self.scratch.mlp)
+        self.scratch.take_mlp()
     }
 
     fn restore_mlp_scratch(&mut self, mlp: Vec<f32>) {
-        self.scratch.mlp = mlp;
+        self.scratch.restore_mlp(mlp)
     }
 
     fn run_projection(
