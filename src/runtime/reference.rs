@@ -5147,6 +5147,78 @@ impl ReferenceModel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn run_cpu_mlp_execution(
+        &self,
+        session: &mut PackedGpuSession<'_>,
+        layer_tensors: &LayerTensorNames,
+        hidden_states: &[f32],
+        residual: &[f32],
+        use_mlp_gu: bool,
+        use_mlp_full: bool,
+        mlp_stage_metrics: &mut PackedMlpStageMetrics,
+    ) -> Result<GpuSwigluBlockExecution, ReferenceError> {
+        let mut reusable_gate_up_scratch = false;
+        let (gate, up, dense_tail_started_at) = if use_mlp_gu {
+            let (mut gate, mut up) = session.take_gate_up_scratch();
+            session.run_projection_pair_into(
+                &layer_tensors.gate_proj_weight,
+                self.config.intermediate_size,
+                &layer_tensors.up_proj_weight,
+                self.config.intermediate_size,
+                self.config.hidden_size,
+                hidden_states,
+                &mut gate,
+                &mut up,
+            )?;
+            reusable_gate_up_scratch = true;
+            (gate, up, Instant::now())
+        } else {
+            let dense_started_at = Instant::now();
+            (
+                self.matvec_f16_resolved(&layer_tensors.gate_proj_weight, hidden_states)?,
+                self.matvec_f16_resolved(&layer_tensors.up_proj_weight, hidden_states)?,
+                dense_started_at,
+            )
+        };
+        let swiglu_started_at = Instant::now();
+        let mut mlp = session.take_mlp_scratch();
+        swiglu_into(&gate, &up, &mut mlp);
+        if reusable_gate_up_scratch {
+            session.restore_gate_up_scratch(gate, up);
+        }
+        let swiglu_elapsed = swiglu_started_at.elapsed();
+        mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
+        session.push_dense_stage_trace("mlp_swiglu", "swiglu", swiglu_elapsed);
+        let down_started_at = Instant::now();
+        let down = if use_mlp_full {
+            session.run_projection_add_residual(
+                &layer_tensors.down_proj_weight,
+                self.config.hidden_size,
+                self.config.intermediate_size,
+                &mlp,
+                residual,
+            )?
+        } else {
+            let down = self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?;
+            residual
+                .iter()
+                .zip(down.iter())
+                .map(|(left, right)| left + right)
+                .collect()
+        };
+        session.restore_mlp_scratch(mlp);
+        let down_elapsed = down_started_at.elapsed();
+        Ok((
+            Some(down),
+            None,
+            swiglu_elapsed,
+            down_elapsed,
+            Duration::ZERO,
+            dense_tail_started_at,
+        ))
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -7792,65 +7864,15 @@ impl ReferenceModel {
                     mlp_stage_metrics,
                 )?
             } else {
-                let mut reusable_gate_up_scratch = false;
-                let (gate, up, dense_tail_started_at) = if use_mlp_gu {
-                    let (mut gate, mut up) = session.take_gate_up_scratch();
-                    session.run_projection_pair_into(
-                        &layer_tensors.gate_proj_weight,
-                        self.config.intermediate_size,
-                        &layer_tensors.up_proj_weight,
-                        self.config.intermediate_size,
-                        self.config.hidden_size,
-                        &hidden_states,
-                        &mut gate,
-                        &mut up,
-                    )?;
-                    reusable_gate_up_scratch = true;
-                    (gate, up, Instant::now())
-                } else {
-                    let dense_started_at = Instant::now();
-                    (
-                        self.matvec_f16_resolved(&layer_tensors.gate_proj_weight, &hidden_states)?,
-                        self.matvec_f16_resolved(&layer_tensors.up_proj_weight, &hidden_states)?,
-                        dense_started_at,
-                    )
-                };
-                let swiglu_started_at = Instant::now();
-                let mut mlp = session.take_mlp_scratch();
-                swiglu_into(&gate, &up, &mut mlp);
-                if reusable_gate_up_scratch {
-                    session.restore_gate_up_scratch(gate, up);
-                }
-                let swiglu_elapsed = swiglu_started_at.elapsed();
-                mlp_stage_metrics.swiglu_duration += swiglu_elapsed;
-                session.push_dense_stage_trace("mlp_swiglu", "swiglu", swiglu_elapsed);
-                let down_started_at = Instant::now();
-                let down = if use_mlp_full {
-                    session.run_projection_add_residual(
-                        &layer_tensors.down_proj_weight,
-                        self.config.hidden_size,
-                        self.config.intermediate_size,
-                        &mlp,
-                        &residual,
-                    )?
-                } else {
-                    let down = self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?;
-                    residual
-                        .iter()
-                        .zip(down.iter())
-                        .map(|(left, right)| left + right)
-                        .collect()
-                };
-                session.restore_mlp_scratch(mlp);
-                let down_elapsed = down_started_at.elapsed();
-                (
-                    Some(down),
-                    None,
-                    swiglu_elapsed,
-                    down_elapsed,
-                    Duration::ZERO,
-                    dense_tail_started_at,
-                )
+                self.run_cpu_mlp_execution(
+                    session,
+                    layer_tensors,
+                    &hidden_states,
+                    &residual,
+                    use_mlp_gu,
+                    use_mlp_full,
+                    mlp_stage_metrics,
+                )?
             };
             mlp_stage_metrics.down_duration += down_elapsed;
             let residual_elapsed = if let Some(hidden_gpu) = gpu_hidden_after_mlp {
