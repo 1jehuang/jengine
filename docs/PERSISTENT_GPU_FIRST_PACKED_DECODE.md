@@ -98,6 +98,28 @@ So the next architectural focus should be:
 2. keep moving dense CPU glue off the host path
 3. collapse dispatch count once the GPU-first branch is stable
 
+### Current bundled branch matrix checkpoint
+
+The current bundled profiler script is:
+
+- `scripts/profile_gpu_first_matrix.sh`
+
+A fresh matrix capture was written to:
+
+- `.artifacts/gpu-first-matrix/20260420-235327/`
+
+with summary:
+
+- `strong_packed`: `380.334 ms` total, `193.555 ms` GPU, `69.244 ms` download, `14.629 ms` compile, `55.523 ms` non-offloaded dense, `226` dispatches
+- `gpu_full_last_layer`: `452.187 ms` total, `209.921 ms` GPU, `68.935 ms` download, `17.672 ms` compile, `94.777 ms` non-offloaded dense, `238` dispatches
+- `gpu_attention_swiglu_block`: `37737.417 ms` total, `1592.747 ms` GPU, `20.665 ms` download, `35621.795 ms` compile, `44.050 ms` non-offloaded dense, `58` dispatches
+
+This reinforces the current branch priority:
+
+- the broad attention+swiglu block path is still unusable
+- the strong packed baseline remains slightly ahead right now
+- the full-last-layer GPU-first branch is the viable branch to keep improving
+
 
 ## Current architecture
 
