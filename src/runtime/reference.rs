@@ -2024,6 +2024,11 @@ enum PackedMlpStageOutcome {
     NextToken(usize),
 }
 
+enum PackedDecodeLayerStepOutcome {
+    Continue,
+    NextToken(usize),
+}
+
 impl<'a> PackedGpuSession<'a> {
     fn new(model: &'a ReferenceModel) -> Self {
         Self {
@@ -4881,8 +4886,8 @@ impl ReferenceModel {
     ) -> Result<(), ReferenceError> {
         let post_norm_weight =
             self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
-        let (attention_report, mlp_report, compile_duration) =
-            gpu_first_session.run_attention_mlp_layer_resident(
+        let (attention_report, mlp_report, compile_duration) = gpu_first_session
+            .run_attention_mlp_layer_resident(
                 layer_idx,
                 position + 1,
                 Some(q),
@@ -5001,14 +5006,15 @@ impl ReferenceModel {
         session: &mut PackedGpuSession<'_>,
     ) -> Result<usize, ReferenceError> {
         let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
-        let (next_token, mlp_report, tail_report, compile_duration) =
-            gpu_first_session.run_mlp_layer_to_tail_argmax(
+        let (next_token, mlp_report, tail_report, compile_duration) = gpu_first_session
+            .run_mlp_layer_to_tail_argmax(
                 layer_idx,
                 residual,
                 post_norm_weight,
                 &final_norm_weight,
             )?;
-        metrics.norm_duration += mlp_report.post_norm_gpu_duration + tail_report.final_norm_gpu_duration;
+        metrics.norm_duration +=
+            mlp_report.post_norm_gpu_duration + tail_report.final_norm_gpu_duration;
         mlp_stage_metrics.swiglu_duration += mlp_report.swiglu_pack_gpu_duration;
         mlp_stage_metrics.down_duration += mlp_report.down_gpu_duration;
         mlp_stage_metrics.residual_duration += mlp_report.residual_add_gpu_duration;
@@ -5091,11 +5097,8 @@ impl ReferenceModel {
             return Ok(Some(pair));
         }
         let started_at = Instant::now();
-        *hidden_states = weighted_rms_norm(
-            residual,
-            post_norm_weight,
-            self.config.rms_norm_eps as f32,
-        );
+        *hidden_states =
+            weighted_rms_norm(residual, post_norm_weight, self.config.rms_norm_eps as f32);
         let elapsed = started_at.elapsed();
         metrics.norm_duration += elapsed;
         *non_offloaded_dense_duration += elapsed;
@@ -5298,12 +5301,8 @@ impl ReferenceModel {
         let norm_started = Instant::now();
         let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
         let next_token = if let Some(hidden_gpu) = final_hidden_gpu {
-            let (tail_result, tail_report, compile_duration) =
-                gpu_first_session.run_tail_from_resident_hidden(
-                    &hidden_gpu.tensor,
-                    &final_norm_weight,
-                    true,
-                )?;
+            let (tail_result, tail_report, compile_duration) = gpu_first_session
+                .run_tail_from_resident_hidden(&hidden_gpu.tensor, &final_norm_weight, true)?;
             let next_token = match tail_result {
                 GpuTailResult::NextToken(token_id) => token_id,
                 GpuTailResult::Logits(_) => unreachable!("argmax-only tail should return a token"),
@@ -5350,7 +5349,8 @@ impl ReferenceModel {
             metrics.logits_duration += logits_started.elapsed();
             next_token
         } else {
-            let hidden = weighted_rms_norm(hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
+            let hidden =
+                weighted_rms_norm(hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
             let norm_elapsed = norm_started.elapsed();
             metrics.norm_duration += norm_elapsed;
             *non_offloaded_dense_duration += norm_elapsed;
@@ -5415,12 +5415,8 @@ impl ReferenceModel {
         let norm_started = Instant::now();
         let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
         let logits = if let Some(hidden_gpu) = final_hidden_gpu {
-            let (tail_result, tail_report, compile_duration) =
-                gpu_first_session.run_tail_from_resident_hidden(
-                    &hidden_gpu.tensor,
-                    &final_norm_weight,
-                    false,
-                )?;
+            let (tail_result, tail_report, compile_duration) = gpu_first_session
+                .run_tail_from_resident_hidden(&hidden_gpu.tensor, &final_norm_weight, false)?;
             let logits = match tail_result {
                 GpuTailResult::Logits(logits) => logits,
                 GpuTailResult::NextToken(_) => unreachable!("logits tail should return logits"),
@@ -5454,7 +5450,8 @@ impl ReferenceModel {
             session.metrics.download_duration += tail_report.logits_download_duration;
             logits
         } else {
-            let hidden = weighted_rms_norm(hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
+            let hidden =
+                weighted_rms_norm(hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
             let norm_elapsed = norm_started.elapsed();
             metrics.norm_duration += norm_elapsed;
             *non_offloaded_dense_duration += norm_elapsed;
@@ -7707,8 +7704,10 @@ impl ReferenceModel {
             && packed_use_gpu_full_last_layer()
             && is_last_layer;
         let use_gpu_mlp_entry = use_mlp_gu && use_mlp_full && packed_use_gpu_mlp_entry();
-        let use_gpu_mlp_only =
-            use_mlp_gu && use_mlp_full && packed_use_gpu_swiglu_block() && !use_gpu_attention_mlp_block;
+        let use_gpu_mlp_only = use_mlp_gu
+            && use_mlp_full
+            && packed_use_gpu_swiglu_block()
+            && !use_gpu_attention_mlp_block;
         let use_gpu_mlp_tail =
             use_gpu_mlp_only && argmax_only && packed_use_gpu_tail() && is_last_layer;
         let use_gpu_swiglu_block = use_mlp_gu && use_mlp_full && packed_use_gpu_swiglu_block();
@@ -8016,6 +8015,259 @@ impl ReferenceModel {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn execute_packed_decode_layer_step(
+        &self,
+        token_id: usize,
+        position: usize,
+        cos: &[f32],
+        sin: &[f32],
+        layer_idx: usize,
+        layer_cache: &mut LayerCache,
+        metrics: &mut DecodeMetrics,
+        attention_stage_metrics: &mut PackedAttentionStageMetrics,
+        mlp_stage_metrics: &mut PackedMlpStageMetrics,
+        non_offloaded_dense_duration: &mut Duration,
+        session: &mut PackedGpuSession<'_>,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        use_attention_full: bool,
+        use_mlp_full: bool,
+        argmax_only: bool,
+        hidden: &mut Vec<f32>,
+        final_hidden_gpu: &mut Option<ResidentGpuVectorAdd>,
+        resident_hidden_state: &mut Option<ResidentHiddenState>,
+    ) -> Result<PackedDecodeLayerStepOutcome, ReferenceError> {
+        let layer_tensors = &self.layer_tensors[layer_idx];
+        let stage_selection = self.select_packed_decode_stages(
+            layer_idx,
+            use_attention_qkv,
+            use_mlp_gu,
+            use_attention_full,
+            use_mlp_full,
+            argmax_only,
+        );
+
+        let input_norm_weight =
+            self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
+        let resident_hidden_tensor_qkv = self.try_resident_hidden_tensor_qkv_entry(
+            gpu_first_session,
+            *resident_hidden_state,
+            layer_idx,
+            use_attention_qkv,
+            stage_selection.use_gpu_attention_block,
+            &input_norm_weight,
+            layer_tensors,
+        )?;
+        let resident_hidden_entry_qkv = self.try_resident_hidden_entry_qkv(
+            gpu_first_session,
+            *resident_hidden_state,
+            layer_idx,
+            use_attention_qkv,
+            stage_selection.use_gpu_attention_block,
+            &input_norm_weight,
+            layer_tensors,
+        )?;
+        let first_layer_gpu_entry_tensor_qkv = self.try_first_layer_gpu_entry_tensor_qkv(
+            gpu_first_session,
+            &resident_hidden_tensor_qkv,
+            &resident_hidden_entry_qkv,
+            layer_idx,
+            token_id,
+            use_attention_qkv,
+            stage_selection.use_gpu_attention_block,
+            &input_norm_weight,
+            layer_tensors,
+        )?;
+        let first_layer_gpu_entry_qkv = self.try_first_layer_gpu_entry_qkv(
+            gpu_first_session,
+            &resident_hidden_tensor_qkv,
+            &resident_hidden_entry_qkv,
+            &first_layer_gpu_entry_tensor_qkv,
+            layer_idx,
+            token_id,
+            use_attention_qkv,
+            &input_norm_weight,
+            layer_tensors,
+        )?;
+        let mut hidden_states = if let Some(entry) = first_layer_gpu_entry_tensor_qkv.as_ref() {
+            self.apply_first_layer_tensor_qkv_entry(entry, hidden, metrics, session)
+        } else if let Some(entry) = first_layer_gpu_entry_qkv.as_ref() {
+            self.apply_first_layer_host_qkv_entry(entry, hidden, metrics, session)
+        } else if let Some(entry) = resident_hidden_tensor_qkv.as_ref() {
+            self.apply_resident_tensor_qkv_entry(entry, metrics, session)
+        } else if let Some(entry) = resident_hidden_entry_qkv.as_ref() {
+            self.apply_resident_host_qkv_entry(
+                entry,
+                hidden,
+                metrics,
+                session,
+                (*resident_hidden_state).expect("resident hidden state should exist"),
+                gpu_first_session,
+            )?
+        } else if layer_idx == 0 && packed_use_gpu_embedding() && packed_use_gpu_first_session() {
+            self.apply_first_layer_embedding_norm_entry(
+                gpu_first_session,
+                token_id,
+                &input_norm_weight,
+                hidden,
+                metrics,
+                session,
+            )?
+        } else {
+            let started_at = Instant::now();
+            let hidden_states =
+                weighted_rms_norm(hidden, &input_norm_weight, self.config.rms_norm_eps as f32);
+            let elapsed = started_at.elapsed();
+            metrics.norm_duration += elapsed;
+            *non_offloaded_dense_duration += elapsed;
+            session.push_dense_stage_trace(
+                "input_norm",
+                &layer_tensors.input_layernorm_weight,
+                elapsed,
+            );
+            hidden_states
+        };
+        let residual = hidden.clone();
+        let residual_resident = self.residual_resident_source(
+            &first_layer_gpu_entry_tensor_qkv,
+            &resident_hidden_tensor_qkv,
+        );
+
+        let started_at = Instant::now();
+        let (mut q, mut k, v, reusable_qkv_scratch) = self.prepare_qkv_host_vectors(
+            session,
+            layer_tensors,
+            &hidden_states,
+            &first_layer_gpu_entry_tensor_qkv,
+            first_layer_gpu_entry_qkv,
+            resident_hidden_entry_qkv,
+            use_attention_qkv,
+        )?;
+        let elapsed = started_at.elapsed();
+        metrics.qkv_duration += elapsed;
+        if !use_attention_qkv {
+            *non_offloaded_dense_duration += elapsed;
+        }
+
+        let started_at = Instant::now();
+        let q_norm_weight = self.load_vector_f32_resolved(&layer_tensors.q_norm_weight)?;
+        let k_norm_weight = self.load_vector_f32_resolved(&layer_tensors.k_norm_weight)?;
+        let mut q_resident: Option<GpuResidentBuffer> = None;
+        let mut kv_appended_on_gpu = false;
+        if stage_selection.use_gpu_attention_block {
+            (q_resident, kv_appended_on_gpu) = self.prepare_gpu_attention_query_and_kv(
+                gpu_first_session,
+                layer_idx,
+                &mut q,
+                &k,
+                &v,
+                &first_layer_gpu_entry_tensor_qkv,
+                &resident_hidden_tensor_qkv,
+                &q_norm_weight,
+                &k_norm_weight,
+                cos,
+                sin,
+                metrics,
+                session,
+            )?;
+        } else {
+            self.apply_cpu_qk_norm_rope(
+                &mut q,
+                &mut k,
+                &q_norm_weight,
+                &k_norm_weight,
+                cos,
+                sin,
+                layer_tensors,
+                metrics,
+                non_offloaded_dense_duration,
+                session,
+                started_at,
+            );
+        }
+
+        if stage_selection.use_gpu_attention_block && !kv_appended_on_gpu {
+            gpu_first_session.append_gpu_kv(layer_idx, &k, &v)?;
+        }
+
+        if !stage_selection.use_gpu_attention_block {
+            layer_cache.keys.extend_from_slice(&k);
+            layer_cache.values.extend_from_slice(&v);
+        }
+
+        match self.handle_attention_stage_after_qkv(
+            gpu_first_session,
+            layer_idx,
+            position,
+            &q,
+            q_resident.as_ref(),
+            residual_resident.as_ref(),
+            layer_cache,
+            &residual,
+            layer_tensors,
+            &stage_selection,
+            use_attention_full,
+            use_attention_qkv,
+            attention_stage_metrics,
+            mlp_stage_metrics,
+            metrics,
+            non_offloaded_dense_duration,
+            session,
+        )? {
+            PackedAttentionStageOutcome::NextToken(next_token) => {
+                if reusable_qkv_scratch {
+                    session.restore_qkv_scratch(q, k, v);
+                }
+                return Ok(PackedDecodeLayerStepOutcome::NextToken(next_token));
+            }
+            PackedAttentionStageOutcome::ResidentMlp => {
+                *resident_hidden_state = Some(ResidentHiddenState::Mlp { layer_idx });
+                if reusable_qkv_scratch {
+                    session.restore_qkv_scratch(q, k, v);
+                }
+                return Ok(PackedDecodeLayerStepOutcome::Continue);
+            }
+            PackedAttentionStageOutcome::Hidden(next_hidden) => {
+                *hidden = next_hidden;
+            }
+        }
+
+        if reusable_qkv_scratch {
+            session.restore_qkv_scratch(q, k, v);
+        }
+
+        let residual = hidden.clone();
+        match self.handle_mlp_stage_after_attention(
+            gpu_first_session,
+            layer_idx,
+            layer_tensors,
+            &residual,
+            &mut hidden_states,
+            hidden,
+            final_hidden_gpu,
+            resident_hidden_state,
+            &stage_selection,
+            use_mlp_gu,
+            use_mlp_full,
+            mlp_stage_metrics,
+            metrics,
+            non_offloaded_dense_duration,
+            session,
+        )? {
+            PackedMlpStageOutcome::NextToken(next_token) => {
+                return Ok(PackedDecodeLayerStepOutcome::NextToken(next_token));
+            }
+            PackedMlpStageOutcome::ResidentMlp => {
+                *resident_hidden_state = Some(ResidentHiddenState::Mlp { layer_idx });
+            }
+            PackedMlpStageOutcome::Continue => {}
+        }
+
+        Ok(PackedDecodeLayerStepOutcome::Continue)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn forward_step_packed_decode(
         &self,
         token_id: usize,
@@ -8054,232 +8306,32 @@ impl ReferenceModel {
             .enumerate()
             .take(self.config.num_hidden_layers)
         {
-            let layer_tensors = &self.layer_tensors[layer_idx];
-            let stage_selection = self.select_packed_decode_stages(
+            match self.execute_packed_decode_layer_step(
+                token_id,
+                position,
+                &cos,
+                &sin,
                 layer_idx,
+                layer_cache,
+                metrics,
+                attention_stage_metrics,
+                mlp_stage_metrics,
+                non_offloaded_dense_duration,
+                session,
+                gpu_first_session,
                 use_attention_qkv,
                 use_mlp_gu,
                 use_attention_full,
                 use_mlp_full,
                 argmax_only,
-            );
-
-            let input_norm_weight =
-                self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
-            let resident_hidden_tensor_qkv = self.try_resident_hidden_tensor_qkv_entry(
-                gpu_first_session,
-                resident_hidden_state,
-                layer_idx,
-                use_attention_qkv,
-                stage_selection.use_gpu_attention_block,
-                &input_norm_weight,
-                layer_tensors,
-            )?;
-            let resident_hidden_entry_qkv = self.try_resident_hidden_entry_qkv(
-                gpu_first_session,
-                resident_hidden_state,
-                layer_idx,
-                use_attention_qkv,
-                stage_selection.use_gpu_attention_block,
-                &input_norm_weight,
-                layer_tensors,
-            )?;
-            let first_layer_gpu_entry_tensor_qkv = self.try_first_layer_gpu_entry_tensor_qkv(
-                gpu_first_session,
-                &resident_hidden_tensor_qkv,
-                &resident_hidden_entry_qkv,
-                layer_idx,
-                token_id,
-                use_attention_qkv,
-                stage_selection.use_gpu_attention_block,
-                &input_norm_weight,
-                layer_tensors,
-            )?;
-            let first_layer_gpu_entry_qkv = self.try_first_layer_gpu_entry_qkv(
-                gpu_first_session,
-                &resident_hidden_tensor_qkv,
-                &resident_hidden_entry_qkv,
-                &first_layer_gpu_entry_tensor_qkv,
-                layer_idx,
-                token_id,
-                use_attention_qkv,
-                &input_norm_weight,
-                layer_tensors,
-            )?;
-            let mut hidden_states = if let Some(entry) = first_layer_gpu_entry_tensor_qkv.as_ref() {
-                self.apply_first_layer_tensor_qkv_entry(entry, &mut hidden, metrics, session)
-            } else if let Some(entry) = first_layer_gpu_entry_qkv.as_ref() {
-                self.apply_first_layer_host_qkv_entry(entry, &mut hidden, metrics, session)
-            } else if let Some(entry) = resident_hidden_tensor_qkv.as_ref() {
-                self.apply_resident_tensor_qkv_entry(entry, metrics, session)
-            } else if let Some(entry) = resident_hidden_entry_qkv.as_ref() {
-                self.apply_resident_host_qkv_entry(
-                    entry,
-                    &mut hidden,
-                    metrics,
-                    session,
-                    resident_hidden_state.expect("resident hidden state should exist"),
-                    gpu_first_session,
-                )?
-            } else if layer_idx == 0 && packed_use_gpu_embedding() && packed_use_gpu_first_session()
-            {
-                self.apply_first_layer_embedding_norm_entry(
-                    gpu_first_session,
-                    token_id,
-                    &input_norm_weight,
-                    &mut hidden,
-                    metrics,
-                    session,
-                )?
-            } else {
-                let started_at = Instant::now();
-                let hidden_states =
-                    weighted_rms_norm(&hidden, &input_norm_weight, self.config.rms_norm_eps as f32);
-                let elapsed = started_at.elapsed();
-                metrics.norm_duration += elapsed;
-                *non_offloaded_dense_duration += elapsed;
-                session.push_dense_stage_trace(
-                    "input_norm",
-                    &layer_tensors.input_layernorm_weight,
-                    elapsed,
-                );
-                hidden_states
-            };
-            let residual = hidden.clone();
-            let residual_resident = self.residual_resident_source(
-                &first_layer_gpu_entry_tensor_qkv,
-                &resident_hidden_tensor_qkv,
-            );
-
-            let started_at = Instant::now();
-            let (mut q, mut k, v, reusable_qkv_scratch) = self.prepare_qkv_host_vectors(
-                session,
-                layer_tensors,
-                &hidden_states,
-                &first_layer_gpu_entry_tensor_qkv,
-                first_layer_gpu_entry_qkv,
-                resident_hidden_entry_qkv,
-                use_attention_qkv,
-            )?;
-            let elapsed = started_at.elapsed();
-            metrics.qkv_duration += elapsed;
-            if !use_attention_qkv {
-                *non_offloaded_dense_duration += elapsed;
-            }
-
-            let started_at = Instant::now();
-            let q_norm_weight = self.load_vector_f32_resolved(&layer_tensors.q_norm_weight)?;
-            let k_norm_weight = self.load_vector_f32_resolved(&layer_tensors.k_norm_weight)?;
-            let mut q_resident: Option<GpuResidentBuffer> = None;
-            let mut kv_appended_on_gpu = false;
-            if stage_selection.use_gpu_attention_block {
-                (q_resident, kv_appended_on_gpu) = self.prepare_gpu_attention_query_and_kv(
-                    gpu_first_session,
-                    layer_idx,
-                    &mut q,
-                    &k,
-                    &v,
-                    &first_layer_gpu_entry_tensor_qkv,
-                    &resident_hidden_tensor_qkv,
-                    &q_norm_weight,
-                    &k_norm_weight,
-                    &cos,
-                    &sin,
-                    metrics,
-                    session,
-                )?;
-            } else {
-                self.apply_cpu_qk_norm_rope(
-                    &mut q,
-                    &mut k,
-                    &q_norm_weight,
-                    &k_norm_weight,
-                    &cos,
-                    &sin,
-                    layer_tensors,
-                    metrics,
-                    non_offloaded_dense_duration,
-                    session,
-                    started_at,
-                );
-            }
-
-            if stage_selection.use_gpu_attention_block && !kv_appended_on_gpu {
-                gpu_first_session.append_gpu_kv(layer_idx, &k, &v)?;
-            }
-
-            if !stage_selection.use_gpu_attention_block {
-                layer_cache.keys.extend_from_slice(&k);
-                layer_cache.values.extend_from_slice(&v);
-            }
-
-            match self.handle_attention_stage_after_qkv(
-                gpu_first_session,
-                layer_idx,
-                position,
-                &q,
-                q_resident.as_ref(),
-                residual_resident.as_ref(),
-                layer_cache,
-                &residual,
-                layer_tensors,
-                &stage_selection,
-                use_attention_full,
-                use_attention_qkv,
-                attention_stage_metrics,
-                mlp_stage_metrics,
-                metrics,
-                non_offloaded_dense_duration,
-                session,
-            )? {
-                PackedAttentionStageOutcome::NextToken(next_token) => {
-                    if reusable_qkv_scratch {
-                        session.restore_qkv_scratch(q, k, v);
-                    }
-                    return Ok(PackedDecodeStepResult::NextToken(next_token));
-                }
-                PackedAttentionStageOutcome::ResidentMlp => {
-                    resident_hidden_state = Some(ResidentHiddenState::Mlp { layer_idx });
-                    if reusable_qkv_scratch {
-                        session.restore_qkv_scratch(q, k, v);
-                    }
-                    continue;
-                }
-                PackedAttentionStageOutcome::Hidden(next_hidden) => {
-                    hidden = next_hidden;
-                }
-            }
-
-            if reusable_qkv_scratch {
-                session.restore_qkv_scratch(q, k, v);
-            }
-
-            let residual = hidden.clone();
-            match self.handle_mlp_stage_after_attention(
-                gpu_first_session,
-                layer_idx,
-                layer_tensors,
-                &residual,
-                &mut hidden_states,
                 &mut hidden,
                 &mut final_hidden_gpu,
                 &mut resident_hidden_state,
-                &stage_selection,
-                use_mlp_gu,
-                use_mlp_full,
-                mlp_stage_metrics,
-                metrics,
-                non_offloaded_dense_duration,
-                session,
             )? {
-                PackedMlpStageOutcome::NextToken(next_token) => {
+                PackedDecodeLayerStepOutcome::Continue => {}
+                PackedDecodeLayerStepOutcome::NextToken(next_token) => {
                     return Ok(PackedDecodeStepResult::NextToken(next_token));
                 }
-                PackedMlpStageOutcome::ResidentMlp => {
-                    resident_hidden_state = Some(ResidentHiddenState::Mlp { layer_idx });
-                    continue;
-                }
-                PackedMlpStageOutcome::Continue => {}
             }
         }
 
