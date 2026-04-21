@@ -1,4 +1,5 @@
-use crate::runtime::reference::{DecodeMetrics, PackedDecodeMetrics};
+use crate::runtime::gpu_decode_metrics::PackedDecodeMetrics;
+use crate::runtime::reference::DecodeMetrics;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct PackedDispatchTrace {
