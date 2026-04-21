@@ -1051,6 +1051,31 @@ impl<'a> GpuFirstRunnerCache<'a> {
         ))
     }
 
+    fn gpu_kv_tensors(&self, layer_idx: usize) -> Option<(GpuResidentBuffer, GpuResidentBuffer)> {
+        self.gpu_kv_caches.get(&layer_idx).map(|cache| {
+            (
+                GpuResidentBuffer::new(
+                    self.shared_context
+                        .as_ref()
+                        .expect("shared context should exist when gpu kv cache exists")
+                        .clone(),
+                    cache.key_buffer_handle(),
+                    cache.len_tokens() * cache.kv_width(),
+                    cache.key_buffer_size(),
+                ),
+                GpuResidentBuffer::new(
+                    self.shared_context
+                        .as_ref()
+                        .expect("shared context should exist when gpu kv cache exists")
+                        .clone(),
+                    cache.value_buffer_handle(),
+                    cache.len_tokens() * cache.kv_width(),
+                    cache.value_buffer_size(),
+                ),
+            )
+        })
+    }
+
     fn run_qk_rope_query_to_host_key_resident(
         &mut self,
         q: &[f32],
@@ -1504,21 +1529,30 @@ impl<'a> GpuFirstRunnerCache<'a> {
         &mut self,
         layer_idx: usize,
         seq_len: usize,
-        q: &[f32],
+        q: Option<&[f32]>,
+        query_resident: Option<&GpuResidentBuffer>,
         keys: &[f32],
         values: &[f32],
         residual: &[f32],
         post_norm_weight: &[f32],
     ) -> Result<(Vec<f32>, GpuAttentionBlockReport, GpuMlpBlockReport, Duration, Duration), ReferenceError> {
         let kv_state = self.gpu_kv_state(layer_idx);
+        let kv_tensors = self.gpu_kv_tensors(layer_idx);
         let (attention_compile_duration, attention_block) =
             self.ensure_attention_block(layer_idx, seq_len)?;
-        let attention_report = if let Some((key_buffer, key_len, key_buffer_size, value_buffer, value_len, value_buffer_size)) =
+        let attention_report = if let Some(query_resident) = query_resident {
+            let (key_tensor, value_tensor) = kv_tensors
+                .as_ref()
+                .expect("gpu kv tensors should exist when resident query is provided");
+            attention_block
+                .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+        } else if let Some((key_buffer, key_len, key_buffer_size, value_buffer, value_len, value_buffer_size)) =
             kv_state
         {
             attention_block
                 .run_with_resident_kv(
-                    q,
+                    q.expect("host query should exist when resident query is not provided"),
                     key_buffer,
                     key_len,
                     key_buffer_size,
@@ -1530,7 +1564,12 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         } else {
             attention_block
-                .run_resident(q, keys, values, residual)
+                .run_resident(
+                    q.expect("host query should exist when resident query is not provided"),
+                    keys,
+                    values,
+                    residual,
+                )
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         };
         let attention_output = attention_block.resident_output();
@@ -1556,20 +1595,29 @@ impl<'a> GpuFirstRunnerCache<'a> {
         &mut self,
         layer_idx: usize,
         seq_len: usize,
-        q: &[f32],
+        q: Option<&[f32]>,
+        query_resident: Option<&GpuResidentBuffer>,
         keys: &[f32],
         values: &[f32],
         residual: &[f32],
     ) -> Result<(Vec<f32>, GpuAttentionBlockReport, Duration, Duration), ReferenceError> {
         let kv_state = self.gpu_kv_state(layer_idx);
+        let kv_tensors = self.gpu_kv_tensors(layer_idx);
         let (attention_compile_duration, attention_block) =
             self.ensure_attention_block(layer_idx, seq_len)?;
-        let attention_report = if let Some((key_buffer, key_len, key_buffer_size, value_buffer, value_len, value_buffer_size)) =
+        let attention_report = if let Some(query_resident) = query_resident {
+            let (key_tensor, value_tensor) = kv_tensors
+                .as_ref()
+                .expect("gpu kv tensors should exist when resident query is provided");
+            attention_block
+                .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+        } else if let Some((key_buffer, key_len, key_buffer_size, value_buffer, value_len, value_buffer_size)) =
             kv_state
         {
             attention_block
                 .run_with_resident_kv(
-                    q,
+                    q.expect("host query should exist when resident query is not provided"),
                     key_buffer,
                     key_len,
                     key_buffer_size,
@@ -1581,7 +1629,12 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         } else {
             attention_block
-                .run_resident(q, keys, values, residual)
+                .run_resident(
+                    q.expect("host query should exist when resident query is not provided"),
+                    keys,
+                    values,
+                    residual,
+                )
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         };
         let (hidden, download_duration) = attention_block
@@ -1599,21 +1652,30 @@ impl<'a> GpuFirstRunnerCache<'a> {
         &mut self,
         layer_idx: usize,
         seq_len: usize,
-        q: &[f32],
+        q: Option<&[f32]>,
+        query_resident: Option<&GpuResidentBuffer>,
         keys: &[f32],
         values: &[f32],
         residual: &[f32],
         final_norm_weight: &[f32],
     ) -> Result<(usize, GpuAttentionBlockReport, GpuTailBlockReport, Duration), ReferenceError> {
         let kv_state = self.gpu_kv_state(layer_idx);
+        let kv_tensors = self.gpu_kv_tensors(layer_idx);
         let (attention_compile_duration, attention_block) =
             self.ensure_attention_block(layer_idx, seq_len)?;
-        let attention_report = if let Some((key_buffer, key_len, key_buffer_size, value_buffer, value_len, value_buffer_size)) =
+        let attention_report = if let Some(query_resident) = query_resident {
+            let (key_tensor, value_tensor) = kv_tensors
+                .as_ref()
+                .expect("gpu kv tensors should exist when resident query is provided");
+            attention_block
+                .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+        } else if let Some((key_buffer, key_len, key_buffer_size, value_buffer, value_len, value_buffer_size)) =
             kv_state
         {
             attention_block
                 .run_with_resident_kv(
-                    q,
+                    q.expect("host query should exist when resident query is not provided"),
                     key_buffer,
                     key_len,
                     key_buffer_size,
@@ -1625,7 +1687,12 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         } else {
             attention_block
-                .run_resident(q, keys, values, residual)
+                .run_resident(
+                    q.expect("host query should exist when resident query is not provided"),
+                    keys,
+                    values,
+                    residual,
+                )
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         };
         let attention_output = attention_block.resident_output();
@@ -1686,7 +1753,8 @@ impl<'a> GpuFirstRunnerCache<'a> {
         &mut self,
         layer_idx: usize,
         seq_len: usize,
-        q: &[f32],
+        q: Option<&[f32]>,
+        query_resident: Option<&GpuResidentBuffer>,
         keys: &[f32],
         values: &[f32],
         residual: &[f32],
@@ -1694,14 +1762,22 @@ impl<'a> GpuFirstRunnerCache<'a> {
         final_norm_weight: &[f32],
     ) -> Result<(usize, GpuAttentionBlockReport, GpuFullLastLayerReport, Duration), ReferenceError> {
         let kv_state = self.gpu_kv_state(layer_idx);
+        let kv_tensors = self.gpu_kv_tensors(layer_idx);
         let (attention_compile_duration, attention_block) =
             self.ensure_attention_block(layer_idx, seq_len)?;
-        let attention_report = if let Some((key_buffer, key_len, key_buffer_size, value_buffer, value_len, value_buffer_size)) =
+        let attention_report = if let Some(query_resident) = query_resident {
+            let (key_tensor, value_tensor) = kv_tensors
+                .as_ref()
+                .expect("gpu kv tensors should exist when resident query is provided");
+            attention_block
+                .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+        } else if let Some((key_buffer, key_len, key_buffer_size, value_buffer, value_len, value_buffer_size)) =
             kv_state
         {
             attention_block
                 .run_with_resident_kv(
-                    q,
+                    q.expect("host query should exist when resident query is not provided"),
                     key_buffer,
                     key_len,
                     key_buffer_size,
@@ -1713,7 +1789,12 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         } else {
             attention_block
-                .run_resident(q, keys, values, residual)
+                .run_resident(
+                    q.expect("host query should exist when resident query is not provided"),
+                    keys,
+                    values,
+                    residual,
+                )
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         };
         let attention_output = attention_block.resident_output();
@@ -5970,6 +6051,7 @@ impl ReferenceModel {
             let started_at = Instant::now();
             let q_norm_weight = self.load_vector_f32_resolved(&layer_tensors.q_norm_weight)?;
             let k_norm_weight = self.load_vector_f32_resolved(&layer_tensors.k_norm_weight)?;
+            let mut q_resident: Option<GpuResidentBuffer> = None;
             let mut kv_appended_on_gpu = false;
             if use_gpu_attention_block {
                 let ((q_out, key_out), qk_rope_report, compile_duration) =
@@ -5982,6 +6064,11 @@ impl ReferenceModel {
                         &sin,
                     )?;
                 q = q_out;
+                q_resident = Some(gpu_first_session
+                    .qk_rope_runner
+                    .as_ref()
+                    .expect("qk rope runner should exist after execution")
+                    .query_resident_output());
                 gpu_first_session
                     .append_gpu_kv_key_tensor_and_value_host(layer_idx, &key_out, &v)?;
                 kv_appended_on_gpu = true;
@@ -6045,7 +6132,8 @@ impl ReferenceModel {
                         gpu_first_session.run_attention_layer_to_tail_argmax(
                             layer_idx,
                             position + 1,
-                            &q,
+                            Some(&q),
+                            q_resident.as_ref(),
                             &layer_cache.keys,
                             &layer_cache.values,
                             &residual,
@@ -6076,7 +6164,8 @@ impl ReferenceModel {
                         gpu_first_session.run_attention_layer_to_host(
                             layer_idx,
                             position + 1,
-                            &q,
+                            Some(&q),
+                            q_resident.as_ref(),
                             &layer_cache.keys,
                             &layer_cache.values,
                             &residual,
@@ -6114,7 +6203,8 @@ impl ReferenceModel {
                     gpu_first_session.run_attention_to_full_last_layer_argmax(
                         layer_idx,
                         position + 1,
-                        &q,
+                        Some(&q),
+                        q_resident.as_ref(),
                         &layer_cache.keys,
                         &layer_cache.values,
                         &residual,
@@ -6164,7 +6254,8 @@ impl ReferenceModel {
                     gpu_first_session.run_attention_mlp_layer_to_host(
                         layer_idx,
                         position + 1,
-                        &q,
+                        Some(&q),
+                        q_resident.as_ref(),
                         &layer_cache.keys,
                         &layer_cache.values,
                         &residual,
