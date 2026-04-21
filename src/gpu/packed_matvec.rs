@@ -234,11 +234,20 @@ pub struct CachedGpuPackedMatvecRunner {
     descriptor_set: vk::DescriptorSet,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
+    argmax_descriptor_set_layout: vk::DescriptorSetLayout,
+    argmax_pipeline_layout: vk::PipelineLayout,
+    argmax_shader_module: vk::ShaderModule,
+    argmax_pipeline: vk::Pipeline,
+    argmax_descriptor_pool: vk::DescriptorPool,
+    argmax_descriptor_set: vk::DescriptorSet,
+    argmax_command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
     code_buffer: BufferAllocation,
     scale_buffer: BufferAllocation,
     vector_buffer: BufferAllocation,
     output_buffer: BufferAllocation,
+    argmax_output_buffer: BufferAllocation,
+    argmax_workgroups: usize,
 }
 
 impl CachedGpuPackedMatvecRunner {
@@ -354,6 +363,8 @@ impl CachedGpuPackedMatvecRunner {
 
         let packed_cols = cols.div_ceil(2);
         let output_bytes = rows * std::mem::size_of::<f32>();
+        let argmax_workgroups = rows.div_ceil(256).max(1);
+        let argmax_output_bytes = argmax_workgroups * std::mem::size_of::<u32>() * 2;
         let vector_bytes = match input_mode {
             PackedRunnerInputMode::PackedHalfPairs => packed_cols * 4,
             PackedRunnerInputMode::RawF32 => cols * std::mem::size_of::<f32>(),
@@ -386,10 +397,18 @@ impl CachedGpuPackedMatvecRunner {
             output_bytes as u64,
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
+        let argmax_output_buffer = create_host_visible_buffer(
+            &instance,
+            &device,
+            physical_device,
+            argmax_output_bytes as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
         write_u32_buffer(&code_buffer, code_words)?;
         write_f32_buffer(&scale_buffer, scales)?;
         zero_buffer(&vector_buffer, vector_bytes)?;
         zero_buffer(&output_buffer, output_bytes)?;
+        zero_buffer(&argmax_output_buffer, argmax_output_bytes)?;
 
         let descriptor_layout_bindings = [
             vk::DescriptorSetLayoutBinding::default()
@@ -443,6 +462,42 @@ impl CachedGpuPackedMatvecRunner {
                 .map_err(|(_, err)| GpuPackedMatvecError::Vk(err))?[0]
         };
 
+        let argmax_shader_path = compile_shader(Path::new("shaders/argmax_reduce.comp"))?;
+        let argmax_descriptor_layout_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_count(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let argmax_descriptor_layout_ci = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(&argmax_descriptor_layout_bindings);
+        let argmax_descriptor_set_layout =
+            unsafe { device.create_descriptor_set_layout(&argmax_descriptor_layout_ci, None)? };
+        let argmax_set_layouts = [argmax_descriptor_set_layout];
+        let argmax_pipeline_layout_ci =
+            vk::PipelineLayoutCreateInfo::default().set_layouts(&argmax_set_layouts);
+        let argmax_pipeline_layout =
+            unsafe { device.create_pipeline_layout(&argmax_pipeline_layout_ci, None)? };
+        let argmax_shader_module = create_shader_module(&device, &argmax_shader_path)?;
+        let argmax_stage_ci = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(argmax_shader_module)
+            .name(&entry_name);
+        let argmax_compute_ci = [vk::ComputePipelineCreateInfo::default()
+            .stage(argmax_stage_ci)
+            .layout(argmax_pipeline_layout)];
+        let argmax_pipeline = unsafe {
+            device
+                .create_compute_pipelines(vk::PipelineCache::null(), &argmax_compute_ci, None)
+                .map_err(|(_, err)| GpuPackedMatvecError::Vk(err))?[0]
+        };
+
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
             .descriptor_count(4)];
@@ -455,6 +510,20 @@ impl CachedGpuPackedMatvecRunner {
             .descriptor_pool(descriptor_pool)
             .set_layouts(&set_layouts);
         let descriptor_set = unsafe { device.allocate_descriptor_sets(&alloc_info)?[0] };
+
+        let argmax_pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(2)];
+        let argmax_descriptor_pool_ci = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&argmax_pool_sizes)
+            .max_sets(1);
+        let argmax_descriptor_pool =
+            unsafe { device.create_descriptor_pool(&argmax_descriptor_pool_ci, None)? };
+        let argmax_alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(argmax_descriptor_pool)
+            .set_layouts(&argmax_set_layouts);
+        let argmax_descriptor_set =
+            unsafe { device.allocate_descriptor_sets(&argmax_alloc_info)?[0] };
 
         let code_info = [vk::DescriptorBufferInfo::default()
             .buffer(code_buffer.buffer)
@@ -496,6 +565,28 @@ impl CachedGpuPackedMatvecRunner {
         ];
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 
+        let argmax_input_info = [vk::DescriptorBufferInfo::default()
+            .buffer(output_buffer.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let argmax_output_info = [vk::DescriptorBufferInfo::default()
+            .buffer(argmax_output_buffer.buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+        let argmax_writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(argmax_descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&argmax_input_info),
+            vk::WriteDescriptorSet::default()
+                .dst_set(argmax_descriptor_set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&argmax_output_info),
+        ];
+        unsafe { device.update_descriptor_sets(&argmax_writes, &[]) };
+
         let command_pool_ci = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family_index)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -503,8 +594,10 @@ impl CachedGpuPackedMatvecRunner {
         let command_alloc = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let command_buffer = unsafe { device.allocate_command_buffers(&command_alloc)?[0] };
+            .command_buffer_count(2);
+        let command_buffers = unsafe { device.allocate_command_buffers(&command_alloc)? };
+        let command_buffer = command_buffers[0];
+        let argmax_command_buffer = command_buffers[1];
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
 
         let runner = Self {
@@ -526,13 +619,23 @@ impl CachedGpuPackedMatvecRunner {
             descriptor_set,
             command_pool,
             command_buffer,
+            argmax_descriptor_set_layout,
+            argmax_pipeline_layout,
+            argmax_shader_module,
+            argmax_pipeline,
+            argmax_descriptor_pool,
+            argmax_descriptor_set,
+            argmax_command_buffer,
             fence,
             code_buffer,
             scale_buffer,
             vector_buffer,
             output_buffer,
+            argmax_output_buffer,
+            argmax_workgroups,
         };
         runner.record_command_buffer()?;
+        runner.record_argmax_command_buffer()?;
         Ok((runner, compile_started.elapsed()))
     }
 
@@ -978,13 +1081,19 @@ impl CachedGpuPackedMatvecRunner {
         };
         let first = values[..first_rows].to_vec();
         let second = values[first_rows..first_rows + second_rows].to_vec();
-        let third = values[first_rows + second_rows..first_rows + second_rows + third_rows].to_vec();
+        let third =
+            values[first_rows + second_rows..first_rows + second_rows + third_rows].to_vec();
         Ok(((first, second, third), download_started.elapsed()))
     }
 
     pub fn argmax_output(&self) -> Result<(usize, Duration), GpuPackedMatvecError> {
         let download_started = Instant::now();
-        let argmax_index = argmax_f32_buffer(&self.output_buffer, self.rows)?;
+        let argmax_index = if self.rows >= 16_384 {
+            self.submit_argmax_and_wait()?;
+            argmax_reduced_f32_buffer(&self.argmax_output_buffer, self.argmax_workgroups)?
+        } else {
+            argmax_f32_buffer(&self.output_buffer, self.rows)?
+        };
         Ok((argmax_index, download_started.elapsed()))
     }
 
@@ -1031,6 +1140,21 @@ impl CachedGpuPackedMatvecRunner {
         let submit_info = [
             vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer))
         ];
+        unsafe {
+            self.device.reset_fences(&[self.fence])?;
+        }
+        let gpu_started = Instant::now();
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+        }
+        Ok(gpu_started.elapsed())
+    }
+
+    fn submit_argmax_and_wait(&self) -> Result<Duration, GpuPackedMatvecError> {
+        let submit_info = [vk::SubmitInfo::default()
+            .command_buffers(std::slice::from_ref(&self.argmax_command_buffer))];
         unsafe {
             self.device.reset_fences(&[self.fence])?;
         }
@@ -1137,6 +1261,40 @@ impl CachedGpuPackedMatvecRunner {
         }
         Ok(())
     }
+
+    fn record_argmax_command_buffer(&self) -> Result<(), GpuPackedMatvecError> {
+        unsafe {
+            self.device.reset_command_buffer(
+                self.argmax_command_buffer,
+                vk::CommandBufferResetFlags::empty(),
+            )?;
+            self.device.begin_command_buffer(
+                self.argmax_command_buffer,
+                &vk::CommandBufferBeginInfo::default(),
+            )?;
+            self.device.cmd_bind_pipeline(
+                self.argmax_command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.argmax_pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                self.argmax_command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.argmax_pipeline_layout,
+                0,
+                &[self.argmax_descriptor_set],
+                &[],
+            );
+            self.device.cmd_dispatch(
+                self.argmax_command_buffer,
+                self.argmax_workgroups as u32,
+                1,
+                1,
+            );
+            self.device.end_command_buffer(self.argmax_command_buffer)?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for CachedGpuPackedMatvecRunner {
@@ -1146,17 +1304,27 @@ impl Drop for CachedGpuPackedMatvecRunner {
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device
+                .destroy_descriptor_pool(self.argmax_descriptor_pool, None);
+            self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
+            self.device.destroy_pipeline(self.argmax_pipeline, None);
             self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_shader_module(self.argmax_shader_module, None);
             self.device.destroy_shader_module(self.shader_module, None);
             self.device
+                .destroy_pipeline_layout(self.argmax_pipeline_layout, None);
+            self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.argmax_descriptor_set_layout, None);
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             destroy_buffer(&self.device, self.code_buffer);
             destroy_buffer(&self.device, self.scale_buffer);
             destroy_buffer(&self.device, self.vector_buffer);
             destroy_buffer(&self.device, self.output_buffer);
+            destroy_buffer(&self.device, self.argmax_output_buffer);
         }
     }
 }
@@ -1418,6 +1586,36 @@ fn argmax_f32_buffer(buffer: &BufferAllocation, len: usize) -> Result<usize, Gpu
         .ok_or_else(|| {
             GpuPackedMatvecError::Shape("argmax requires at least one output element".to_string())
         })?;
+    Ok(best_index)
+}
+
+fn argmax_reduced_f32_buffer(
+    buffer: &BufferAllocation,
+    len: usize,
+) -> Result<usize, GpuPackedMatvecError> {
+    let byte_len = len * std::mem::size_of::<u32>() * 2;
+    if byte_len as u64 > buffer.size {
+        return Err(GpuPackedMatvecError::Shape(format!(
+            "read {} bytes exceeds mapped buffer size {}",
+            byte_len, buffer.size
+        )));
+    }
+    if len == 0 {
+        return Err(GpuPackedMatvecError::Shape(
+            "argmax requires at least one reduction entry".to_string(),
+        ));
+    }
+    let values = unsafe { std::slice::from_raw_parts(buffer.mapped_ptr as *const u32, len * 2) };
+    let mut best_index = values[1] as usize;
+    let mut best_value = f32::from_bits(values[0]);
+    for chunk in values.chunks_exact(2).skip(1) {
+        let value = f32::from_bits(chunk[0]);
+        let index = chunk[1] as usize;
+        if value > best_value || (value == best_value && index < best_index) {
+            best_value = value;
+            best_index = index;
+        }
+    }
     Ok(best_index)
 }
 
