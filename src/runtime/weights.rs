@@ -276,6 +276,38 @@ impl WeightStore {
         }
     }
 
+    pub fn embedding_lookup_u32_words(
+        &self,
+        name: &str,
+    ) -> Result<(usize, usize, Vec<u32>), WeightError> {
+        let tensor = self.tensor_entry(name)?;
+        let shape = &tensor.shape;
+        if shape.len() != 2 {
+            return Err(WeightError::Shape(format!(
+                "embedding tensor {name} must be rank-2"
+            )));
+        }
+        let rows = shape[0];
+        let cols = shape[1];
+        match tensor.dtype {
+            Dtype::F16 => {
+                let bytes = self.tensor_bytes(tensor);
+                if bytes.len() % 4 != 0 {
+                    return Err(WeightError::Shape(format!(
+                        "embedding tensor {name} byte length {} is not word-aligned",
+                        bytes.len()
+                    )));
+                }
+                let words = bytes
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect::<Vec<_>>();
+                Ok((rows, cols, words))
+            }
+            dtype => Err(WeightError::UnsupportedDtype(dtype)),
+        }
+    }
+
     pub fn matvec_f16(&self, name: &str, input: &[f32]) -> Result<Vec<f32>, WeightError> {
         let tensor = self.tensor_entry(name)?;
         let shape = &tensor.shape;

@@ -1,5 +1,6 @@
 pub mod attention_block;
 pub mod attention_single_query;
+pub mod embedding_lookup;
 pub mod fp16_matvec;
 pub mod full_last_layer_block;
 pub mod kv_cache;

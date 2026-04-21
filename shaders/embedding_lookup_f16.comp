@@ -1,0 +1,31 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Embeddings {
+    uint words[];
+} embeddings;
+
+layout(set = 0, binding = 1) readonly buffer Token {
+    uint token_id;
+} token;
+
+layout(set = 0, binding = 2) writeonly buffer Output {
+    float values[];
+} output_buffer;
+
+layout(push_constant) uniform Params {
+    uint hidden;
+} params;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.hidden) {
+        return;
+    }
+
+    uint half_index = token.token_id * params.hidden + idx;
+    uint word = embeddings.words[half_index / 2u];
+    vec2 unpacked = unpackHalf2x16(word);
+    output_buffer.values[idx] = (half_index & 1u) == 0u ? unpacked.x : unpacked.y;
+}

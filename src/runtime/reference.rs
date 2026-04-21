@@ -1,6 +1,7 @@
 use crate::cpu::block::{YarnRope, build_yarn_rope, rope_cos_sin};
 use crate::cpu::primitives::{argmax, swiglu};
 use crate::gpu::attention_block::{CachedGpuAttentionBlockRunner, GpuAttentionBlockReport};
+use crate::gpu::embedding_lookup::{CachedGpuEmbeddingLookupRunner, GpuEmbeddingLookupReport};
 use crate::gpu::full_last_layer_block::{
     CachedGpuFullLastLayerRunner, GpuFullLastLayerReport, PackedLinearSpec,
 };
@@ -862,6 +863,7 @@ struct GpuFirstRunnerCache<'a> {
     model: &'a ReferenceModel,
     kv_capacity_tokens: usize,
     shared_context: Option<Arc<SharedGpuPackedContext>>,
+    embedding_lookup_runner: Option<CachedGpuEmbeddingLookupRunner>,
     gpu_kv_caches: HashMap<usize, GpuKvCache>,
     attention_blocks: HashMap<(usize, usize), CachedGpuAttentionBlockRunner>,
     mlp_blocks: HashMap<usize, CachedGpuMlpBlockRunner>,
@@ -875,6 +877,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
             model,
             kv_capacity_tokens: expected_tokens,
             shared_context: None,
+            embedding_lookup_runner: None,
             gpu_kv_caches: HashMap::new(),
             attention_blocks: HashMap::new(),
             mlp_blocks: HashMap::new(),
@@ -942,6 +945,47 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 cache.value_buffer_size(),
             )
         })
+    }
+
+    fn ensure_embedding_lookup_runner(
+        &mut self,
+    ) -> Result<(Duration, &mut CachedGpuEmbeddingLookupRunner), ReferenceError> {
+        let compile_duration = if self.embedding_lookup_runner.is_some() {
+            Duration::ZERO
+        } else {
+            let (vocab, hidden, words) = self
+                .model
+                .weights
+                .embedding_lookup_u32_words("model.embed_tokens.weight")
+                .map_err(ReferenceError::Weight)?;
+            let context = self.get_or_create_shared_context()?;
+            let (runner, compile_duration) = CachedGpuEmbeddingLookupRunner::new_with_context(
+                context,
+                &words,
+                vocab,
+                hidden,
+            )
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+            self.embedding_lookup_runner = Some(runner);
+            compile_duration
+        };
+        Ok((
+            compile_duration,
+            self.embedding_lookup_runner
+                .as_mut()
+                .expect("embedding lookup runner should exist after creation"),
+        ))
+    }
+
+    fn run_embedding_lookup_to_host(
+        &mut self,
+        token_id: usize,
+    ) -> Result<(Vec<f32>, GpuEmbeddingLookupReport, Duration), ReferenceError> {
+        let (compile_duration, runner) = self.ensure_embedding_lookup_runner()?;
+        let (hidden, report) = runner
+            .run_with_output(token_id)
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        Ok((hidden, report, compile_duration))
     }
 
     fn packed_linear_spec(
@@ -2698,8 +2742,13 @@ impl ReferenceModel {
         std::env::var_os("JENGINE_GPU_ATTENTION_BLOCK").is_some()
     }
 
+    fn packed_use_gpu_embedding() -> bool {
+        std::env::var_os("JENGINE_GPU_EMBEDDING").is_some()
+    }
+
     fn packed_use_gpu_first_session() -> bool {
         Self::packed_use_gpu_attention_block()
+            || Self::packed_use_gpu_embedding()
             || Self::packed_use_gpu_swiglu_block()
             || Self::packed_use_gpu_full_last_layer()
             || Self::packed_use_gpu_tail()
@@ -5372,7 +5421,21 @@ impl ReferenceModel {
         argmax_only: bool,
     ) -> Result<PackedDecodeStepResult, ReferenceError> {
         let started_at = Instant::now();
-        let mut hidden = self.embedding_lookup_resolved("model.embed_tokens.weight", token_id)?;
+        let mut hidden = if Self::packed_use_gpu_embedding() && Self::packed_use_gpu_first_session() {
+            let (hidden, report, compile_duration) =
+                gpu_first_session.run_embedding_lookup_to_host(token_id)?;
+            session.metrics.compile_duration += compile_duration;
+            session.metrics.activation_upload_duration += report.upload_duration;
+            session.metrics.upload_duration += report.upload_duration;
+            session.metrics.gpu_duration += report.gpu_duration;
+            session.metrics.download_duration += report.download_duration;
+            session.metrics.activation_upload_bytes += std::mem::size_of::<u32>();
+            session.metrics.upload_bytes += std::mem::size_of::<u32>();
+            session.metrics.download_bytes += self.config.hidden_size * std::mem::size_of::<f32>();
+            hidden
+        } else {
+            self.embedding_lookup_resolved("model.embed_tokens.weight", token_id)?
+        };
         let elapsed = started_at.elapsed();
         metrics.embedding_duration += elapsed;
         *non_offloaded_dense_duration += elapsed;
@@ -6773,6 +6836,43 @@ mod tests {
             .get(&0)
             .expect("layer 0 gpu kv cache should exist");
         assert_eq!(kv_cache.len_tokens(), 1);
+    }
+
+    #[test]
+    fn creates_gpu_embedding_runner_and_matches_reference_embedding_row() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let _guard = lock_env();
+        let _env = ScopedEnvVars::set(&[("JENGINE_GPU_EMBEDDING", "1")]);
+
+        let reference_hidden = model
+            .embedding_lookup_resolved("model.embed_tokens.weight", 2)
+            .expect("reference embedding should load");
+
+        let mut session = model.begin_packed_decode_session(2, true, true, true);
+        let _ = session
+            .push_prompt_token(2)
+            .expect("gpu embedding prompt token should decode");
+
+        let PackedDecodeSession::GpuFirst(mut session) = session else {
+            panic!("gpu-first session should be selected when gpu embedding is enabled");
+        };
+        let runner = session
+            .inner
+            .gpu_first_session
+            .embedding_lookup_runner
+            .as_mut()
+            .expect("embedding runner should be created");
+        let (gpu_hidden, _) = runner
+            .run_with_output(2)
+            .expect("gpu embedding lookup should succeed");
+        assert_eq!(gpu_hidden, reference_hidden);
     }
 
     #[test]
