@@ -21,7 +21,7 @@ use crate::gpu::vector_add::CachedGpuVectorAddRunner;
 use crate::gpu::weighted_rms_norm::{CachedGpuWeightedRmsNormRunner, GpuWeightedRmsNormReport};
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
-use crate::runtime::assets::{BonsaiAssetPaths};
+use crate::runtime::assets::BonsaiAssetPaths;
 use crate::runtime::decode_plan::PackedDecodePlan;
 use crate::runtime::decode_report::{MemoryReport, build_memory_report};
 use crate::runtime::gpu_decode_env::{
@@ -31,16 +31,14 @@ use crate::runtime::gpu_decode_env::{
     packed_use_gpu_tail, packed_use_mlp_full,
 };
 use crate::runtime::gpu_decode_metrics::{
-    account_projection_report, AttentionProjectionMixMetrics, DecodeMetrics,
-    HybridDecodeMetrics, HybridProjectionDecodeMetrics, MlpProjectionMixMetrics,
-    PackedAttentionStageMetrics, PackedDecodeMetrics, PackedDecodeValidationReport,
-    PackedGpuSessionMetrics, PackedMlpStageMetrics, ProjectionComparison,
+    AttentionProjectionMixMetrics, DecodeMetrics, HybridDecodeMetrics,
+    HybridProjectionDecodeMetrics, MlpProjectionMixMetrics, PackedAttentionStageMetrics,
+    PackedDecodeMetrics, PackedDecodeValidationReport, PackedGpuSessionMetrics,
+    PackedMlpStageMetrics, ProjectionComparison, account_projection_report,
     finish_packed_decode_metrics,
 };
 use crate::runtime::gpu_decode_model_state::{HybridQProjCache, LayerTensorNames};
-use crate::runtime::gpu_decode_output::{
-    DecodeResult, PackedDecodeResult, PackedDispatchTrace,
-};
+use crate::runtime::gpu_decode_output::{DecodeResult, PackedDecodeResult, PackedDispatchTrace};
 use crate::runtime::gpu_decode_projection_state::{
     PackedProjectionCache, PreparedProjectionRunner, ResidentGpuFinalNorm,
     ResidentGpuPackedActivation, ResidentGpuPackedActivationKeepalive, ResidentGpuSwigluCombined,
@@ -50,10 +48,12 @@ use crate::runtime::gpu_decode_scratch::PackedDecodeScratch;
 use crate::runtime::gpu_decode_session_state::{
     LayerCache, PackedDecodeStepResult, allocate_layer_cache_vec,
 };
-use crate::runtime::gpu_decode_state::{GpuKvBinding, GpuTailResult, GpuTailStepReport, ResidentHiddenState};
+use crate::runtime::gpu_decode_state::{
+    GpuKvBinding, GpuTailResult, GpuTailStepReport, ResidentHiddenState,
+};
 use crate::runtime::packed_model::PackedModelStore;
-use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
 use crate::runtime::reference_error::ReferenceError;
+use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
 use crate::runtime::weights::WeightStore;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -316,7 +316,9 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
     }
 
     pub(crate) fn has_raw_f32_projection_runner(&self, key: &str) -> bool {
-        self.inner.gpu_first_session.has_raw_f32_projection_runner(key)
+        self.inner
+            .gpu_first_session
+            .has_raw_f32_projection_runner(key)
     }
 
     pub(crate) fn gpu_kv_len_tokens(&self, layer_idx: usize) -> Option<usize> {
@@ -341,7 +343,9 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
         &self,
         layer_idx: usize,
     ) -> Result<Option<(usize, usize)>, ReferenceError> {
-        self.inner.gpu_first_session.gpu_kv_snapshot_lengths(layer_idx)
+        self.inner
+            .gpu_first_session
+            .gpu_kv_snapshot_lengths(layer_idx)
     }
 
     pub(crate) fn has_attention_block(&self, layer_idx: usize) -> bool {
@@ -364,7 +368,9 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
         &mut self,
         token_id: usize,
     ) -> Result<Option<Vec<f32>>, ReferenceError> {
-        self.inner.gpu_first_session.embedding_lookup_output(token_id)
+        self.inner
+            .gpu_first_session
+            .embedding_lookup_output(token_id)
     }
 
     pub fn finish_metrics(
@@ -523,7 +529,9 @@ impl<'a> GpuFirstRunnerCache<'a> {
     }
 
     fn gpu_kv_len_tokens(&self, layer_idx: usize) -> Option<usize> {
-        self.gpu_kv_caches.get(&layer_idx).map(|cache| cache.len_tokens())
+        self.gpu_kv_caches
+            .get(&layer_idx)
+            .map(|cache| cache.len_tokens())
     }
 
     fn gpu_kv_snapshot_lengths(
@@ -562,13 +570,19 @@ impl<'a> GpuFirstRunnerCache<'a> {
         self.full_last_layer_block.is_some()
     }
 
-    fn embedding_lookup_output(&mut self, token_id: usize) -> Result<Option<Vec<f32>>, ReferenceError> {
+    fn embedding_lookup_output(
+        &mut self,
+        token_id: usize,
+    ) -> Result<Option<Vec<f32>>, ReferenceError> {
         let Some(runner) = self.embedding_lookup_runner.as_mut() else {
             return Ok(None);
         };
-        let (output, _) = runner.borrow_mut().run_with_output(token_id).map_err(|error| {
-            ReferenceError::Decode(format!("gpu embedding lookup failed: {error}"))
-        })?;
+        let (output, _) = runner
+            .borrow_mut()
+            .run_with_output(token_id)
+            .map_err(|error| {
+                ReferenceError::Decode(format!("gpu embedding lookup failed: {error}"))
+            })?;
         Ok(Some(output))
     }
 
@@ -1322,7 +1336,10 @@ impl<'a> GpuFirstRunnerCache<'a> {
         Ok(())
     }
 
-    fn prewarm_gpu_attention_runners(&mut self, use_attention_qkv: bool) -> Result<(), ReferenceError> {
+    fn prewarm_gpu_attention_runners(
+        &mut self,
+        use_attention_qkv: bool,
+    ) -> Result<(), ReferenceError> {
         if use_attention_qkv
             && (packed_use_gpu_attention_block()
                 || packed_use_gpu_tail()
@@ -2096,21 +2113,22 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.gpu_cache_hits += usize::from(activation.gpu_cache_hit);
         self.metrics.activation_upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
-        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
-            self.dispatch_trace.len() + 1,
-            "gpu_pack",
-            "pack_f16_pairs",
-            "pack_f16_pairs",
-            cols.div_ceil(2),
-            cols,
-            activation.gpu_cache_hit,
-            activation.compile_duration,
-            Duration::ZERO,
-            activation.upload_duration,
-            activation.gpu_duration,
-            0,
-            activation.logical_len * std::mem::size_of::<f32>(),
-        ));
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_pack",
+                "pack_f16_pairs",
+                "pack_f16_pairs",
+                cols.div_ceil(2),
+                cols,
+                activation.gpu_cache_hit,
+                activation.compile_duration,
+                Duration::ZERO,
+                activation.upload_duration,
+                activation.gpu_duration,
+                0,
+                activation.logical_len * std::mem::size_of::<f32>(),
+            ));
 
         let weight_upload_bytes = usize::from(!prepared.gpu_cache_hit)
             * (prepared.packed.code_words.len() * std::mem::size_of::<u32>()
@@ -2303,21 +2321,22 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.activation_upload_bytes += final_norm.len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += 2 * final_norm.len * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(final_norm.gpu_cache_hit);
-        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
-            self.dispatch_trace.len() + 1,
-            "gpu_dense",
-            "final_norm_gpu",
-            "model.norm.weight",
-            final_norm.len,
-            final_norm.len,
-            final_norm.gpu_cache_hit,
-            final_norm.compile_duration,
-            final_norm.report.upload_duration,
-            Duration::ZERO,
-            final_norm.report.gpu_duration,
-            final_norm.len * std::mem::size_of::<f32>(),
-            final_norm.len * std::mem::size_of::<f32>(),
-        ));
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_dense",
+                "final_norm_gpu",
+                "model.norm.weight",
+                final_norm.len,
+                final_norm.len,
+                final_norm.gpu_cache_hit,
+                final_norm.compile_duration,
+                final_norm.report.upload_duration,
+                Duration::ZERO,
+                final_norm.report.gpu_duration,
+                final_norm.len * std::mem::size_of::<f32>(),
+                final_norm.len * std::mem::size_of::<f32>(),
+            ));
         Ok(ResidentGpuPackedActivation {
             keepalive: ResidentGpuPackedActivationKeepalive::PackF16(runner.clone()),
             tensor: GpuResidentBuffer::new(
@@ -2389,21 +2408,22 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.upload_bytes +=
             (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
-        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
-            self.dispatch_trace.len() + 1,
-            "gpu_dense",
-            "mlp_swiglu_gpu",
-            "swiglu_combined",
-            pair.first_rows,
-            pair.first_rows + pair.second_rows,
-            gpu_cache_hit,
-            compile_duration,
-            Duration::ZERO,
-            report.upload_duration,
-            report.gpu_duration,
-            0,
-            (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>(),
-        ));
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_dense",
+                "mlp_swiglu_gpu",
+                "swiglu_combined",
+                pair.first_rows,
+                pair.first_rows + pair.second_rows,
+                gpu_cache_hit,
+                compile_duration,
+                Duration::ZERO,
+                report.upload_duration,
+                report.gpu_duration,
+                0,
+                (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>(),
+            ));
         let len = pair.first_rows;
         let tensor = GpuResidentBuffer::new(
             runner.borrow().shared_context().clone(),
@@ -2475,21 +2495,22 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.upload_bytes +=
             (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
-        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
-            self.dispatch_trace.len() + 1,
-            "gpu_pack",
-            "mlp_swiglu_pack_gpu",
-            "swiglu_pack_f16_pairs",
-            pair.first_rows.div_ceil(2),
-            pair.first_rows + pair.second_rows,
-            gpu_cache_hit,
-            compile_duration,
-            Duration::ZERO,
-            report.upload_duration,
-            report.gpu_duration,
-            0,
-            (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>(),
-        ));
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_pack",
+                "mlp_swiglu_pack_gpu",
+                "swiglu_pack_f16_pairs",
+                pair.first_rows.div_ceil(2),
+                pair.first_rows + pair.second_rows,
+                gpu_cache_hit,
+                compile_duration,
+                Duration::ZERO,
+                report.upload_duration,
+                report.gpu_duration,
+                0,
+                (pair.first_rows + pair.second_rows) * std::mem::size_of::<f32>(),
+            ));
         Ok(ResidentGpuPackedActivation {
             keepalive: ResidentGpuPackedActivationKeepalive::SwigluPackF16(runner.clone()),
             tensor: GpuResidentBuffer::new(
@@ -2532,21 +2553,22 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.activation_upload_bytes += swiglu.len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += swiglu.len * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
-        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
-            self.dispatch_trace.len() + 1,
-            "gpu_pack",
-            "pack_f16_pairs",
-            "pack_f16_pairs",
-            swiglu.len.div_ceil(2),
-            swiglu.len,
-            gpu_cache_hit,
-            compile_duration,
-            Duration::ZERO,
-            report.upload_duration,
-            report.gpu_duration,
-            0,
-            swiglu.len * std::mem::size_of::<f32>(),
-        ));
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_pack",
+                "pack_f16_pairs",
+                "pack_f16_pairs",
+                swiglu.len.div_ceil(2),
+                swiglu.len,
+                gpu_cache_hit,
+                compile_duration,
+                Duration::ZERO,
+                report.upload_duration,
+                report.gpu_duration,
+                0,
+                swiglu.len * std::mem::size_of::<f32>(),
+            ));
         Ok(ResidentGpuPackedActivation {
             keepalive: ResidentGpuPackedActivationKeepalive::PackF16(runner.clone()),
             tensor: GpuResidentBuffer::new(
@@ -2592,21 +2614,22 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.gpu_cache_hits += usize::from(activation.gpu_cache_hit);
         self.metrics.activation_upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += activation.logical_len * std::mem::size_of::<f32>();
-        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
-            self.dispatch_trace.len() + 1,
-            "gpu_pack",
-            "pack_f16_pairs",
-            "pack_f16_pairs",
-            cols.div_ceil(2),
-            cols,
-            activation.gpu_cache_hit,
-            activation.compile_duration,
-            Duration::ZERO,
-            activation.upload_duration,
-            activation.gpu_duration,
-            0,
-            activation.logical_len * std::mem::size_of::<f32>(),
-        ));
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_pack",
+                "pack_f16_pairs",
+                "pack_f16_pairs",
+                cols.div_ceil(2),
+                cols,
+                activation.gpu_cache_hit,
+                activation.compile_duration,
+                Duration::ZERO,
+                activation.upload_duration,
+                activation.gpu_duration,
+                0,
+                activation.logical_len * std::mem::size_of::<f32>(),
+            ));
         let tensor = GpuResidentBuffer::new(
             prepared.runner.borrow().shared_context().clone(),
             prepared.runner.borrow().output_buffer_handle(),
@@ -2694,21 +2717,22 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.activation_upload_bytes += 2 * activation.len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += 2 * activation.len * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(activation.gpu_cache_hit);
-        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
-            self.dispatch_trace.len() + 1,
-            "gpu_dense",
-            "vector_add_gpu",
-            "vector_add",
-            activation.len,
-            activation.len,
-            activation.gpu_cache_hit,
-            activation.compile_duration,
-            Duration::ZERO,
-            activation.report.upload_duration,
-            activation.report.gpu_duration,
-            0,
-            2 * activation.len * std::mem::size_of::<f32>(),
-        ));
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_dense",
+                "vector_add_gpu",
+                "vector_add",
+                activation.len,
+                activation.len,
+                activation.gpu_cache_hit,
+                activation.compile_duration,
+                Duration::ZERO,
+                activation.report.upload_duration,
+                activation.report.gpu_duration,
+                0,
+                2 * activation.len * std::mem::size_of::<f32>(),
+            ));
 
         let (runner, compile_duration, gpu_cache_hit) =
             self.model.get_or_create_final_norm_gpu()?;
@@ -3183,21 +3207,22 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.weight_upload_bytes += len * std::mem::size_of::<f32>();
         self.metrics.upload_bytes += 2 * len * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(final_norm.gpu_cache_hit);
-        self.dispatch_trace.push(PackedDispatchTrace::resident_stage(
-            self.dispatch_trace.len() + 1,
-            "gpu_dense",
-            "post_attention_norm_gpu",
-            "post_attention_layernorm.weight",
-            len,
-            len,
-            final_norm.gpu_cache_hit,
-            final_norm.compile_duration,
-            final_norm.report.upload_duration,
-            Duration::ZERO,
-            final_norm.report.gpu_duration,
-            len * std::mem::size_of::<f32>(),
-            len * std::mem::size_of::<f32>(),
-        ));
+        self.dispatch_trace
+            .push(PackedDispatchTrace::resident_stage(
+                self.dispatch_trace.len() + 1,
+                "gpu_dense",
+                "post_attention_norm_gpu",
+                "post_attention_layernorm.weight",
+                len,
+                len,
+                final_norm.gpu_cache_hit,
+                final_norm.compile_duration,
+                final_norm.report.upload_duration,
+                Duration::ZERO,
+                final_norm.report.gpu_duration,
+                len * std::mem::size_of::<f32>(),
+                len * std::mem::size_of::<f32>(),
+            ));
 
         let pair_key = format!("concat::{first_name}||{second_name}");
         let (packed, pack_duration, pack_cache_hit) =
@@ -3619,7 +3644,8 @@ impl ReferenceModel {
     ) -> Result<(), ReferenceError> {
         for layer_tensors in &self.layer_tensors {
             let _ = self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
-            let _ = self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
+            let _ =
+                self.load_vector_f32_resolved(&layer_tensors.post_attention_layernorm_weight)?;
             let _ = self.load_vector_f32_resolved(&layer_tensors.q_norm_weight)?;
             let _ = self.load_vector_f32_resolved(&layer_tensors.k_norm_weight)?;
             if use_attention_qkv {
@@ -3646,7 +3672,8 @@ impl ReferenceModel {
                         self.config.hidden_size,
                         self.config.hidden_size,
                     )?;
-                    let _ = self.get_or_create_projection_gpu(&layer_tensors.o_proj_weight, &packed)?;
+                    let _ =
+                        self.get_or_create_projection_gpu(&layer_tensors.o_proj_weight, &packed)?;
                 }
             }
             if use_mlp_gu {
@@ -3672,7 +3699,8 @@ impl ReferenceModel {
                         self.config.hidden_size,
                         self.config.intermediate_size,
                     )?;
-                    let _ = self.get_or_create_projection_gpu(&layer_tensors.down_proj_weight, &packed)?;
+                    let _ = self
+                        .get_or_create_projection_gpu(&layer_tensors.down_proj_weight, &packed)?;
                     if plan.gpu_swiglu_block {
                         let _ = self.get_or_create_swiglu_pack_f16_pairs_gpu()?;
                     }
@@ -4203,15 +4231,17 @@ impl ReferenceModel {
             && use_attention_qkv
             && use_gpu_attention_block
         {
-            return Ok(Some(gpu_first_session.run_first_layer_embedding_norm_qkv_tensors(
-                layer_idx,
-                token_id,
-                input_norm_weight,
-                &layer_tensors.q_proj_weight,
-                &layer_tensors.k_proj_weight,
-                &layer_tensors.v_proj_weight,
-                self.config.num_key_value_heads * self.config.head_dim,
-            )?));
+            return Ok(Some(
+                gpu_first_session.run_first_layer_embedding_norm_qkv_tensors(
+                    layer_idx,
+                    token_id,
+                    input_norm_weight,
+                    &layer_tensors.q_proj_weight,
+                    &layer_tensors.k_proj_weight,
+                    &layer_tensors.v_proj_weight,
+                    self.config.num_key_value_heads * self.config.head_dim,
+                )?,
+            ));
         }
         Ok(None)
     }
@@ -4237,15 +4267,17 @@ impl ReferenceModel {
             && packed_use_gpu_first_session()
             && use_attention_qkv
         {
-            return Ok(Some(gpu_first_session.run_first_layer_embedding_norm_qkv_to_host(
-                layer_idx,
-                token_id,
-                input_norm_weight,
-                &layer_tensors.q_proj_weight,
-                &layer_tensors.k_proj_weight,
-                &layer_tensors.v_proj_weight,
-                self.config.num_key_value_heads * self.config.head_dim,
-            )?));
+            return Ok(Some(
+                gpu_first_session.run_first_layer_embedding_norm_qkv_to_host(
+                    layer_idx,
+                    token_id,
+                    input_norm_weight,
+                    &layer_tensors.q_proj_weight,
+                    &layer_tensors.k_proj_weight,
+                    &layer_tensors.v_proj_weight,
+                    self.config.num_key_value_heads * self.config.head_dim,
+                )?,
+            ));
         }
         Ok(None)
     }
@@ -4257,15 +4289,7 @@ impl ReferenceModel {
         metrics: &mut DecodeMetrics,
         session: &mut PackedGpuSession<'_>,
     ) -> Vec<f32> {
-        let (
-            _hidden_resident,
-            _q,
-            _k,
-            _v,
-            norm_report,
-            qkv_report,
-            compile_duration,
-        ) = entry;
+        let (_hidden_resident, _q, _k, _v, norm_report, qkv_report, compile_duration) = entry;
         session.metrics.compile_duration += *compile_duration;
         session.metrics.activation_upload_duration +=
             norm_report.upload_duration + qkv_report.upload_duration;
@@ -4273,7 +4297,8 @@ impl ReferenceModel {
         session.metrics.gpu_duration += norm_report.gpu_duration + qkv_report.gpu_duration;
         session.metrics.download_duration +=
             norm_report.download_duration + qkv_report.download_duration;
-        session.metrics.activation_upload_bytes += self.config.hidden_size * std::mem::size_of::<f32>();
+        session.metrics.activation_upload_bytes +=
+            self.config.hidden_size * std::mem::size_of::<f32>();
         session.metrics.upload_bytes += self.config.hidden_size * std::mem::size_of::<f32>();
         metrics.norm_duration +=
             norm_report.upload_duration + norm_report.gpu_duration + norm_report.download_duration;
@@ -4292,15 +4317,7 @@ impl ReferenceModel {
         resident_hidden_state: ResidentHiddenState,
         gpu_first_session: &mut GpuFirstRunnerCache<'_>,
     ) -> Result<Vec<f32>, ReferenceError> {
-        let (
-            _hidden_resident,
-            _q,
-            _k,
-            _v,
-            norm_report,
-            qkv_report,
-            compile_duration,
-        ) = entry;
+        let (_hidden_resident, _q, _k, _v, norm_report, qkv_report, compile_duration) = entry;
         session.metrics.compile_duration += *compile_duration;
         session.metrics.activation_upload_duration +=
             norm_report.upload_duration + qkv_report.upload_duration;
@@ -4308,7 +4325,8 @@ impl ReferenceModel {
         session.metrics.gpu_duration += norm_report.gpu_duration + qkv_report.gpu_duration;
         session.metrics.download_duration +=
             norm_report.download_duration + qkv_report.download_duration;
-        session.metrics.activation_upload_bytes += self.config.hidden_size * std::mem::size_of::<f32>();
+        session.metrics.activation_upload_bytes +=
+            self.config.hidden_size * std::mem::size_of::<f32>();
         session.metrics.upload_bytes += self.config.hidden_size * std::mem::size_of::<f32>();
         session.metrics.download_bytes += (self.config.hidden_size
             + 2 * (self.config.num_key_value_heads * self.config.head_dim))
@@ -4346,20 +4364,24 @@ impl ReferenceModel {
         ) = entry;
         *hidden = gpu_hidden.clone();
         session.metrics.compile_duration += *compile_duration;
-        session.metrics.activation_upload_duration +=
-            embedding_report.upload_duration + norm_report.upload_duration + qkv_report.upload_duration;
-        session.metrics.upload_duration +=
-            embedding_report.upload_duration + norm_report.upload_duration + qkv_report.upload_duration;
+        session.metrics.activation_upload_duration += embedding_report.upload_duration
+            + norm_report.upload_duration
+            + qkv_report.upload_duration;
+        session.metrics.upload_duration += embedding_report.upload_duration
+            + norm_report.upload_duration
+            + qkv_report.upload_duration;
         session.metrics.gpu_duration +=
             embedding_report.gpu_duration + norm_report.gpu_duration + qkv_report.gpu_duration;
-        session.metrics.download_duration +=
-            embedding_report.download_duration + norm_report.download_duration + qkv_report.download_duration;
+        session.metrics.download_duration += embedding_report.download_duration
+            + norm_report.download_duration
+            + qkv_report.download_duration;
         session.metrics.activation_upload_bytes +=
             std::mem::size_of::<u32>() + self.config.hidden_size * std::mem::size_of::<f32>();
         session.metrics.upload_bytes +=
             std::mem::size_of::<u32>() + self.config.hidden_size * std::mem::size_of::<f32>();
-        metrics.embedding_duration +=
-            embedding_report.upload_duration + embedding_report.gpu_duration + embedding_report.download_duration;
+        metrics.embedding_duration += embedding_report.upload_duration
+            + embedding_report.gpu_duration
+            + embedding_report.download_duration;
         metrics.norm_duration +=
             norm_report.upload_duration + norm_report.gpu_duration + norm_report.download_duration;
         metrics.qkv_duration +=
@@ -4375,26 +4397,21 @@ impl ReferenceModel {
         metrics: &mut DecodeMetrics,
         session: &mut PackedGpuSession<'_>,
     ) -> Vec<f32> {
-        let (
-            gpu_hidden,
-            _q,
-            _k,
-            _v,
-            embedding_report,
-            norm_report,
-            qkv_report,
-            compile_duration,
-        ) = entry;
+        let (gpu_hidden, _q, _k, _v, embedding_report, norm_report, qkv_report, compile_duration) =
+            entry;
         *hidden = gpu_hidden.clone();
         session.metrics.compile_duration += *compile_duration;
-        session.metrics.activation_upload_duration +=
-            embedding_report.upload_duration + norm_report.upload_duration + qkv_report.upload_duration;
-        session.metrics.upload_duration +=
-            embedding_report.upload_duration + norm_report.upload_duration + qkv_report.upload_duration;
+        session.metrics.activation_upload_duration += embedding_report.upload_duration
+            + norm_report.upload_duration
+            + qkv_report.upload_duration;
+        session.metrics.upload_duration += embedding_report.upload_duration
+            + norm_report.upload_duration
+            + qkv_report.upload_duration;
         session.metrics.gpu_duration +=
             embedding_report.gpu_duration + norm_report.gpu_duration + qkv_report.gpu_duration;
-        session.metrics.download_duration +=
-            embedding_report.download_duration + norm_report.download_duration + qkv_report.download_duration;
+        session.metrics.download_duration += embedding_report.download_duration
+            + norm_report.download_duration
+            + qkv_report.download_duration;
         session.metrics.activation_upload_bytes +=
             std::mem::size_of::<u32>() + self.config.hidden_size * std::mem::size_of::<f32>();
         session.metrics.upload_bytes +=
@@ -4403,8 +4420,9 @@ impl ReferenceModel {
             + (self.config.hidden_size
                 + 2 * (self.config.num_key_value_heads * self.config.head_dim))
                 * std::mem::size_of::<f32>();
-        metrics.embedding_duration +=
-            embedding_report.upload_duration + embedding_report.gpu_duration + embedding_report.download_duration;
+        metrics.embedding_duration += embedding_report.upload_duration
+            + embedding_report.gpu_duration
+            + embedding_report.download_duration;
         metrics.norm_duration +=
             norm_report.upload_duration + norm_report.gpu_duration + norm_report.download_duration;
         metrics.qkv_duration +=
@@ -4429,7 +4447,8 @@ impl ReferenceModel {
         session.metrics.compile_duration += compile_duration;
         session.metrics.activation_upload_duration +=
             embedding_report.upload_duration + norm_report.upload_duration;
-        session.metrics.upload_duration += embedding_report.upload_duration + norm_report.upload_duration;
+        session.metrics.upload_duration +=
+            embedding_report.upload_duration + norm_report.upload_duration;
         session.metrics.gpu_duration += embedding_report.gpu_duration + norm_report.gpu_duration;
         session.metrics.download_duration +=
             embedding_report.download_duration + norm_report.download_duration;
@@ -4507,6 +4526,107 @@ impl ReferenceModel {
             self.matvec_f16_resolved(&layer_tensors.v_proj_weight, hidden_states)?,
             false,
         ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_gpu_attention_query_and_kv(
+        &self,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+        layer_idx: usize,
+        q: &mut Vec<f32>,
+        k: &[f32],
+        v: &[f32],
+        first_layer_gpu_entry_tensor_qkv: &Option<FirstLayerTensorQkvEntry>,
+        resident_hidden_tensor_qkv: &Option<ResidentTensorQkvEntry>,
+        q_norm_weight: &[f32],
+        k_norm_weight: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        metrics: &mut DecodeMetrics,
+        session: &mut PackedGpuSession<'_>,
+    ) -> Result<(Option<GpuResidentBuffer>, bool), ReferenceError> {
+        if let Some((_, _, q_tensor, k_tensor, v_tensor, ..)) =
+            first_layer_gpu_entry_tensor_qkv.as_ref()
+        {
+            let (query_out, key_out, qk_rope_report, compile_duration) = gpu_first_session
+                .run_qk_rope_resident_query_and_key(
+                    q_tensor,
+                    k_tensor,
+                    q_norm_weight,
+                    k_norm_weight,
+                    cos,
+                    sin,
+                )?;
+            gpu_first_session.append_gpu_kv_tensors(layer_idx, &key_out, v_tensor)?;
+            metrics.norm_duration += qk_rope_report.upload_duration
+                + qk_rope_report.gpu_duration
+                + qk_rope_report.download_duration;
+            session.metrics.compile_duration += compile_duration;
+            session.metrics.activation_upload_duration += qk_rope_report.upload_duration;
+            session.metrics.upload_duration += qk_rope_report.upload_duration;
+            session.metrics.gpu_duration += qk_rope_report.gpu_duration;
+            session.metrics.download_duration += qk_rope_report.download_duration;
+            session.metrics.activation_upload_bytes +=
+                (q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
+                    * std::mem::size_of::<f32>();
+            session.metrics.upload_bytes +=
+                (q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
+                    * std::mem::size_of::<f32>();
+            return Ok((Some(query_out), true));
+        }
+        if let Some((_, q_tensor, k_tensor, v_tensor, ..)) = resident_hidden_tensor_qkv.as_ref() {
+            let (query_out, key_out, qk_rope_report, compile_duration) = gpu_first_session
+                .run_qk_rope_resident_query_and_key(
+                    q_tensor,
+                    k_tensor,
+                    q_norm_weight,
+                    k_norm_weight,
+                    cos,
+                    sin,
+                )?;
+            gpu_first_session.append_gpu_kv_tensors(layer_idx, &key_out, v_tensor)?;
+            metrics.norm_duration += qk_rope_report.upload_duration
+                + qk_rope_report.gpu_duration
+                + qk_rope_report.download_duration;
+            session.metrics.compile_duration += compile_duration;
+            session.metrics.activation_upload_duration += qk_rope_report.upload_duration;
+            session.metrics.upload_duration += qk_rope_report.upload_duration;
+            session.metrics.gpu_duration += qk_rope_report.gpu_duration;
+            session.metrics.download_duration += qk_rope_report.download_duration;
+            session.metrics.activation_upload_bytes +=
+                (q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
+                    * std::mem::size_of::<f32>();
+            session.metrics.upload_bytes +=
+                (q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
+                    * std::mem::size_of::<f32>();
+            return Ok((Some(query_out), true));
+        }
+        let ((q_out, key_out), qk_rope_report, compile_duration) = gpu_first_session
+            .run_qk_rope_query_to_host_key_resident(q, k, q_norm_weight, k_norm_weight, cos, sin)?;
+        *q = q_out;
+        let q_resident = gpu_first_session
+            .qk_rope_runner
+            .as_ref()
+            .expect("qk rope runner should exist after execution")
+            .borrow()
+            .query_resident_output();
+        gpu_first_session.append_gpu_kv_key_tensor_and_value_host(layer_idx, &key_out, v)?;
+        metrics.norm_duration += qk_rope_report.upload_duration
+            + qk_rope_report.gpu_duration
+            + qk_rope_report.download_duration;
+        session.metrics.compile_duration += compile_duration;
+        session.metrics.activation_upload_duration += qk_rope_report.upload_duration;
+        session.metrics.upload_duration += qk_rope_report.upload_duration;
+        session.metrics.gpu_duration += qk_rope_report.gpu_duration;
+        session.metrics.download_duration += qk_rope_report.download_duration;
+        session.metrics.activation_upload_bytes +=
+            (q.len() + k.len() + q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
+                * std::mem::size_of::<f32>();
+        session.metrics.upload_bytes +=
+            (q.len() + k.len() + q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
+                * std::mem::size_of::<f32>();
+        session.metrics.download_bytes += q.len() * std::mem::size_of::<f32>();
+        Ok((Some(q_resident), true))
     }
 
     fn encode_prompt_ids(
@@ -6821,9 +6941,7 @@ impl ReferenceModel {
                     resident_hidden_state.expect("resident hidden state should exist"),
                     gpu_first_session,
                 )?
-            } else if layer_idx == 0
-                && packed_use_gpu_embedding()
-                && packed_use_gpu_first_session()
+            } else if layer_idx == 0 && packed_use_gpu_embedding() && packed_use_gpu_first_session()
             {
                 self.apply_first_layer_embedding_norm_entry(
                     gpu_first_session,
@@ -6848,8 +6966,10 @@ impl ReferenceModel {
                 hidden_states
             };
             let residual = hidden.clone();
-            let residual_resident = self
-                .residual_resident_source(&first_layer_gpu_entry_tensor_qkv, &resident_hidden_tensor_qkv);
+            let residual_resident = self.residual_resident_source(
+                &first_layer_gpu_entry_tensor_qkv,
+                &resident_hidden_tensor_qkv,
+            );
 
             let started_at = Instant::now();
             let (mut q, mut k, v, reusable_qkv_scratch) = self.prepare_qkv_host_vectors(
@@ -6873,110 +6993,21 @@ impl ReferenceModel {
             let mut q_resident: Option<GpuResidentBuffer> = None;
             let mut kv_appended_on_gpu = false;
             if use_gpu_attention_block {
-                if let Some((_, _, q_tensor, k_tensor, v_tensor, ..)) =
-                    first_layer_gpu_entry_tensor_qkv.as_ref()
-                {
-                    let (query_out, key_out, qk_rope_report, compile_duration) = gpu_first_session
-                        .run_qk_rope_resident_query_and_key(
-                            q_tensor,
-                            k_tensor,
-                            &q_norm_weight,
-                            &k_norm_weight,
-                            &cos,
-                            &sin,
-                        )?;
-                    q_resident = Some(query_out);
-                    gpu_first_session.append_gpu_kv_tensors(layer_idx, &key_out, v_tensor)?;
-                    kv_appended_on_gpu = true;
-                    metrics.norm_duration += qk_rope_report.upload_duration
-                        + qk_rope_report.gpu_duration
-                        + qk_rope_report.download_duration;
-                    session.metrics.compile_duration += compile_duration;
-                    session.metrics.activation_upload_duration += qk_rope_report.upload_duration;
-                    session.metrics.upload_duration += qk_rope_report.upload_duration;
-                    session.metrics.gpu_duration += qk_rope_report.gpu_duration;
-                    session.metrics.download_duration += qk_rope_report.download_duration;
-                    session.metrics.activation_upload_bytes +=
-                        (q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
-                            * std::mem::size_of::<f32>();
-                    session.metrics.upload_bytes +=
-                        (q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
-                            * std::mem::size_of::<f32>();
-                } else if let Some((_, q_tensor, k_tensor, v_tensor, ..)) =
-                    resident_hidden_tensor_qkv.as_ref()
-                {
-                    let (query_out, key_out, qk_rope_report, compile_duration) = gpu_first_session
-                        .run_qk_rope_resident_query_and_key(
-                            q_tensor,
-                            k_tensor,
-                            &q_norm_weight,
-                            &k_norm_weight,
-                            &cos,
-                            &sin,
-                        )?;
-                    q_resident = Some(query_out);
-                    gpu_first_session.append_gpu_kv_tensors(layer_idx, &key_out, v_tensor)?;
-                    kv_appended_on_gpu = true;
-                    metrics.norm_duration += qk_rope_report.upload_duration
-                        + qk_rope_report.gpu_duration
-                        + qk_rope_report.download_duration;
-                    session.metrics.compile_duration += compile_duration;
-                    session.metrics.activation_upload_duration += qk_rope_report.upload_duration;
-                    session.metrics.upload_duration += qk_rope_report.upload_duration;
-                    session.metrics.gpu_duration += qk_rope_report.gpu_duration;
-                    session.metrics.download_duration += qk_rope_report.download_duration;
-                    session.metrics.activation_upload_bytes +=
-                        (q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
-                            * std::mem::size_of::<f32>();
-                    session.metrics.upload_bytes +=
-                        (q_norm_weight.len() + k_norm_weight.len() + cos.len() + sin.len())
-                            * std::mem::size_of::<f32>();
-                } else {
-                    let ((q_out, key_out), qk_rope_report, compile_duration) = gpu_first_session
-                        .run_qk_rope_query_to_host_key_resident(
-                            &q,
-                            &k,
-                            &q_norm_weight,
-                            &k_norm_weight,
-                            &cos,
-                            &sin,
-                        )?;
-                    q = q_out;
-                    q_resident = Some(
-                        gpu_first_session
-                            .qk_rope_runner
-                            .as_ref()
-                            .expect("qk rope runner should exist after execution")
-                            .borrow()
-                            .query_resident_output(),
-                    );
-                    gpu_first_session
-                        .append_gpu_kv_key_tensor_and_value_host(layer_idx, &key_out, &v)?;
-                    kv_appended_on_gpu = true;
-                    metrics.norm_duration += qk_rope_report.upload_duration
-                        + qk_rope_report.gpu_duration
-                        + qk_rope_report.download_duration;
-                    session.metrics.compile_duration += compile_duration;
-                    session.metrics.activation_upload_duration += qk_rope_report.upload_duration;
-                    session.metrics.upload_duration += qk_rope_report.upload_duration;
-                    session.metrics.gpu_duration += qk_rope_report.gpu_duration;
-                    session.metrics.download_duration += qk_rope_report.download_duration;
-                    session.metrics.activation_upload_bytes += (q.len()
-                        + k.len()
-                        + q_norm_weight.len()
-                        + k_norm_weight.len()
-                        + cos.len()
-                        + sin.len())
-                        * std::mem::size_of::<f32>();
-                    session.metrics.upload_bytes += (q.len()
-                        + k.len()
-                        + q_norm_weight.len()
-                        + k_norm_weight.len()
-                        + cos.len()
-                        + sin.len())
-                        * std::mem::size_of::<f32>();
-                    session.metrics.download_bytes += q.len() * std::mem::size_of::<f32>();
-                }
+                (q_resident, kv_appended_on_gpu) = self.prepare_gpu_attention_query_and_kv(
+                    gpu_first_session,
+                    layer_idx,
+                    &mut q,
+                    &k,
+                    &v,
+                    &first_layer_gpu_entry_tensor_qkv,
+                    &resident_hidden_tensor_qkv,
+                    &q_norm_weight,
+                    &k_norm_weight,
+                    &cos,
+                    &sin,
+                    metrics,
+                    session,
+                )?;
             } else {
                 apply_head_rms_norm_weighted(
                     &mut q,
@@ -7427,8 +7458,7 @@ impl ReferenceModel {
             }
 
             let started_at = Instant::now();
-            let use_gpu_swiglu_block =
-                use_mlp_gu && use_mlp_full && packed_use_gpu_swiglu_block();
+            let use_gpu_swiglu_block = use_mlp_gu && use_mlp_full && packed_use_gpu_swiglu_block();
             let use_gpu_tail = use_gpu_swiglu_block
                 && packed_use_gpu_tail()
                 && packed_use_gpu_final_norm()
@@ -7615,7 +7645,9 @@ impl ReferenceModel {
                     .run_tail_from_resident_hidden(&hidden_gpu.tensor, &final_norm_weight, true)?;
                 let next_token = match tail_result {
                     GpuTailResult::NextToken(token_id) => token_id,
-                    GpuTailResult::Logits(_) => unreachable!("argmax-only tail should return a token"),
+                    GpuTailResult::Logits(_) => {
+                        unreachable!("argmax-only tail should return a token")
+                    }
                 };
                 metrics.norm_duration += norm_started.elapsed();
                 metrics.logits_duration += tail_report.pack_gpu_duration
@@ -7633,7 +7665,9 @@ impl ReferenceModel {
                     .run_tail_from_host_hidden(&hidden, &final_norm_weight, true)?;
                 let next_token = match tail_result {
                     GpuTailResult::NextToken(token_id) => token_id,
-                    GpuTailResult::Logits(_) => unreachable!("argmax-only tail should return a token"),
+                    GpuTailResult::Logits(_) => {
+                        unreachable!("argmax-only tail should return a token")
+                    }
                 };
                 metrics.norm_duration += norm_started.elapsed();
                 metrics.logits_duration += tail_report.pack_gpu_duration
@@ -8661,9 +8695,7 @@ mod tests {
             panic!("gpu-first session should be selected when gpu attention is enabled");
         };
         assert_eq!(session.cpu_kv_is_empty(0), Some(true));
-        assert!(
-            session.has_attention_block(0)
-        );
+        assert!(session.has_attention_block(0));
     }
 
     #[test]
@@ -8728,9 +8760,7 @@ mod tests {
             model.layer_tensors[0].k_proj_weight,
             model.layer_tensors[0].v_proj_weight,
         );
-        assert!(
-            session.has_raw_f32_projection_runner(&expected_key)
-        );
+        assert!(session.has_raw_f32_projection_runner(&expected_key));
     }
 
     #[test]
@@ -8778,18 +8808,10 @@ mod tests {
             model.layer_tensors[0].k_proj_weight,
             model.layer_tensors[0].v_proj_weight,
         );
-        assert!(
-            session.has_raw_f32_projection_runner(&expected_q_key)
-        );
-        assert!(
-            session.has_raw_f32_projection_runner(&expected_k_key)
-        );
-        assert!(
-            session.has_raw_f32_projection_runner(&expected_v_key)
-        );
-        assert!(
-            !session.has_raw_f32_projection_runner(&legacy_triplet_key)
-        );
+        assert!(session.has_raw_f32_projection_runner(&expected_q_key));
+        assert!(session.has_raw_f32_projection_runner(&expected_k_key));
+        assert!(session.has_raw_f32_projection_runner(&expected_v_key));
+        assert!(!session.has_raw_f32_projection_runner(&legacy_triplet_key));
         assert!(session.has_qk_rope_runner());
         assert_eq!(session.cpu_kv_is_empty(0), Some(true));
         assert_eq!(
@@ -8838,15 +8860,9 @@ mod tests {
             "gpu_first::layer::1::v_proj::{}",
             model.layer_tensors[1].v_proj_weight,
         );
-        assert!(
-            session.has_raw_f32_projection_runner(&expected_q_key)
-        );
-        assert!(
-            session.has_raw_f32_projection_runner(&expected_k_key)
-        );
-        assert!(
-            session.has_raw_f32_projection_runner(&expected_v_key)
-        );
+        assert!(session.has_raw_f32_projection_runner(&expected_q_key));
+        assert!(session.has_raw_f32_projection_runner(&expected_k_key));
+        assert!(session.has_raw_f32_projection_runner(&expected_v_key));
         assert_eq!(session.cpu_kv_is_empty(0), Some(true));
         assert_eq!(session.cpu_kv_is_empty(1), Some(true));
         assert_eq!(
@@ -8963,9 +8979,7 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when gpu attention tail is enabled");
         };
-        assert!(
-            session.has_attention_block(0)
-        );
+        assert!(session.has_attention_block(0));
         assert!(session.has_tail_block());
     }
 
@@ -9025,9 +9039,7 @@ mod tests {
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when gpu full last layer is enabled");
         };
-        assert!(
-            session.has_full_last_layer_block()
-        );
+        assert!(session.has_full_last_layer_block());
         assert_eq!(session.cpu_kv_is_empty(0), Some(true));
         assert_eq!(session.cpu_kv_is_empty(1), Some(true));
         assert_eq!(
@@ -9156,15 +9168,9 @@ mod tests {
             "gpu_first::layer::0::v_proj::{}",
             model.layer_tensors[0].v_proj_weight,
         );
-        assert!(
-            session.has_raw_f32_projection_runner(&expected_q_key)
-        );
-        assert!(
-            session.has_raw_f32_projection_runner(&expected_k_key)
-        );
-        assert!(
-            session.has_raw_f32_projection_runner(&expected_v_key)
-        );
+        assert!(session.has_raw_f32_projection_runner(&expected_q_key));
+        assert!(session.has_raw_f32_projection_runner(&expected_k_key));
+        assert!(session.has_raw_f32_projection_runner(&expected_v_key));
         for layer_idx in 0..2 {
             assert_eq!(session.cpu_kv_is_empty(layer_idx), Some(true));
             assert_eq!(session.cpu_kv_capacities(layer_idx), Some((0, 0)));
