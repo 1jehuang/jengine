@@ -2002,6 +2002,7 @@ struct PackedDecodeStageSelection {
     use_gpu_attention_block: bool,
     use_gpu_attention_mlp_block: bool,
     use_gpu_attention_only: bool,
+    use_gpu_attention_tail: bool,
     use_gpu_full_last_layer_block: bool,
     use_gpu_full_last_layer: bool,
     use_gpu_mlp_entry: bool,
@@ -2009,6 +2010,12 @@ struct PackedDecodeStageSelection {
     use_gpu_mlp_tail: bool,
     use_gpu_swiglu_block: bool,
     use_gpu_tail: bool,
+}
+
+enum PackedAttentionStageOutcome {
+    Hidden(Vec<f32>),
+    ResidentMlp,
+    NextToken(usize),
 }
 
 impl<'a> PackedGpuSession<'a> {
@@ -7682,6 +7689,8 @@ impl ReferenceModel {
         let use_gpu_attention_mlp_block =
             use_gpu_attention_block && use_mlp_gu && use_mlp_full && packed_use_gpu_swiglu_block();
         let use_gpu_attention_only = use_gpu_attention_block && !use_gpu_attention_mlp_block;
+        let use_gpu_attention_tail =
+            use_gpu_attention_only && argmax_only && packed_use_gpu_tail() && is_last_layer;
         let use_gpu_full_last_layer_block = use_gpu_attention_mlp_block
             && argmax_only
             && packed_use_gpu_full_last_layer()
@@ -7706,6 +7715,7 @@ impl ReferenceModel {
             use_gpu_attention_block,
             use_gpu_attention_mlp_block,
             use_gpu_attention_only,
+            use_gpu_attention_tail,
             use_gpu_full_last_layer_block,
             use_gpu_full_last_layer,
             use_gpu_mlp_entry,
@@ -7714,6 +7724,113 @@ impl ReferenceModel {
             use_gpu_swiglu_block,
             use_gpu_tail,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_attention_stage_after_qkv(
+        &self,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+        layer_idx: usize,
+        position: usize,
+        q: &[f32],
+        q_resident: Option<&GpuResidentBuffer>,
+        residual_resident: Option<&GpuResidentBuffer>,
+        layer_cache: &mut LayerCache,
+        residual: &[f32],
+        layer_tensors: &LayerTensorNames,
+        stage_selection: &PackedDecodeStageSelection,
+        use_attention_full: bool,
+        use_attention_qkv: bool,
+        attention_stage_metrics: &mut PackedAttentionStageMetrics,
+        mlp_stage_metrics: &mut PackedMlpStageMetrics,
+        metrics: &mut DecodeMetrics,
+        non_offloaded_dense_duration: &mut Duration,
+        session: &mut PackedGpuSession<'_>,
+    ) -> Result<PackedAttentionStageOutcome, ReferenceError> {
+        if stage_selection.use_gpu_attention_only {
+            if stage_selection.use_gpu_attention_tail {
+                let next_token = self.run_gpu_attention_only_tail_argmax(
+                    gpu_first_session,
+                    layer_idx,
+                    position,
+                    q,
+                    q_resident,
+                    residual_resident,
+                    layer_cache,
+                    residual,
+                    attention_stage_metrics,
+                    metrics,
+                    session,
+                )?;
+                return Ok(PackedAttentionStageOutcome::NextToken(next_token));
+            }
+            let hidden = self.run_gpu_attention_only_to_host(
+                gpu_first_session,
+                layer_idx,
+                position,
+                q,
+                q_resident,
+                layer_cache,
+                residual,
+                attention_stage_metrics,
+                metrics,
+                session,
+            )?;
+            return Ok(PackedAttentionStageOutcome::Hidden(hidden));
+        }
+
+        if stage_selection.use_gpu_full_last_layer_block {
+            let next_token = self.run_gpu_full_last_layer_argmax(
+                gpu_first_session,
+                layer_idx,
+                position,
+                q,
+                q_resident,
+                residual_resident,
+                layer_cache,
+                residual,
+                layer_tensors,
+                attention_stage_metrics,
+                mlp_stage_metrics,
+                metrics,
+                session,
+            )?;
+            return Ok(PackedAttentionStageOutcome::NextToken(next_token));
+        }
+
+        if stage_selection.use_gpu_attention_mlp_block {
+            self.run_gpu_attention_mlp_resident_handoff(
+                gpu_first_session,
+                layer_idx,
+                position,
+                q,
+                q_resident,
+                residual_resident,
+                layer_cache,
+                residual,
+                layer_tensors,
+                attention_stage_metrics,
+                mlp_stage_metrics,
+                metrics,
+                session,
+            )?;
+            return Ok(PackedAttentionStageOutcome::ResidentMlp);
+        }
+
+        let hidden = self.apply_dense_attention_fallback(
+            session,
+            layer_tensors,
+            q,
+            layer_cache,
+            position,
+            residual,
+            use_attention_full,
+            use_attention_qkv,
+            attention_stage_metrics,
+            metrics,
+            non_offloaded_dense_duration,
+        )?;
+        Ok(PackedAttentionStageOutcome::Hidden(hidden))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7909,107 +8026,46 @@ impl ReferenceModel {
                 gpu_first_session.append_gpu_kv(layer_idx, &k, &v)?;
             }
 
-            if stage_selection.use_gpu_attention_only {
-                let use_gpu_attention_tail = argmax_only
-                    && packed_use_gpu_tail()
-                    && layer_idx + 1 == self.config.num_hidden_layers;
-                if use_gpu_attention_tail {
-                    let next_token = self.run_gpu_attention_only_tail_argmax(
-                        gpu_first_session,
-                        layer_idx,
-                        position,
-                        &q,
-                        q_resident.as_ref(),
-                        residual_resident.as_ref(),
-                        layer_cache,
-                        &residual,
-                        attention_stage_metrics,
-                        metrics,
-                        session,
-                    )?;
-                    if reusable_qkv_scratch {
-                        session.restore_qkv_scratch(q, k, v);
-                    }
-                    return Ok(PackedDecodeStepResult::NextToken(next_token));
-                } else {
-                    hidden = self.run_gpu_attention_only_to_host(
-                        gpu_first_session,
-                        layer_idx,
-                        position,
-                        &q,
-                        q_resident.as_ref(),
-                        layer_cache,
-                        &residual,
-                        attention_stage_metrics,
-                        metrics,
-                        session,
-                    )?;
-                }
-            }
-
             if !stage_selection.use_gpu_attention_block {
                 layer_cache.keys.extend_from_slice(&k);
                 layer_cache.values.extend_from_slice(&v);
             }
 
-            if stage_selection.use_gpu_full_last_layer_block {
-                let next_token = self.run_gpu_full_last_layer_argmax(
-                    gpu_first_session,
-                    layer_idx,
-                    position,
-                    &q,
-                    q_resident.as_ref(),
-                    residual_resident.as_ref(),
-                    layer_cache,
-                    &residual,
-                    layer_tensors,
-                    attention_stage_metrics,
-                    mlp_stage_metrics,
-                    metrics,
-                    session,
-                )?;
-                if reusable_qkv_scratch {
-                    session.restore_qkv_scratch(q, k, v);
+            match self.handle_attention_stage_after_qkv(
+                gpu_first_session,
+                layer_idx,
+                position,
+                &q,
+                q_resident.as_ref(),
+                residual_resident.as_ref(),
+                layer_cache,
+                &residual,
+                layer_tensors,
+                &stage_selection,
+                use_attention_full,
+                use_attention_qkv,
+                attention_stage_metrics,
+                mlp_stage_metrics,
+                metrics,
+                non_offloaded_dense_duration,
+                session,
+            )? {
+                PackedAttentionStageOutcome::NextToken(next_token) => {
+                    if reusable_qkv_scratch {
+                        session.restore_qkv_scratch(q, k, v);
+                    }
+                    return Ok(PackedDecodeStepResult::NextToken(next_token));
                 }
-                return Ok(PackedDecodeStepResult::NextToken(next_token));
-            }
-            if stage_selection.use_gpu_attention_mlp_block {
-                self.run_gpu_attention_mlp_resident_handoff(
-                    gpu_first_session,
-                    layer_idx,
-                    position,
-                    &q,
-                    q_resident.as_ref(),
-                    residual_resident.as_ref(),
-                    layer_cache,
-                    &residual,
-                    layer_tensors,
-                    attention_stage_metrics,
-                    mlp_stage_metrics,
-                    metrics,
-                    session,
-                )?;
-                resident_hidden_state = Some(ResidentHiddenState::Mlp { layer_idx });
-                if reusable_qkv_scratch {
-                    session.restore_qkv_scratch(q, k, v);
+                PackedAttentionStageOutcome::ResidentMlp => {
+                    resident_hidden_state = Some(ResidentHiddenState::Mlp { layer_idx });
+                    if reusable_qkv_scratch {
+                        session.restore_qkv_scratch(q, k, v);
+                    }
+                    continue;
                 }
-                continue;
-            }
-
-            if !stage_selection.use_gpu_attention_only {
-                hidden = self.apply_dense_attention_fallback(
-                    session,
-                    layer_tensors,
-                    &q,
-                    layer_cache,
-                    position,
-                    &residual,
-                    use_attention_full,
-                    use_attention_qkv,
-                    attention_stage_metrics,
-                    metrics,
-                    non_offloaded_dense_duration,
-                )?;
+                PackedAttentionStageOutcome::Hidden(next_hidden) => {
+                    hidden = next_hidden;
+                }
             }
 
             if reusable_qkv_scratch {
