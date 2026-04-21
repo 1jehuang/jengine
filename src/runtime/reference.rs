@@ -5857,14 +5857,13 @@ impl ReferenceModel {
             *non_offloaded_dense_duration += elapsed;
             session.push_dense_stage_trace("qk_norm_rope", &layer_tensors.q_norm_weight, elapsed);
 
-            let use_gpu_attention_block = use_attention_qkv
-                && use_attention_full
+            let use_gpu_attention_block =
+                use_attention_qkv && use_attention_full && Self::packed_use_gpu_attention_block();
+            let use_gpu_attention_mlp_block = use_gpu_attention_block
                 && use_mlp_gu
                 && use_mlp_full
-                && Self::packed_use_gpu_attention_block();
-            let use_gpu_attention_mlp_block =
-                use_gpu_attention_block && Self::packed_use_gpu_swiglu_block();
-            if Self::packed_use_gpu_attention_block() {
+                && Self::packed_use_gpu_swiglu_block();
+            if use_gpu_attention_block {
                 gpu_first_session.append_gpu_kv(layer_idx, &k, &v)?;
             }
 
@@ -5894,7 +5893,7 @@ impl ReferenceModel {
                 session.metrics.download_duration += download_duration;
             }
 
-            if !use_gpu_attention_mlp_block {
+            if !use_gpu_attention_block {
                 layer_cache.keys.extend_from_slice(&k);
                 layer_cache.values.extend_from_slice(&v);
             }
@@ -7180,7 +7179,10 @@ mod tests {
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed-first model should load");
         let _guard = lock_env();
-        let _env = ScopedEnvVars::set(&[("JENGINE_GPU_ATTENTION_BLOCK", "1")]);
+        let _env = ScopedEnvVars::set(&[
+            ("JENGINE_PACKED_ATTENTION_FULL", "1"),
+            ("JENGINE_GPU_ATTENTION_BLOCK", "1"),
+        ]);
 
         let mut session = model.begin_packed_decode_session(2, true, true, true);
         let _ = session
@@ -7197,12 +7199,16 @@ mod tests {
             .get(&0)
             .expect("layer 0 gpu kv cache should exist");
         assert_eq!(kv_cache.len_tokens(), 1);
-        assert_eq!(kv_cache.snapshot_keys().expect("kv keys should read back"), session.inner.cache[0].keys);
+        assert_eq!(
+            kv_cache.snapshot_keys().expect("kv keys should read back").len(),
+            model.config.num_key_value_heads * model.config.head_dim
+        );
         assert_eq!(
             kv_cache
                 .snapshot_values()
-                .expect("kv values should read back"),
-            session.inner.cache[0].values
+                .expect("kv values should read back")
+                .len(),
+            model.config.num_key_value_heads * model.config.head_dim
         );
     }
 
@@ -7232,6 +7238,41 @@ mod tests {
 
         let PackedDecodeSession::GpuFirst(session) = session else {
             panic!("gpu-first session should be selected when block flags are enabled");
+        };
+        assert!(session.inner.cache[0].keys.is_empty());
+        assert!(session.inner.cache[0].values.is_empty());
+        let kv_cache = session
+            .inner
+            .gpu_first_session
+            .gpu_kv_caches
+            .get(&0)
+            .expect("layer 0 gpu kv cache should exist");
+        assert_eq!(kv_cache.len_tokens(), 1);
+    }
+
+    #[test]
+    fn avoids_cpu_kv_cache_on_gpu_attention_only_path() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let _guard = lock_env();
+        let _env = ScopedEnvVars::set(&[
+            ("JENGINE_PACKED_ATTENTION_FULL", "1"),
+            ("JENGINE_GPU_ATTENTION_BLOCK", "1"),
+        ]);
+
+        let mut session = model.begin_packed_decode_session(2, true, true, true);
+        let _ = session
+            .push_prompt_token(2)
+            .expect("gpu attention token should decode");
+
+        let PackedDecodeSession::GpuFirst(session) = session else {
+            panic!("gpu-first session should be selected when gpu attention is enabled");
         };
         assert!(session.inner.cache[0].keys.is_empty());
         assert!(session.inner.cache[0].values.is_empty());
@@ -7488,7 +7529,7 @@ mod tests {
         let packed =
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed model should load");
-        let _guard = env_lock().lock().expect("env lock should be acquired");
+        let _guard = lock_env();
         let layers = packed.config.num_hidden_layers;
 
         let (_, attention) = packed
@@ -7516,7 +7557,7 @@ mod tests {
         let packed =
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed model should load");
-        let _guard = env_lock().lock().expect("env lock should be acquired");
+        let _guard = lock_env();
         let prompt_ids = [2usize];
         let expected_dispatches = packed.config.num_hidden_layers * 2 + 1;
         let kv_rows = packed.config.num_key_value_heads * packed.config.head_dim;
