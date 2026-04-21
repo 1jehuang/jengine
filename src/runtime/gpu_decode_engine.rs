@@ -4,8 +4,10 @@ use crate::runtime::gpu_decode_metrics::{
     DecodeMetrics, PackedAttentionStageMetrics, PackedDecodeMetrics,
     PackedGpuSessionMetrics,
     PackedDecodeValidationReport, PackedMlpStageMetrics,
+    account_projection_report,
 };
 use crate::runtime::gpu_decode_output::{PackedDecodeResult, PackedDispatchTrace};
+use crate::runtime::gpu_decode_projection_state::PackedProjectionCache;
 use crate::runtime::gpu_decode_scratch::PackedDecodeScratch;
 use crate::runtime::gpu_decode_session_state::{
     LayerCache, PackedDecodeStepResult, allocate_layer_cache_vec,
@@ -113,6 +115,79 @@ impl<'a> PackedGpuSession<'a> {
 
     pub(crate) fn restore_mlp_scratch(&mut self, mlp: Vec<f32>) {
         self.scratch.restore_mlp(mlp)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn push_dispatch_trace(
+        &mut self,
+        tensor_name: &str,
+        operation: &str,
+        rows: usize,
+        cols: usize,
+        pack_cache_hit: bool,
+        gpu_cache_hit: bool,
+        compile_duration: std::time::Duration,
+        weight_upload_duration: std::time::Duration,
+        activation_upload_duration: std::time::Duration,
+        gpu_duration: std::time::Duration,
+        download_duration: std::time::Duration,
+        weight_upload_bytes: usize,
+        activation_upload_bytes: usize,
+        download_bytes: usize,
+    ) {
+        self.dispatch_trace.push(PackedDispatchTrace::gpu_packed(
+            self.dispatch_trace.len() + 1,
+            tensor_name,
+            operation,
+            rows,
+            cols,
+            pack_cache_hit,
+            gpu_cache_hit,
+            compile_duration,
+            weight_upload_duration,
+            activation_upload_duration,
+            gpu_duration,
+            download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            download_bytes,
+        ));
+    }
+
+    pub(crate) fn push_dense_stage_trace(
+        &mut self,
+        stage: &str,
+        tensor_name: &str,
+        cpu_duration: std::time::Duration,
+    ) {
+        self.dispatch_trace.push(PackedDispatchTrace::dense_stage(
+            self.dispatch_trace.len() + 1,
+            stage,
+            tensor_name,
+            cpu_duration,
+        ));
+    }
+
+    pub(crate) fn account_projection_report(
+        &mut self,
+        packed: &PackedProjectionCache,
+        cols: usize,
+        weight_upload_duration: std::time::Duration,
+        gpu_cache_hit: bool,
+        report: &crate::gpu::packed_matvec::GpuPackedMatvecReport,
+        download_bytes: usize,
+    ) {
+        let packed_weight_bytes = packed.code_words.len() * std::mem::size_of::<u32>()
+            + packed.scales.len() * std::mem::size_of::<f32>();
+        account_projection_report(
+            &mut self.metrics,
+            packed_weight_bytes,
+            cols,
+            weight_upload_duration,
+            gpu_cache_hit,
+            report,
+            download_bytes,
+        );
     }
 }
 

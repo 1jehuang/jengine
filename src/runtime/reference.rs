@@ -35,7 +35,7 @@ use crate::runtime::gpu_decode_metrics::{
     AttentionProjectionMixMetrics, DecodeMetrics, HybridDecodeMetrics,
     HybridProjectionDecodeMetrics, MlpProjectionMixMetrics, PackedAttentionStageMetrics,
     PackedDecodeMetrics,
-    PackedMlpStageMetrics, ProjectionComparison, account_projection_report,
+    PackedMlpStageMetrics, ProjectionComparison,
     finish_packed_decode_metrics,
 };
 use crate::runtime::gpu_decode_model_state::{HybridQProjCache, LayerTensorNames};
@@ -2542,74 +2542,6 @@ impl<'a> PackedGpuSession<'a> {
             rows * std::mem::size_of::<f32>(),
         );
         Ok(output)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn push_dispatch_trace(
-        &mut self,
-        tensor_name: &str,
-        operation: &str,
-        rows: usize,
-        cols: usize,
-        pack_cache_hit: bool,
-        gpu_cache_hit: bool,
-        compile_duration: Duration,
-        weight_upload_duration: Duration,
-        activation_upload_duration: Duration,
-        gpu_duration: Duration,
-        download_duration: Duration,
-        weight_upload_bytes: usize,
-        activation_upload_bytes: usize,
-        download_bytes: usize,
-    ) {
-        self.dispatch_trace.push(PackedDispatchTrace::gpu_packed(
-            self.dispatch_trace.len() + 1,
-            tensor_name,
-            operation,
-            rows,
-            cols,
-            pack_cache_hit,
-            gpu_cache_hit,
-            compile_duration,
-            weight_upload_duration,
-            activation_upload_duration,
-            gpu_duration,
-            download_duration,
-            weight_upload_bytes,
-            activation_upload_bytes,
-            download_bytes,
-        ));
-    }
-
-    fn push_dense_stage_trace(&mut self, stage: &str, tensor_name: &str, cpu_duration: Duration) {
-        self.dispatch_trace.push(PackedDispatchTrace::dense_stage(
-            self.dispatch_trace.len() + 1,
-            stage,
-            tensor_name,
-            cpu_duration,
-        ));
-    }
-
-    fn account_projection_report(
-        &mut self,
-        packed: &PackedProjectionCache,
-        cols: usize,
-        weight_upload_duration: Duration,
-        gpu_cache_hit: bool,
-        report: &crate::gpu::packed_matvec::GpuPackedMatvecReport,
-        download_bytes: usize,
-    ) {
-        let packed_weight_bytes = packed.code_words.len() * std::mem::size_of::<u32>()
-            + packed.scales.len() * std::mem::size_of::<f32>();
-        account_projection_report(
-            &mut self.metrics,
-            packed_weight_bytes,
-            cols,
-            weight_upload_duration,
-            gpu_cache_hit,
-            report,
-            download_bytes,
-        );
     }
 
     fn run_projection_add_residual(
