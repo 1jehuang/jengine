@@ -1,7 +1,7 @@
 use crate::model::tokenizer::PromptAnalysis;
 use crate::runtime::decode_report::MemoryReport;
 use crate::runtime::gpu_decode_metrics::DecodeMetrics;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -39,6 +39,25 @@ pub fn append_jsonl_record(file_name: &str, value: &Value) -> Result<PathBuf, st
     serde_json::to_writer(&mut file, value).expect("JSONL should serialize");
     writeln!(file)?;
     Ok(path)
+}
+
+pub fn runtime_fingerprint_json() -> Value {
+    fn read_trimmed(path: &str) -> Option<String> {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    let recorded_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    json!({
+        "recorded_unix_secs": recorded_unix_secs,
+        "hostname": std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()).or_else(|| read_trimmed("/etc/hostname")),
+        "kernel_release": read_trimmed("/proc/sys/kernel/osrelease"),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]

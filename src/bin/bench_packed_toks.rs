@@ -1,4 +1,4 @@
-use jengine::report::append_jsonl_record;
+use jengine::report::{append_jsonl_record, runtime_fingerprint_json};
 use jengine::runtime::packed_model::resolve_source_file_sha256;
 use jengine::runtime::reference::ReferenceModel;
 use serde_json::json;
@@ -71,6 +71,7 @@ fn main() {
     let artifact_source_file_sha256 = manifest
         .as_ref()
         .and_then(|manifest| resolve_source_file_sha256(manifest).ok().flatten());
+    let runtime_fingerprint = runtime_fingerprint_json();
 
     let (use_attention_qkv, use_mlp_gu) = match variant.as_str() {
         "attention" => (true, false),
@@ -134,6 +135,7 @@ fn main() {
                 "summary": result.summarize(),
                 "artifact_manifest_sha256": artifact_source_file_sha256,
                 "artifact_source_file_sha256": artifact_source_file_sha256,
+                "runtime_fingerprint": runtime_fingerprint,
                 "artifact_created_unix_secs": manifest.as_ref().map(|m| m.created_unix_secs),
                 "artifact_source_file_bytes": manifest.as_ref().map(|m| m.source_file_bytes),
             }),
@@ -158,6 +160,7 @@ fn main() {
             "avg_tok_s": avg_tok_s,
             "artifact_manifest_sha256": artifact_source_file_sha256,
             "artifact_source_file_sha256": artifact_source_file_sha256,
+            "runtime_fingerprint": runtime_fingerprint,
             "artifact_created_unix_secs": manifest.as_ref().map(|m| m.created_unix_secs),
             "artifact_source_file_bytes": manifest.as_ref().map(|m| m.source_file_bytes),
         }),

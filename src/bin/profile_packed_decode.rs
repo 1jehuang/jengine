@@ -1,4 +1,4 @@
-use jengine::report::{timestamped_profile_path, write_json_value};
+use jengine::report::{runtime_fingerprint_json, timestamped_profile_path, write_json_value};
 use jengine::runtime::gpu_decode_metrics::{DecodeMetrics, PackedDecodeMetrics};
 use jengine::runtime::packed_model::resolve_source_file_sha256;
 use jengine::runtime::reference::ReferenceModel;
@@ -94,6 +94,7 @@ fn main() {
     let artifact_source_file_sha256 = manifest
         .as_ref()
         .and_then(|manifest| resolve_source_file_sha256(manifest).ok().flatten());
+    let runtime_fingerprint = runtime_fingerprint_json();
     if std::env::var_os("JENGINE_PREWARM_PACKED").is_some() {
         let expected_tokens = model
             .prompt_analysis(&prompt)
@@ -128,6 +129,7 @@ fn main() {
             "artifact_manifest_sha256": artifact_source_file_sha256,
             "artifact_source_file_sha256": artifact_source_file_sha256,
         },
+        "runtime_fingerprint": runtime_fingerprint,
     });
     let output = serde_json::to_string_pretty(&document).expect("profile JSON should serialize");
 
