@@ -5219,6 +5219,46 @@ impl ReferenceModel {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_hidden_after_mlp(
+        &self,
+        session: &mut PackedGpuSession<'_>,
+        down: Option<Vec<f32>>,
+        gpu_hidden_after_mlp: Option<ResidentGpuVectorAdd>,
+        residual: &[f32],
+        hidden: &mut Vec<f32>,
+        final_hidden_gpu: &mut Option<ResidentGpuVectorAdd>,
+        resident_hidden_state: &mut Option<ResidentHiddenState>,
+        use_mlp_full: bool,
+        use_gpu_swiglu_block: bool,
+        gpu_residual_elapsed: Duration,
+    ) -> Duration {
+        if let Some(hidden_gpu) = gpu_hidden_after_mlp {
+            *hidden = residual.to_vec();
+            *final_hidden_gpu = Some(hidden_gpu);
+            *resident_hidden_state = None;
+            return gpu_residual_elapsed;
+        }
+        *resident_hidden_state = None;
+        if use_mlp_full && !use_gpu_swiglu_block {
+            *hidden = down.expect("down must exist for cpu residual path");
+            return Duration::ZERO;
+        }
+        let residual_started_at = Instant::now();
+        *hidden = residual
+            .iter()
+            .zip(
+                down.as_ref()
+                    .expect("down must exist for cpu residual path")
+                    .iter(),
+            )
+            .map(|(left, right)| left + right)
+            .collect();
+        let residual_elapsed = residual_started_at.elapsed();
+        session.push_dense_stage_trace("mlp_residual", "mlp_residual_add", residual_elapsed);
+        residual_elapsed
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -7875,36 +7915,18 @@ impl ReferenceModel {
                 )?
             };
             mlp_stage_metrics.down_duration += down_elapsed;
-            let residual_elapsed = if let Some(hidden_gpu) = gpu_hidden_after_mlp {
-                hidden = residual;
-                final_hidden_gpu = Some(hidden_gpu);
-                resident_hidden_state = None;
-                gpu_residual_elapsed
-            } else {
-                resident_hidden_state = None;
-                if use_mlp_full && !use_gpu_swiglu_block {
-                    hidden = down.expect("down must exist for cpu residual path");
-                    Duration::ZERO
-                } else {
-                    let residual_started_at = Instant::now();
-                    hidden = residual
-                        .iter()
-                        .zip(
-                            down.as_ref()
-                                .expect("down must exist for cpu residual path")
-                                .iter(),
-                        )
-                        .map(|(left, right)| left + right)
-                        .collect();
-                    let residual_elapsed = residual_started_at.elapsed();
-                    session.push_dense_stage_trace(
-                        "mlp_residual",
-                        "mlp_residual_add",
-                        residual_elapsed,
-                    );
-                    residual_elapsed
-                }
-            };
+            let residual_elapsed = self.resolve_hidden_after_mlp(
+                session,
+                down,
+                gpu_hidden_after_mlp,
+                &residual,
+                &mut hidden,
+                &mut final_hidden_gpu,
+                &mut resident_hidden_state,
+                use_mlp_full,
+                use_gpu_swiglu_block,
+                gpu_residual_elapsed,
+            );
             mlp_stage_metrics.residual_duration += residual_elapsed;
             let elapsed = started_at.elapsed();
             metrics.mlp_duration += elapsed;
