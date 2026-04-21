@@ -30,6 +30,7 @@ use crate::runtime::gpu_decode_env::{
     packed_use_gpu_full_last_layer, packed_use_gpu_mlp_entry, packed_use_gpu_swiglu_block,
     packed_use_gpu_tail, packed_use_mlp_full,
 };
+use crate::runtime::gpu_decode_engine::PersistentPackedDecodeSession;
 use crate::runtime::gpu_decode_metrics::{
     AttentionProjectionMixMetrics, DecodeMetrics, HybridDecodeMetrics,
     HybridProjectionDecodeMetrics, MlpProjectionMixMetrics, PackedAttentionStageMetrics,
@@ -134,23 +135,6 @@ type GpuSwigluBlockExecution = (
     Instant,
 );
 
-pub struct PersistentPackedDecodeSession<'a> {
-    pub(crate) model: &'a ReferenceModel,
-    pub(crate) cache: Vec<LayerCache>,
-    pub(crate) gpu_session: PackedGpuSession<'a>,
-    pub(crate) gpu_first_session: GpuFirstRunnerCache<'a>,
-    pub(crate) metrics: DecodeMetrics,
-    pub(crate) attention_stage_metrics: PackedAttentionStageMetrics,
-    pub(crate) mlp_stage_metrics: PackedMlpStageMetrics,
-    pub(crate) non_offloaded_dense_duration: Duration,
-    pub(crate) next_position: usize,
-    pub(crate) use_attention_qkv: bool,
-    pub(crate) use_mlp_gu: bool,
-    pub(crate) use_attention_full: bool,
-    pub(crate) use_mlp_full: bool,
-    pub(crate) argmax_only: bool,
-}
-
 impl<'a> PersistentPackedDecodeSession<'a> {
     pub(crate) fn new_with_cpu_kv_preallocation(
         model: &'a ReferenceModel,
@@ -201,13 +185,6 @@ impl<'a> PersistentPackedDecodeSession<'a> {
     pub fn dispatch_trace(&self) -> &[PackedDispatchTrace] {
         &self.gpu_session.dispatch_trace
     }
-}
-
-pub struct GpuFirstPackedDecodeSession<'a> {
-    pub(crate) inner: PersistentPackedDecodeSession<'a>,
-}
-
-impl<'a> GpuFirstPackedDecodeSession<'a> {
 }
 
 pub(crate) struct GpuFirstRunnerCache<'a> {
