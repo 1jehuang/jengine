@@ -3509,15 +3509,26 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
 
-        let (combined, report) =
-            runner
-                .borrow_mut()
-                .run_with_output(input, None)
-                .map_err(|error| {
-                    ReferenceError::Decode(format!(
-                        "gpu projection failed for {first_name}+{second_name}: {error}"
-                    ))
-                })?;
+        let report = runner
+            .borrow_mut()
+            .run_resident(input)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection failed for {first_name}+{second_name}: {error}"
+                ))
+            })?;
+        let ((first, second), download_duration) = runner
+            .borrow()
+            .read_output_pair(first_rows, second_rows)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection output download failed for {first_name}+{second_name}: {error}"
+                ))
+            })?;
+        let report = crate::gpu::packed_matvec::GpuPackedMatvecReport {
+            download_duration,
+            ..report
+        };
         self.metrics.activation_upload_duration += report.upload_duration;
         self.metrics.upload_duration += weight_upload_duration + report.upload_duration;
         self.metrics.gpu_duration += report.gpu_duration;
@@ -3534,7 +3545,6 @@ impl<'a> PackedGpuSession<'a> {
             usize::from(!gpu_cache_hit) * weight_bytes + activation_upload_bytes;
         self.metrics.download_bytes += (first_rows + second_rows) * std::mem::size_of::<f32>();
 
-        let (first, second) = combined.split_at(first_rows);
         let weight_upload_bytes = usize::from(!gpu_cache_hit)
             * (packed.code_words.len() * std::mem::size_of::<u32>()
                 + packed.scales.len() * std::mem::size_of::<f32>());
@@ -3556,7 +3566,7 @@ impl<'a> PackedGpuSession<'a> {
             activation_upload_bytes,
             download_bytes,
         );
-        Ok((first.to_vec(), second.to_vec()))
+        Ok((first, second))
     }
 
     #[allow(dead_code)]
@@ -3587,11 +3597,14 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.weight_upload_duration += weight_upload_duration;
         self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
-        let report = runner.borrow_mut().run_resident(input).map_err(|error| {
-            ReferenceError::Decode(format!(
-                "gpu projection failed for {first_name}+{second_name}: {error}"
-            ))
-        })?;
+        let report = runner
+            .borrow_mut()
+            .run_resident(input)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection failed for {first_name}+{second_name}: {error}"
+                ))
+            })?;
         let tensor = GpuResidentBuffer::new(
             runner.borrow().shared_context().clone(),
             runner.borrow().output_buffer_handle(),
@@ -3746,15 +3759,26 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.pack_cache_hits += usize::from(pack_cache_hit);
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
 
-        let (combined, report) =
-            runner
-                .borrow_mut()
-                .run_with_output(input, None)
-                .map_err(|error| {
-                    ReferenceError::Decode(format!(
-                        "gpu projection failed for {first_name}+{second_name}+{third_name}: {error}"
-                    ))
-                })?;
+        let report = runner
+            .borrow_mut()
+            .run_resident(input)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection failed for {first_name}+{second_name}+{third_name}: {error}"
+                ))
+            })?;
+        let ((first, second, third), download_duration) = runner
+            .borrow()
+            .read_output_triplet(first_rows, second_rows, third_rows)
+            .map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection output download failed for {first_name}+{second_name}+{third_name}: {error}"
+                ))
+            })?;
+        let report = crate::gpu::packed_matvec::GpuPackedMatvecReport {
+            download_duration,
+            ..report
+        };
         self.metrics.activation_upload_duration += report.upload_duration;
         self.metrics.upload_duration += weight_upload_duration + report.upload_duration;
         self.metrics.gpu_duration += report.gpu_duration;
@@ -3772,8 +3796,6 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.download_bytes +=
             (first_rows + second_rows + third_rows) * std::mem::size_of::<f32>();
 
-        let (first, tail) = combined.split_at(first_rows);
-        let (second, third) = tail.split_at(second_rows);
         let weight_upload_bytes = usize::from(!gpu_cache_hit)
             * (packed.code_words.len() * std::mem::size_of::<u32>()
                 + packed.scales.len() * std::mem::size_of::<f32>());
@@ -3795,7 +3817,7 @@ impl<'a> PackedGpuSession<'a> {
             activation_upload_bytes,
             download_bytes,
         );
-        Ok((first.to_vec(), second.to_vec(), third.to_vec()))
+        Ok((first, second, third))
     }
 }
 

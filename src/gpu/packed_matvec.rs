@@ -927,6 +927,48 @@ impl CachedGpuPackedMatvecRunner {
         Ok((gpu_output, download_started.elapsed()))
     }
 
+    pub fn read_output_pair(
+        &self,
+        first_rows: usize,
+        second_rows: usize,
+    ) -> Result<((Vec<f32>, Vec<f32>), Duration), GpuPackedMatvecError> {
+        if first_rows + second_rows != self.rows {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "pair rows {} + {} must equal output rows {}",
+                first_rows, second_rows, self.rows
+            )));
+        }
+        let download_started = Instant::now();
+        let values = unsafe {
+            std::slice::from_raw_parts(self.output_buffer.mapped_ptr as *const f32, self.rows)
+        };
+        let first = values[..first_rows].to_vec();
+        let second = values[first_rows..first_rows + second_rows].to_vec();
+        Ok(((first, second), download_started.elapsed()))
+    }
+
+    pub fn read_output_triplet(
+        &self,
+        first_rows: usize,
+        second_rows: usize,
+        third_rows: usize,
+    ) -> Result<((Vec<f32>, Vec<f32>, Vec<f32>), Duration), GpuPackedMatvecError> {
+        if first_rows + second_rows + third_rows != self.rows {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "triplet rows {} + {} + {} must equal output rows {}",
+                first_rows, second_rows, third_rows, self.rows
+            )));
+        }
+        let download_started = Instant::now();
+        let values = unsafe {
+            std::slice::from_raw_parts(self.output_buffer.mapped_ptr as *const f32, self.rows)
+        };
+        let first = values[..first_rows].to_vec();
+        let second = values[first_rows..first_rows + second_rows].to_vec();
+        let third = values[first_rows + second_rows..first_rows + second_rows + third_rows].to_vec();
+        Ok(((first, second, third), download_started.elapsed()))
+    }
+
     pub fn argmax_output(&self) -> Result<(usize, Duration), GpuPackedMatvecError> {
         let download_started = Instant::now();
         let argmax_index = argmax_f32_buffer(&self.output_buffer, self.rows)?;
