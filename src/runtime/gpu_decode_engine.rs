@@ -1,4 +1,5 @@
 use crate::runtime::decode_plan::PackedDecodePlan;
+use crate::runtime::gpu_decode_env::{gpu_first_use_attention_full, gpu_first_use_mlp_full};
 use crate::runtime::reference::{
     GpuFirstPackedDecodeSession, PackedDecodeSession, PersistentPackedDecodeSession,
     ReferenceError, ReferenceModel,
@@ -38,6 +39,30 @@ pub struct GpuDecodeEngine<'a> {
     model: &'a ReferenceModel,
     request: PackedDecodeRequest,
     plan: PackedDecodePlan,
+}
+
+impl<'a> GpuFirstPackedDecodeSession<'a> {
+    pub(crate) fn new(
+        model: &'a ReferenceModel,
+        expected_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        argmax_only: bool,
+    ) -> Self {
+        let mut inner = PersistentPackedDecodeSession::new_with_cpu_kv_preallocation(
+            model,
+            expected_tokens,
+            use_attention_qkv,
+            use_mlp_gu,
+            argmax_only,
+            false,
+        );
+        inner.set_full_modes(
+            gpu_first_use_attention_full(use_attention_qkv),
+            gpu_first_use_mlp_full(use_mlp_gu),
+        );
+        Self { inner }
+    }
 }
 
 impl<'a> GpuDecodeEngine<'a> {

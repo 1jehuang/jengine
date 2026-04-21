@@ -24,11 +24,10 @@ use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRun
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::decode_plan::PackedDecodePlan;
 use crate::runtime::gpu_decode_env::{
-    gpu_first_use_attention_full, gpu_first_use_mlp_full, packed_enabled_label,
-    packed_use_attention_full, packed_use_gpu_attention_block, packed_use_gpu_embedding,
-    packed_use_gpu_final_norm, packed_use_gpu_first_session, packed_use_gpu_full_last_layer,
-    packed_use_gpu_mlp_entry, packed_use_gpu_swiglu_block, packed_use_gpu_tail,
-    packed_use_mlp_full,
+    packed_enabled_label, packed_use_attention_full, packed_use_gpu_attention_block,
+    packed_use_gpu_embedding, packed_use_gpu_final_norm, packed_use_gpu_first_session,
+    packed_use_gpu_full_last_layer, packed_use_gpu_mlp_entry, packed_use_gpu_swiglu_block,
+    packed_use_gpu_tail, packed_use_mlp_full,
 };
 use crate::runtime::gpu_decode_metrics::{
     PackedAttentionStageMetrics, PackedGpuSessionMetrics, PackedMlpStageMetrics,
@@ -501,7 +500,7 @@ pub struct PersistentPackedDecodeSession<'a> {
 }
 
 impl<'a> PersistentPackedDecodeSession<'a> {
-    fn new_with_cpu_kv_preallocation(
+    pub(crate) fn new_with_cpu_kv_preallocation(
         model: &'a ReferenceModel,
         expected_tokens: usize,
         use_attention_qkv: bool,
@@ -552,6 +551,11 @@ impl<'a> PersistentPackedDecodeSession<'a> {
             argmax_only,
             true,
         )
+    }
+
+    pub(crate) fn set_full_modes(&mut self, use_attention_full: bool, use_mlp_full: bool) {
+        self.use_attention_full = use_attention_full;
+        self.use_mlp_full = use_mlp_full;
     }
 
     pub fn push_prompt_token(
@@ -650,30 +654,10 @@ impl<'a> PersistentPackedDecodeSession<'a> {
 }
 
 pub struct GpuFirstPackedDecodeSession<'a> {
-    inner: PersistentPackedDecodeSession<'a>,
+    pub(crate) inner: PersistentPackedDecodeSession<'a>,
 }
 
 impl<'a> GpuFirstPackedDecodeSession<'a> {
-    pub(crate) fn new(
-        model: &'a ReferenceModel,
-        expected_tokens: usize,
-        use_attention_qkv: bool,
-        use_mlp_gu: bool,
-        argmax_only: bool,
-    ) -> Self {
-        let mut inner = PersistentPackedDecodeSession::new_with_cpu_kv_preallocation(
-            model,
-            expected_tokens,
-            use_attention_qkv,
-            use_mlp_gu,
-            argmax_only,
-            false,
-        );
-        inner.use_attention_full = gpu_first_use_attention_full(use_attention_qkv);
-        inner.use_mlp_full = gpu_first_use_mlp_full(use_mlp_gu);
-        Self { inner }
-    }
-
     pub fn push_prompt_token(
         &mut self,
         token_id: usize,
