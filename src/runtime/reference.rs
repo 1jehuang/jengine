@@ -25,10 +25,10 @@ use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::decode_plan::PackedDecodePlan;
+use crate::runtime::gpu_decode_state::{GpuKvBinding, ResidentHiddenState};
 use crate::runtime::packed_model::{PackedModelError, PackedModelStore};
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
 use crate::runtime::weights::{WeightError, WeightStore};
-use ash::vk;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
@@ -920,11 +920,6 @@ struct PackedMlpStageMetrics {
     residual_duration: Duration,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResidentHiddenState {
-    Mlp { layer_idx: usize },
-}
-
 struct GpuFirstRunnerCache<'a> {
     model: &'a ReferenceModel,
     kv_capacity_tokens: usize,
@@ -1032,20 +1027,17 @@ impl<'a> GpuFirstRunnerCache<'a> {
             })
     }
 
-    fn gpu_kv_state(
-        &self,
-        layer_idx: usize,
-    ) -> Option<(vk::Buffer, usize, u64, vk::Buffer, usize, u64)> {
+    fn gpu_kv_state(&self, layer_idx: usize) -> Option<GpuKvBinding> {
         self.gpu_kv_caches.get(&layer_idx).map(|cache| {
             let kv_len = cache.len_tokens() * cache.kv_width();
-            (
-                cache.key_buffer_handle(),
-                kv_len,
-                cache.key_buffer_size(),
-                cache.value_buffer_handle(),
-                kv_len,
-                cache.value_buffer_size(),
-            )
+            GpuKvBinding {
+                key_buffer: cache.key_buffer_handle(),
+                key_len: kv_len,
+                key_buffer_size: cache.key_buffer_size(),
+                value_buffer: cache.value_buffer_handle(),
+                value_len: kv_len,
+                value_buffer_size: cache.value_buffer_size(),
+            }
         })
     }
 
@@ -1877,25 +1869,17 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .borrow_mut()
                 .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
-        } else if let Some((
-            key_buffer,
-            key_len,
-            key_buffer_size,
-            value_buffer,
-            value_len,
-            value_buffer_size,
-        )) = kv_state
-        {
+        } else if let Some(kv_state) = kv_state {
             attention_block
                 .borrow_mut()
                 .run_with_resident_kv(
                     q.expect("host query should exist when resident query is not provided"),
-                    key_buffer,
-                    key_len,
-                    key_buffer_size,
-                    value_buffer,
-                    value_len,
-                    value_buffer_size,
+                    kv_state.key_buffer,
+                    kv_state.key_len,
+                    kv_state.key_buffer_size,
+                    kv_state.value_buffer,
+                    kv_state.value_len,
+                    kv_state.value_buffer_size,
                     residual,
                 )
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
@@ -1973,25 +1957,17 @@ impl<'a> GpuFirstRunnerCache<'a> {
                     )
                     .map_err(|error| ReferenceError::Decode(error.to_string()))?
             }
-        } else if let Some((
-            key_buffer,
-            key_len,
-            key_buffer_size,
-            value_buffer,
-            value_len,
-            value_buffer_size,
-        )) = kv_state
-        {
+        } else if let Some(kv_state) = kv_state {
             attention_block
                 .borrow_mut()
                 .run_with_resident_kv(
                     q.expect("host query should exist when resident query is not provided"),
-                    key_buffer,
-                    key_len,
-                    key_buffer_size,
-                    value_buffer,
-                    value_len,
-                    value_buffer_size,
+                    kv_state.key_buffer,
+                    kv_state.key_len,
+                    kv_state.key_buffer_size,
+                    kv_state.value_buffer,
+                    kv_state.value_len,
+                    kv_state.value_buffer_size,
                     residual,
                 )
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
@@ -2043,25 +2019,17 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .borrow_mut()
                 .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
-        } else if let Some((
-            key_buffer,
-            key_len,
-            key_buffer_size,
-            value_buffer,
-            value_len,
-            value_buffer_size,
-        )) = kv_state
-        {
+        } else if let Some(kv_state) = kv_state {
             attention_block
                 .borrow_mut()
                 .run_with_resident_kv(
                     q.expect("host query should exist when resident query is not provided"),
-                    key_buffer,
-                    key_len,
-                    key_buffer_size,
-                    value_buffer,
-                    value_len,
-                    value_buffer_size,
+                    kv_state.key_buffer,
+                    kv_state.key_len,
+                    kv_state.key_buffer_size,
+                    kv_state.value_buffer,
+                    kv_state.value_len,
+                    kv_state.value_buffer_size,
                     residual,
                 )
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
@@ -2111,25 +2079,17 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .borrow_mut()
                 .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
-        } else if let Some((
-            key_buffer,
-            key_len,
-            key_buffer_size,
-            value_buffer,
-            value_len,
-            value_buffer_size,
-        )) = kv_state
-        {
+        } else if let Some(kv_state) = kv_state {
             attention_block
                 .borrow_mut()
                 .run_with_resident_kv(
                     q.expect("host query should exist when resident query is not provided"),
-                    key_buffer,
-                    key_len,
-                    key_buffer_size,
-                    value_buffer,
-                    value_len,
-                    value_buffer_size,
+                    kv_state.key_buffer,
+                    kv_state.key_len,
+                    kv_state.key_buffer_size,
+                    kv_state.value_buffer,
+                    kv_state.value_len,
+                    kv_state.value_buffer_size,
                     residual,
                 )
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
@@ -2189,25 +2149,17 @@ impl<'a> GpuFirstRunnerCache<'a> {
                     )
                     .map_err(|error| ReferenceError::Decode(error.to_string()))?
             }
-        } else if let Some((
-            key_buffer,
-            key_len,
-            key_buffer_size,
-            value_buffer,
-            value_len,
-            value_buffer_size,
-        )) = kv_state
-        {
+        } else if let Some(kv_state) = kv_state {
             attention_block
                 .borrow_mut()
                 .run_with_resident_kv(
                     q.expect("host query should exist when resident query is not provided"),
-                    key_buffer,
-                    key_len,
-                    key_buffer_size,
-                    value_buffer,
-                    value_len,
-                    value_buffer_size,
+                    kv_state.key_buffer,
+                    kv_state.key_len,
+                    kv_state.key_buffer_size,
+                    kv_state.value_buffer,
+                    kv_state.value_len,
+                    kv_state.value_buffer_size,
                     residual,
                 )
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
@@ -2346,25 +2298,17 @@ impl<'a> GpuFirstRunnerCache<'a> {
                     )
                     .map_err(|error| ReferenceError::Decode(error.to_string()))?
             }
-        } else if let Some((
-            key_buffer,
-            key_len,
-            key_buffer_size,
-            value_buffer,
-            value_len,
-            value_buffer_size,
-        )) = kv_state
-        {
+        } else if let Some(kv_state) = kv_state {
             attention_block
                 .borrow_mut()
                 .run_with_resident_kv(
                     q.expect("host query should exist when resident query is not provided"),
-                    key_buffer,
-                    key_len,
-                    key_buffer_size,
-                    value_buffer,
-                    value_len,
-                    value_buffer_size,
+                    kv_state.key_buffer,
+                    kv_state.key_len,
+                    kv_state.key_buffer_size,
+                    kv_state.value_buffer,
+                    kv_state.value_len,
+                    kv_state.value_buffer_size,
                     residual,
                 )
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
