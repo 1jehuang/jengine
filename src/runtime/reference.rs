@@ -85,6 +85,15 @@ type CachedSwigluPackF16PairsGpuRunner = Rc<RefCell<CachedGpuSwigluPackF16PairsR
 #[allow(dead_code)]
 type CachedSwigluPackF16PairsGpuCacheEntry = (CachedSwigluPackF16PairsGpuRunner, Duration, bool);
 type ProjectionTripletOutputs = (Vec<f32>, Vec<f32>, Vec<f32>);
+type ResidentTensorQkvEntry = (
+    GpuResidentBuffer,
+    GpuResidentBuffer,
+    GpuResidentBuffer,
+    GpuResidentBuffer,
+    GpuWeightedRmsNormReport,
+    crate::gpu::packed_matvec::GpuPackedMatvecReport,
+    Duration,
+);
 
 pub struct PersistentPackedDecodeSession<'a> {
     model: &'a ReferenceModel,
@@ -4081,6 +4090,37 @@ impl ReferenceModel {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn try_resident_hidden_tensor_qkv_entry(
+        &self,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+        resident_hidden_state: Option<ResidentHiddenState>,
+        layer_idx: usize,
+        use_attention_qkv: bool,
+        use_gpu_attention_block: bool,
+        input_norm_weight: &[f32],
+        layer_tensors: &LayerTensorNames,
+    ) -> Result<Option<ResidentTensorQkvEntry>, ReferenceError> {
+        if layer_idx > 0
+            && use_attention_qkv
+            && resident_hidden_state.is_some()
+            && use_gpu_attention_block
+        {
+            return Ok(Some(
+                gpu_first_session.run_layer_input_norm_qkv_tensors_from_hidden_resident(
+                    resident_hidden_state.expect("resident hidden state should exist"),
+                    layer_idx,
+                    input_norm_weight,
+                    &layer_tensors.q_proj_weight,
+                    &layer_tensors.k_proj_weight,
+                    &layer_tensors.v_proj_weight,
+                    self.config.num_key_value_heads * self.config.head_dim,
+                )?,
+            ));
+        }
+        Ok(None)
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -6338,25 +6378,15 @@ impl ReferenceModel {
 
             let input_norm_weight =
                 self.load_vector_f32_resolved(&layer_tensors.input_layernorm_weight)?;
-            let resident_hidden_tensor_qkv = if layer_idx > 0
-                && use_attention_qkv
-                && resident_hidden_state.is_some()
-                && use_gpu_attention_block
-            {
-                Some(
-                    gpu_first_session.run_layer_input_norm_qkv_tensors_from_hidden_resident(
-                        resident_hidden_state.expect("resident hidden state should exist"),
-                        layer_idx,
-                        &input_norm_weight,
-                        &layer_tensors.q_proj_weight,
-                        &layer_tensors.k_proj_weight,
-                        &layer_tensors.v_proj_weight,
-                        self.config.num_key_value_heads * self.config.head_dim,
-                    )?,
-                )
-            } else {
-                None
-            };
+            let resident_hidden_tensor_qkv = self.try_resident_hidden_tensor_qkv_entry(
+                gpu_first_session,
+                resident_hidden_state,
+                layer_idx,
+                use_attention_qkv,
+                use_gpu_attention_block,
+                &input_norm_weight,
+                layer_tensors,
+            )?;
             let resident_hidden_entry_qkv = if layer_idx > 0
                 && use_attention_qkv
                 && resident_hidden_state.is_some()
