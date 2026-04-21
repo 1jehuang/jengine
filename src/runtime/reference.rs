@@ -2496,6 +2496,7 @@ struct ResidentPackedProjection {
     operation: String,
     rows: usize,
     cols: usize,
+    tensor: GpuResidentBuffer,
     prepared: PreparedProjectionRunner,
     report: crate::gpu::packed_matvec::GpuPackedMatvecReport,
 }
@@ -2506,6 +2507,7 @@ struct ResidentPackedPairProjection {
     first_rows: usize,
     second_rows: usize,
     cols: usize,
+    tensor: GpuResidentBuffer,
     activation_upload_bytes: usize,
     prepared: PreparedProjectionRunner,
     report: crate::gpu::packed_matvec::GpuPackedMatvecReport,
@@ -2550,7 +2552,10 @@ struct ResidentGpuPackedActivation {
 
 #[allow(dead_code)]
 struct ResidentGpuSwigluCombined {
+    #[allow(dead_code)]
     runner: CachedSwigluCombinedGpuRunner,
+    tensor: GpuResidentBuffer,
+    len: usize,
     report: crate::gpu::swiglu_combined::GpuSwigluCombinedReport,
     compile_duration: Duration,
     gpu_cache_hit: bool,
@@ -2699,11 +2704,18 @@ impl<'a> PackedGpuSession<'a> {
             .map_err(|error| {
                 ReferenceError::Decode(format!("gpu projection failed for {tensor_name}: {error}"))
             })?;
+        let tensor = GpuResidentBuffer::new(
+            prepared.runner.borrow().shared_context().clone(),
+            prepared.runner.borrow().output_buffer_handle(),
+            rows,
+            prepared.runner.borrow().output_buffer_size(),
+        );
         Ok(ResidentPackedProjection {
             tensor_name: tensor_name.to_string(),
             operation: operation.to_string(),
             rows,
             cols,
+            tensor,
             prepared,
             report,
         })
@@ -2959,10 +2971,10 @@ impl<'a> PackedGpuSession<'a> {
         let report = runner
             .borrow_mut()
             .run_resident_from_f32_buffer(
-                pair.prepared.runner.borrow().shared_context(),
-                pair.prepared.runner.borrow().output_buffer_handle(),
+                &pair.tensor.shared_context,
+                pair.tensor.buffer,
                 pair.first_rows + pair.second_rows,
-                pair.prepared.runner.borrow().output_buffer_size(),
+                pair.tensor.buffer_size,
             )
             .map_err(|error| {
                 ReferenceError::Decode(format!("gpu combined swiglu failed: {error}"))
@@ -2997,7 +3009,16 @@ impl<'a> PackedGpuSession<'a> {
                 * std::mem::size_of::<f32>(),
             download_bytes: 0,
         });
+        let len = pair.first_rows;
+        let tensor = GpuResidentBuffer::new(
+            runner.borrow().shared_context().clone(),
+            runner.borrow().output_buffer_handle(),
+            len,
+            runner.borrow().output_buffer_size(),
+        );
         Ok(ResidentGpuSwigluCombined {
+            tensor,
+            len,
             runner,
             report,
             compile_duration,
@@ -3042,10 +3063,10 @@ impl<'a> PackedGpuSession<'a> {
         let report = runner
             .borrow_mut()
             .run_with_output_from_buffer(
-                pair.prepared.runner.borrow().shared_context(),
-                pair.prepared.runner.borrow().output_buffer_handle(),
+                &pair.tensor.shared_context,
+                pair.tensor.buffer,
                 pair.first_rows + pair.second_rows,
-                pair.prepared.runner.borrow().output_buffer_size(),
+                pair.tensor.buffer_size,
             )
             .map_err(|error| {
                 ReferenceError::Decode(format!("gpu fused swiglu pack failed: {error}"))
@@ -3107,10 +3128,10 @@ impl<'a> PackedGpuSession<'a> {
         let report = runner
             .borrow_mut()
             .run_resident_from_f32_buffer(
-                swiglu.runner.borrow().shared_context(),
-                swiglu.runner.borrow().output_buffer_handle(),
-                swiglu.runner.borrow().len(),
-                swiglu.runner.borrow().output_buffer_size(),
+                &swiglu.tensor.shared_context,
+                swiglu.tensor.buffer,
+                swiglu.len,
+                swiglu.tensor.buffer_size,
             )
             .map_err(|error| {
                 ReferenceError::Decode(format!("gpu pack f16 pairs failed: {error}"))
@@ -3119,9 +3140,8 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.upload_duration += report.upload_duration;
         self.metrics.gpu_duration += report.gpu_duration;
         self.metrics.dispatch_count += 1;
-        self.metrics.activation_upload_bytes +=
-            swiglu.runner.borrow().len() * std::mem::size_of::<f32>();
-        self.metrics.upload_bytes += swiglu.runner.borrow().len() * std::mem::size_of::<f32>();
+        self.metrics.activation_upload_bytes += swiglu.len * std::mem::size_of::<f32>();
+        self.metrics.upload_bytes += swiglu.len * std::mem::size_of::<f32>();
         self.metrics.gpu_cache_hits += usize::from(gpu_cache_hit);
         self.dispatch_trace.push(PackedDispatchTrace {
             index: self.dispatch_trace.len() + 1,
@@ -3129,8 +3149,8 @@ impl<'a> PackedGpuSession<'a> {
             path: "gpu_pack".to_string(),
             stage: "pack_f16_pairs".to_string(),
             tensor_name: "pack_f16_pairs".to_string(),
-            rows: swiglu.runner.borrow().len().div_ceil(2),
-            cols: swiglu.runner.borrow().len(),
+            rows: swiglu.len.div_ceil(2),
+            cols: swiglu.len,
             pack_cache_hit: false,
             gpu_cache_hit,
             cpu_ms: (compile_duration + report.upload_duration).as_secs_f64() * 1_000.0,
@@ -3140,7 +3160,7 @@ impl<'a> PackedGpuSession<'a> {
             gpu_ms: report.gpu_duration.as_secs_f64() * 1_000.0,
             download_ms: 0.0,
             weight_upload_bytes: 0,
-            activation_upload_bytes: swiglu.runner.borrow().len() * std::mem::size_of::<f32>(),
+            activation_upload_bytes: swiglu.len * std::mem::size_of::<f32>(),
             download_bytes: 0,
         });
         Ok(ResidentGpuPackedActivation {
@@ -3151,7 +3171,7 @@ impl<'a> PackedGpuSession<'a> {
                 runner.borrow().packed_len(),
                 runner.borrow().output_buffer_size(),
             ),
-            logical_len: swiglu.runner.borrow().len(),
+            logical_len: swiglu.len,
             upload_duration: report.upload_duration,
             gpu_duration: report.gpu_duration,
             compile_duration,
@@ -3209,11 +3229,18 @@ impl<'a> PackedGpuSession<'a> {
             activation_upload_bytes: activation.logical_len * std::mem::size_of::<f32>(),
             download_bytes: 0,
         });
+        let tensor = GpuResidentBuffer::new(
+            prepared.runner.borrow().shared_context().clone(),
+            prepared.runner.borrow().output_buffer_handle(),
+            rows,
+            prepared.runner.borrow().output_buffer_size(),
+        );
         Ok(ResidentPackedProjection {
             tensor_name: tensor_name.to_string(),
             operation: "single_resident".to_string(),
             rows,
             cols,
+            tensor,
             prepared,
             report,
         })
@@ -3258,10 +3285,10 @@ impl<'a> PackedGpuSession<'a> {
         let report = runner
             .borrow_mut()
             .run_resident_from_left_buffer_and_host(
-                left.prepared.runner.borrow().shared_context(),
-                left.prepared.runner.borrow().output_buffer_handle(),
+                &left.tensor.shared_context,
+                left.tensor.buffer,
                 left.rows,
-                left.prepared.runner.borrow().output_buffer_size(),
+                left.tensor.buffer_size,
                 right,
             )
             .map_err(|error| ReferenceError::Decode(format!("gpu vector add failed: {error}")))?;
@@ -3616,11 +3643,18 @@ impl<'a> PackedGpuSession<'a> {
                 "gpu projection failed for {first_name}+{second_name}: {error}"
             ))
         })?;
+        let tensor = GpuResidentBuffer::new(
+            runner.borrow().shared_context().clone(),
+            runner.borrow().output_buffer_handle(),
+            first_rows + second_rows,
+            runner.borrow().output_buffer_size(),
+        );
         Ok(ResidentPackedPairProjection {
             tensor_name: pair_key,
             first_rows,
             second_rows,
             cols,
+            tensor,
             activation_upload_bytes: cols.div_ceil(2) * std::mem::size_of::<u32>(),
             prepared: PreparedProjectionRunner {
                 packed,
@@ -3705,11 +3739,18 @@ impl<'a> PackedGpuSession<'a> {
                     "gpu raw-f32 pair projection failed for {first_name}+{second_name}: {error}"
                 ))
             })?;
+        let tensor = GpuResidentBuffer::new(
+            runner.borrow().shared_context().clone(),
+            runner.borrow().output_buffer_handle(),
+            first_rows + second_rows,
+            runner.borrow().output_buffer_size(),
+        );
         Ok(ResidentPackedPairProjection {
             tensor_name: pair_key,
             first_rows,
             second_rows,
             cols,
+            tensor,
             activation_upload_bytes: cols * std::mem::size_of::<f32>(),
             prepared: PreparedProjectionRunner {
                 packed,
