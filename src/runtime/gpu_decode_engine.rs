@@ -81,6 +81,41 @@ pub(crate) struct PackedGpuSession<'a> {
     pub(crate) scratch: PackedDecodeScratch,
 }
 
+impl<'a> PackedGpuSession<'a> {
+    pub(crate) fn new(model: &'a ReferenceModel) -> Self {
+        Self {
+            model,
+            metrics: PackedGpuSessionMetrics::default(),
+            dispatch_trace: Vec::new(),
+            scratch: PackedDecodeScratch::default(),
+        }
+    }
+
+    pub(crate) fn take_qkv_scratch(&mut self) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        self.scratch.take_qkv()
+    }
+
+    pub(crate) fn restore_qkv_scratch(&mut self, q: Vec<f32>, k: Vec<f32>, v: Vec<f32>) {
+        self.scratch.restore_qkv(q, k, v)
+    }
+
+    pub(crate) fn take_gate_up_scratch(&mut self) -> (Vec<f32>, Vec<f32>) {
+        self.scratch.take_gate_up()
+    }
+
+    pub(crate) fn restore_gate_up_scratch(&mut self, gate: Vec<f32>, up: Vec<f32>) {
+        self.scratch.restore_gate_up(gate, up)
+    }
+
+    pub(crate) fn take_mlp_scratch(&mut self) -> Vec<f32> {
+        self.scratch.take_mlp()
+    }
+
+    pub(crate) fn restore_mlp_scratch(&mut self, mlp: Vec<f32>) {
+        self.scratch.restore_mlp(mlp)
+    }
+}
+
 impl<'a> PersistentPackedDecodeSession<'a> {
     pub(crate) fn new_with_cpu_kv_preallocation(
         model: &'a ReferenceModel,

@@ -34,7 +34,7 @@ use crate::runtime::gpu_decode_env::{
 use crate::runtime::gpu_decode_metrics::{
     AttentionProjectionMixMetrics, DecodeMetrics, HybridDecodeMetrics,
     HybridProjectionDecodeMetrics, MlpProjectionMixMetrics, PackedAttentionStageMetrics,
-    PackedDecodeMetrics, PackedGpuSessionMetrics,
+    PackedDecodeMetrics,
     PackedMlpStageMetrics, ProjectionComparison, account_projection_report,
     finish_packed_decode_metrics,
 };
@@ -45,7 +45,6 @@ use crate::runtime::gpu_decode_projection_state::{
     ResidentGpuPackedActivation, ResidentGpuPackedActivationKeepalive, ResidentGpuSwigluCombined,
     ResidentGpuVectorAdd, ResidentPackedPairProjection, ResidentPackedProjection,
 };
-use crate::runtime::gpu_decode_scratch::PackedDecodeScratch;
 use crate::runtime::gpu_decode_session_state::{
     LayerCache, PackedDecodeStepResult, allocate_layer_cache_vec,
 };
@@ -1751,39 +1750,6 @@ enum PackedDecodeLayerStepOutcome {
 }
 
 impl<'a> PackedGpuSession<'a> {
-    pub(crate) fn new(model: &'a ReferenceModel) -> Self {
-        Self {
-            model,
-            metrics: PackedGpuSessionMetrics::default(),
-            dispatch_trace: Vec::new(),
-            scratch: PackedDecodeScratch::default(),
-        }
-    }
-
-    fn take_qkv_scratch(&mut self) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-        self.scratch.take_qkv()
-    }
-
-    fn restore_qkv_scratch(&mut self, q: Vec<f32>, k: Vec<f32>, v: Vec<f32>) {
-        self.scratch.restore_qkv(q, k, v)
-    }
-
-    fn take_gate_up_scratch(&mut self) -> (Vec<f32>, Vec<f32>) {
-        self.scratch.take_gate_up()
-    }
-
-    fn restore_gate_up_scratch(&mut self, gate: Vec<f32>, up: Vec<f32>) {
-        self.scratch.restore_gate_up(gate, up)
-    }
-
-    fn take_mlp_scratch(&mut self) -> Vec<f32> {
-        self.scratch.take_mlp()
-    }
-
-    fn restore_mlp_scratch(&mut self, mlp: Vec<f32>) {
-        self.scratch.restore_mlp(mlp)
-    }
-
     fn run_projection(
         &mut self,
         tensor_name: &str,
