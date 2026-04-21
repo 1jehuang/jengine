@@ -23,7 +23,6 @@ use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::decode_plan::PackedDecodePlan;
-use crate::runtime::gpu_decode_engine::{GpuDecodeEngine, PackedDecodeRequest};
 use crate::runtime::gpu_decode_env::{
     gpu_first_use_attention_full, gpu_first_use_mlp_full, packed_enabled_label,
     packed_use_attention_full, packed_use_gpu_attention_block, packed_use_gpu_embedding,
@@ -4109,40 +4108,6 @@ impl ReferenceModel {
         }
     }
 
-    pub fn prewarm_packed_decode_caches(
-        &self,
-        use_attention_qkv: bool,
-        use_mlp_gu: bool,
-        use_attention_full: bool,
-        use_mlp_full: bool,
-    ) -> Result<(), ReferenceError> {
-        self.prewarm_packed_decode_caches_with_expected_tokens(
-            1,
-            use_attention_qkv,
-            use_mlp_gu,
-            false,
-        )
-    }
-
-    pub fn prewarm_packed_decode_caches_with_expected_tokens(
-        &self,
-        expected_tokens: usize,
-        use_attention_qkv: bool,
-        use_mlp_gu: bool,
-        argmax_only: bool,
-    ) -> Result<(), ReferenceError> {
-        GpuDecodeEngine::new(
-            self,
-            PackedDecodeRequest {
-                expected_tokens,
-                use_attention_qkv,
-                use_mlp_gu,
-                argmax_only,
-            },
-        )
-        .prewarm()
-    }
-
     pub(crate) fn prewarm_packed_decode_caches_internal(
         &self,
         expected_tokens: usize,
@@ -4260,25 +4225,6 @@ impl ReferenceModel {
             gpu_first_cache.prewarm_decode_path(use_attention_qkv, use_mlp_gu)?;
         }
         Ok(())
-    }
-
-    pub fn begin_packed_decode_session(
-        &self,
-        expected_tokens: usize,
-        use_attention_qkv: bool,
-        use_mlp_gu: bool,
-        argmax_only: bool,
-    ) -> PackedDecodeSession<'_> {
-        GpuDecodeEngine::new(
-            self,
-            PackedDecodeRequest {
-                expected_tokens,
-                use_attention_qkv,
-                use_mlp_gu,
-                argmax_only,
-            },
-        )
-        .begin_packed_session()
     }
 
     fn packed_cache_bytes(&self) -> usize {

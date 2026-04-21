@@ -1,5 +1,8 @@
 use crate::runtime::decode_plan::PackedDecodePlan;
-use crate::runtime::reference::{GpuFirstPackedDecodeSession, PackedDecodeSession, PersistentPackedDecodeSession, ReferenceModel};
+use crate::runtime::reference::{
+    GpuFirstPackedDecodeSession, PackedDecodeSession, PersistentPackedDecodeSession,
+    ReferenceError, ReferenceModel,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuDecodeSessionMode {
@@ -13,6 +16,22 @@ pub struct PackedDecodeRequest {
     pub use_attention_qkv: bool,
     pub use_mlp_gu: bool,
     pub argmax_only: bool,
+}
+
+impl PackedDecodeRequest {
+    pub fn new(
+        expected_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        argmax_only: bool,
+    ) -> Self {
+        Self {
+            expected_tokens,
+            use_attention_qkv,
+            use_mlp_gu,
+            argmax_only,
+        }
+    }
 }
 
 pub struct GpuDecodeEngine<'a> {
@@ -47,7 +66,7 @@ impl<'a> GpuDecodeEngine<'a> {
         }
     }
 
-    pub fn prewarm(&self) -> Result<(), crate::runtime::reference::ReferenceError> {
+    pub fn prewarm(&self) -> Result<(), ReferenceError> {
         self.model.prewarm_packed_decode_caches_internal(
             self.request.expected_tokens,
             self.request.use_attention_qkv,
@@ -78,5 +97,60 @@ impl<'a> GpuDecodeEngine<'a> {
                 ),
             ),
         }
+    }
+}
+
+impl ReferenceModel {
+    pub fn prewarm_packed_decode_caches(
+        &self,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        _use_attention_full: bool,
+        _use_mlp_full: bool,
+    ) -> Result<(), ReferenceError> {
+        self.prewarm_packed_decode_caches_with_expected_tokens(
+            1,
+            use_attention_qkv,
+            use_mlp_gu,
+            false,
+        )
+    }
+
+    pub fn prewarm_packed_decode_caches_with_expected_tokens(
+        &self,
+        expected_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        argmax_only: bool,
+    ) -> Result<(), ReferenceError> {
+        GpuDecodeEngine::new(
+            self,
+            PackedDecodeRequest::new(
+                expected_tokens,
+                use_attention_qkv,
+                use_mlp_gu,
+                argmax_only,
+            ),
+        )
+        .prewarm()
+    }
+
+    pub fn begin_packed_decode_session(
+        &self,
+        expected_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        argmax_only: bool,
+    ) -> PackedDecodeSession<'_> {
+        GpuDecodeEngine::new(
+            self,
+            PackedDecodeRequest::new(
+                expected_tokens,
+                use_attention_qkv,
+                use_mlp_gu,
+                argmax_only,
+            ),
+        )
+        .begin_packed_session()
     }
 }
