@@ -16,16 +16,14 @@ use crate::gpu::qk_rope::{CachedGpuQkRopeRunner, GpuQkRopeReport};
 use crate::gpu::resident_buffer::GpuResidentBuffer;
 use crate::gpu::swiglu_combined::CachedGpuSwigluCombinedRunner;
 use crate::gpu::swiglu_pack_f16_pairs::CachedGpuSwigluPackF16PairsRunner;
-use crate::gpu::tail_block::{
-    CachedGpuTailBlockRunner, GpuTailBlockLogitsReport, GpuTailBlockReport,
-};
+use crate::gpu::tail_block::{CachedGpuTailBlockRunner, GpuTailBlockReport};
 use crate::gpu::vector_add::CachedGpuVectorAddRunner;
 use crate::gpu::weighted_rms_norm::{CachedGpuWeightedRmsNormRunner, GpuWeightedRmsNormReport};
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::decode_plan::PackedDecodePlan;
-use crate::runtime::gpu_decode_state::{GpuKvBinding, ResidentHiddenState};
+use crate::runtime::gpu_decode_state::{GpuKvBinding, GpuTailResult, GpuTailStepReport, ResidentHiddenState};
 use crate::runtime::packed_model::{PackedModelError, PackedModelStore};
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
 use crate::runtime::weights::{WeightError, WeightStore};
@@ -2339,56 +2337,82 @@ impl<'a> GpuFirstRunnerCache<'a> {
         ))
     }
 
-    fn run_tail_argmax_from_resident_hidden(
+    fn run_tail_from_resident_hidden(
         &mut self,
         source: &GpuResidentBuffer,
         final_norm_weight: &[f32],
-    ) -> Result<(usize, GpuTailBlockReport, Duration), ReferenceError> {
+        argmax_only: bool,
+    ) -> Result<(GpuTailResult, GpuTailStepReport, Duration), ReferenceError> {
         let (compile_duration, tail_block) = self.ensure_tail_block()?;
-        let report = tail_block
-            .borrow_mut()
-            .run_argmax_from_resident_tensor(source, final_norm_weight)
-            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-        Ok((report.argmax_index, report, compile_duration))
-    }
-
-    fn run_tail_argmax_from_host_hidden(
-        &mut self,
-        hidden_input: &[f32],
-        final_norm_weight: &[f32],
-    ) -> Result<(usize, GpuTailBlockReport, Duration), ReferenceError> {
-        let (compile_duration, tail_block) = self.ensure_tail_block()?;
-        let report = tail_block
-            .borrow_mut()
-            .run_argmax(hidden_input, final_norm_weight)
-            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-        Ok((report.argmax_index, report, compile_duration))
-    }
-
-    fn run_tail_logits_from_resident_hidden(
-        &mut self,
-        source: &GpuResidentBuffer,
-        final_norm_weight: &[f32],
-    ) -> Result<(Vec<f32>, GpuTailBlockLogitsReport, Duration), ReferenceError> {
-        let (compile_duration, tail_block) = self.ensure_tail_block()?;
+        if argmax_only {
+            let report = tail_block
+                .borrow_mut()
+                .run_argmax_from_resident_tensor(source, final_norm_weight)
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+            return Ok((
+                GpuTailResult::NextToken(report.argmax_index),
+                GpuTailStepReport {
+                    final_norm_gpu_duration: report.final_norm_gpu_duration,
+                    pack_gpu_duration: report.pack_gpu_duration,
+                    logits_gpu_duration: report.logits_gpu_duration,
+                    logits_download_duration: report.logits_download_duration,
+                },
+                compile_duration,
+            ));
+        }
         let (logits, report) = tail_block
             .borrow_mut()
             .run_logits_from_resident_tensor(source, final_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-        Ok((logits, report, compile_duration))
+        Ok((
+            GpuTailResult::Logits(logits),
+            GpuTailStepReport {
+                final_norm_gpu_duration: report.final_norm_gpu_duration,
+                pack_gpu_duration: report.pack_gpu_duration,
+                logits_gpu_duration: report.logits_gpu_duration,
+                logits_download_duration: report.logits_download_duration,
+            },
+            compile_duration,
+        ))
     }
 
-    fn run_tail_logits_from_host_hidden(
+    fn run_tail_from_host_hidden(
         &mut self,
         hidden_input: &[f32],
         final_norm_weight: &[f32],
-    ) -> Result<(Vec<f32>, GpuTailBlockLogitsReport, Duration), ReferenceError> {
+        argmax_only: bool,
+    ) -> Result<(GpuTailResult, GpuTailStepReport, Duration), ReferenceError> {
         let (compile_duration, tail_block) = self.ensure_tail_block()?;
+        if argmax_only {
+            let report = tail_block
+                .borrow_mut()
+                .run_argmax(hidden_input, final_norm_weight)
+                .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+            return Ok((
+                GpuTailResult::NextToken(report.argmax_index),
+                GpuTailStepReport {
+                    final_norm_gpu_duration: report.final_norm_gpu_duration,
+                    pack_gpu_duration: report.pack_gpu_duration,
+                    logits_gpu_duration: report.logits_gpu_duration,
+                    logits_download_duration: report.logits_download_duration,
+                },
+                compile_duration,
+            ));
+        }
         let (logits, report) = tail_block
             .borrow_mut()
             .run_logits(hidden_input, final_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-        Ok((logits, report, compile_duration))
+        Ok((
+            GpuTailResult::Logits(logits),
+            GpuTailStepReport {
+                final_norm_gpu_duration: report.final_norm_gpu_duration,
+                pack_gpu_duration: report.pack_gpu_duration,
+                logits_gpu_duration: report.logits_gpu_duration,
+                logits_download_duration: report.logits_download_duration,
+            },
+            compile_duration,
+        ))
     }
 }
 
@@ -8221,8 +8245,12 @@ impl ReferenceModel {
             let norm_started = Instant::now();
             let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
             let next_token = if let Some(hidden_gpu) = final_hidden_gpu {
-                let (next_token, tail_report, compile_duration) = gpu_first_session
-                    .run_tail_argmax_from_resident_hidden(&hidden_gpu.tensor, &final_norm_weight)?;
+                let (tail_result, tail_report, compile_duration) = gpu_first_session
+                    .run_tail_from_resident_hidden(&hidden_gpu.tensor, &final_norm_weight, true)?;
+                let next_token = match tail_result {
+                    GpuTailResult::NextToken(token_id) => token_id,
+                    GpuTailResult::Logits(_) => unreachable!("argmax-only tail should return a token"),
+                };
                 metrics.norm_duration += norm_started.elapsed();
                 metrics.logits_duration += tail_report.pack_gpu_duration
                     + tail_report.logits_gpu_duration
@@ -8235,8 +8263,12 @@ impl ReferenceModel {
                 session.metrics.download_duration += tail_report.logits_download_duration;
                 next_token
             } else if Self::packed_use_gpu_tail() {
-                let (next_token, tail_report, compile_duration) = gpu_first_session
-                    .run_tail_argmax_from_host_hidden(&hidden, &final_norm_weight)?;
+                let (tail_result, tail_report, compile_duration) = gpu_first_session
+                    .run_tail_from_host_hidden(&hidden, &final_norm_weight, true)?;
+                let next_token = match tail_result {
+                    GpuTailResult::NextToken(token_id) => token_id,
+                    GpuTailResult::Logits(_) => unreachable!("argmax-only tail should return a token"),
+                };
                 metrics.norm_duration += norm_started.elapsed();
                 metrics.logits_duration += tail_report.pack_gpu_duration
                     + tail_report.logits_gpu_duration
@@ -8282,8 +8314,12 @@ impl ReferenceModel {
             let norm_started = Instant::now();
             let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
             let logits = if let Some(hidden_gpu) = final_hidden_gpu {
-                let (logits, tail_report, compile_duration) = gpu_first_session
-                    .run_tail_logits_from_resident_hidden(&hidden_gpu.tensor, &final_norm_weight)?;
+                let (tail_result, tail_report, compile_duration) = gpu_first_session
+                    .run_tail_from_resident_hidden(&hidden_gpu.tensor, &final_norm_weight, false)?;
+                let logits = match tail_result {
+                    GpuTailResult::Logits(logits) => logits,
+                    GpuTailResult::NextToken(_) => unreachable!("logits tail should return logits"),
+                };
                 metrics.norm_duration += norm_started.elapsed();
                 metrics.logits_duration += tail_report.pack_gpu_duration
                     + tail_report.logits_gpu_duration
@@ -8296,8 +8332,12 @@ impl ReferenceModel {
                 session.metrics.download_duration += tail_report.logits_download_duration;
                 logits
             } else if Self::packed_use_gpu_tail() {
-                let (logits, tail_report, compile_duration) = gpu_first_session
-                    .run_tail_logits_from_host_hidden(&hidden, &final_norm_weight)?;
+                let (tail_result, tail_report, compile_duration) = gpu_first_session
+                    .run_tail_from_host_hidden(&hidden, &final_norm_weight, false)?;
+                let logits = match tail_result {
+                    GpuTailResult::Logits(logits) => logits,
+                    GpuTailResult::NextToken(_) => unreachable!("logits tail should return logits"),
+                };
                 metrics.norm_duration += norm_started.elapsed();
                 metrics.logits_duration += tail_report.pack_gpu_duration
                     + tail_report.logits_gpu_duration
