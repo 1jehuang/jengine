@@ -4458,6 +4458,57 @@ impl ReferenceModel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_qkv_host_vectors(
+        &self,
+        session: &mut PackedGpuSession<'_>,
+        layer_tensors: &LayerTensorNames,
+        hidden_states: &[f32],
+        first_layer_gpu_entry_tensor_qkv: &Option<FirstLayerTensorQkvEntry>,
+        first_layer_gpu_entry_qkv: Option<FirstLayerHostQkvEntry>,
+        resident_hidden_entry_qkv: Option<ResidentHostQkvEntry>,
+        use_attention_qkv: bool,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, bool), ReferenceError> {
+        let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
+        if first_layer_gpu_entry_tensor_qkv.is_some() {
+            return Ok((
+                vec![0.0; self.config.hidden_size],
+                vec![0.0; kv_rows],
+                vec![0.0; kv_rows],
+                false,
+            ));
+        }
+        if let Some((_, q, k, v, ..)) = first_layer_gpu_entry_qkv {
+            return Ok((q, k, v, false));
+        }
+        if let Some((_, q, k, v, ..)) = resident_hidden_entry_qkv {
+            return Ok((q, k, v, false));
+        }
+        if use_attention_qkv {
+            let (mut q, mut k, mut v) = session.take_qkv_scratch();
+            session.run_projection_triplet_into(
+                &layer_tensors.q_proj_weight,
+                self.config.hidden_size,
+                &layer_tensors.k_proj_weight,
+                kv_rows,
+                &layer_tensors.v_proj_weight,
+                kv_rows,
+                self.config.hidden_size,
+                hidden_states,
+                &mut q,
+                &mut k,
+                &mut v,
+            )?;
+            return Ok((q, k, v, true));
+        }
+        Ok((
+            self.matvec_f16_resolved(&layer_tensors.q_proj_weight, hidden_states)?,
+            self.matvec_f16_resolved(&layer_tensors.k_proj_weight, hidden_states)?,
+            self.matvec_f16_resolved(&layer_tensors.v_proj_weight, hidden_states)?,
+            false,
+        ))
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -6801,42 +6852,15 @@ impl ReferenceModel {
                 .residual_resident_source(&first_layer_gpu_entry_tensor_qkv, &resident_hidden_tensor_qkv);
 
             let started_at = Instant::now();
-            let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
-            let mut reusable_qkv_scratch = false;
-            let (mut q, mut k, v) = if first_layer_gpu_entry_tensor_qkv.is_some() {
-                (
-                    vec![0.0; self.config.hidden_size],
-                    vec![0.0; kv_rows],
-                    vec![0.0; kv_rows],
-                )
-            } else if let Some((_, q, k, v, ..)) = first_layer_gpu_entry_qkv {
-                (q, k, v)
-            } else if let Some((_, q, k, v, ..)) = resident_hidden_entry_qkv {
-                (q, k, v)
-            } else if use_attention_qkv {
-                let (mut q, mut k, mut v) = session.take_qkv_scratch();
-                session.run_projection_triplet_into(
-                    &layer_tensors.q_proj_weight,
-                    self.config.hidden_size,
-                    &layer_tensors.k_proj_weight,
-                    kv_rows,
-                    &layer_tensors.v_proj_weight,
-                    kv_rows,
-                    self.config.hidden_size,
-                    &hidden_states,
-                    &mut q,
-                    &mut k,
-                    &mut v,
-                )?;
-                reusable_qkv_scratch = true;
-                (q, k, v)
-            } else {
-                (
-                    self.matvec_f16_resolved(&layer_tensors.q_proj_weight, &hidden_states)?,
-                    self.matvec_f16_resolved(&layer_tensors.k_proj_weight, &hidden_states)?,
-                    self.matvec_f16_resolved(&layer_tensors.v_proj_weight, &hidden_states)?,
-                )
-            };
+            let (mut q, mut k, v, reusable_qkv_scratch) = self.prepare_qkv_host_vectors(
+                session,
+                layer_tensors,
+                &hidden_states,
+                &first_layer_gpu_entry_tensor_qkv,
+                first_layer_gpu_entry_qkv,
+                resident_hidden_entry_qkv,
+                use_attention_qkv,
+            )?;
             let elapsed = started_at.elapsed();
             metrics.qkv_duration += elapsed;
             if !use_attention_qkv {
