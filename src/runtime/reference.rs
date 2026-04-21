@@ -3481,6 +3481,78 @@ impl<'a> PackedGpuSession<'a> {
         self.metrics.download_bytes += download_bytes;
     }
 
+    fn run_projection_add_residual(
+        &mut self,
+        tensor_name: &str,
+        rows: usize,
+        cols: usize,
+        input: &[f32],
+        residual: &[f32],
+    ) -> Result<Vec<f32>, ReferenceError> {
+        if residual.len() != rows {
+            return Err(ReferenceError::Decode(format!(
+                "residual len {} must match rows {} for {tensor_name}",
+                residual.len(), rows
+            )));
+        }
+        let prepared = self.prepare_projection_runner(tensor_name, rows, cols)?;
+        let report = prepared
+            .runner
+            .borrow_mut()
+            .run_resident(input)
+            .map_err(|error| {
+                ReferenceError::Decode(format!("gpu projection failed for {tensor_name}: {error}"))
+            })?;
+        let download_started = Instant::now();
+        let summed = {
+            let runner_ref = prepared.runner.borrow();
+            let output = runner_ref.output_slice().map_err(|error| {
+                ReferenceError::Decode(format!(
+                    "gpu projection output borrow failed for {tensor_name}: {error}"
+                ))
+            })?;
+            residual
+                .iter()
+                .zip(output.iter())
+                .map(|(left, right)| left + right)
+                .collect::<Vec<_>>()
+        };
+        let report = crate::gpu::packed_matvec::GpuPackedMatvecReport {
+            download_duration: download_started.elapsed(),
+            ..report
+        };
+        let weight_upload_bytes = usize::from(!prepared.gpu_cache_hit)
+            * (prepared.packed.code_words.len() * std::mem::size_of::<u32>()
+                + prepared.packed.scales.len() * std::mem::size_of::<f32>());
+        let activation_upload_bytes = cols.div_ceil(2) * std::mem::size_of::<u32>();
+        let download_bytes = rows * std::mem::size_of::<f32>();
+        self.account_projection_report(
+            &prepared.packed,
+            cols,
+            prepared.weight_upload_duration,
+            prepared.gpu_cache_hit,
+            &report,
+            download_bytes,
+        );
+        self.push_dispatch_trace(
+            tensor_name,
+            "single",
+            rows,
+            cols,
+            prepared.pack_cache_hit,
+            prepared.gpu_cache_hit,
+            prepared.compile_duration,
+            prepared.weight_upload_duration,
+            report.upload_duration,
+            report.gpu_duration,
+            report.download_duration,
+            weight_upload_bytes,
+            activation_upload_bytes,
+            download_bytes,
+        );
+        Ok(summed)
+    }
+
     fn run_projection_pair(
         &mut self,
         first_name: &str,
@@ -7572,25 +7644,25 @@ impl ReferenceModel {
                     attn_elapsed,
                 );
                 let oproj_started_at = Instant::now();
-                let attn_output = if use_attention_full {
-                    session.run_projection(
+                hidden = if use_attention_full {
+                    session.run_projection_add_residual(
                         &layer_tensors.o_proj_weight,
                         self.config.hidden_size,
                         self.config.hidden_size,
                         &attn,
+                        &residual,
                     )?
                 } else {
-                    self.matvec_f16_resolved(&layer_tensors.o_proj_weight, &attn)?
+                    let attn_output = self.matvec_f16_resolved(&layer_tensors.o_proj_weight, &attn)?;
+                    residual
+                        .iter()
+                        .zip(attn_output.iter())
+                        .map(|(left, right)| left + right)
+                        .collect()
                 };
                 let oproj_elapsed = oproj_started_at.elapsed();
                 attention_stage_metrics.oproj_duration += oproj_elapsed;
-                let residual_started_at = Instant::now();
-                hidden = residual
-                    .iter()
-                    .zip(attn_output.iter())
-                    .map(|(left, right)| left + right)
-                    .collect();
-                let residual_elapsed = residual_started_at.elapsed();
+                let residual_elapsed = Duration::ZERO;
                 attention_stage_metrics.residual_duration += residual_elapsed;
                 session.push_dense_stage_trace(
                     "attention_residual",
@@ -7869,14 +7941,20 @@ impl ReferenceModel {
                 session.push_dense_stage_trace("mlp_swiglu", "swiglu", swiglu_elapsed);
                 let down_started_at = Instant::now();
                 let down = if use_mlp_full {
-                    session.run_projection(
+                    session.run_projection_add_residual(
                         &layer_tensors.down_proj_weight,
                         self.config.hidden_size,
                         self.config.intermediate_size,
                         &mlp,
+                        &residual,
                     )?
                 } else {
-                    self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?
+                    let down = self.matvec_f16_resolved(&layer_tensors.down_proj_weight, &mlp)?;
+                    residual
+                        .iter()
+                        .zip(down.iter())
+                        .map(|(left, right)| left + right)
+                        .collect()
                 };
                 let down_elapsed = down_started_at.elapsed();
                 (
@@ -7896,23 +7974,28 @@ impl ReferenceModel {
                 gpu_residual_elapsed
             } else {
                 resident_hidden_state = None;
-                let residual_started_at = Instant::now();
-                hidden = residual
-                    .iter()
-                    .zip(
-                        down.as_ref()
-                            .expect("down must exist for cpu residual path")
-                            .iter(),
-                    )
-                    .map(|(left, right)| left + right)
-                    .collect();
-                let residual_elapsed = residual_started_at.elapsed();
-                session.push_dense_stage_trace(
-                    "mlp_residual",
-                    "mlp_residual_add",
-                    residual_elapsed,
-                );
-                residual_elapsed
+                if use_mlp_full && !use_gpu_swiglu_block {
+                    hidden = down.expect("down must exist for cpu residual path");
+                    Duration::ZERO
+                } else {
+                    let residual_started_at = Instant::now();
+                    hidden = residual
+                        .iter()
+                        .zip(
+                            down.as_ref()
+                                .expect("down must exist for cpu residual path")
+                                .iter(),
+                        )
+                        .map(|(left, right)| left + right)
+                        .collect();
+                    let residual_elapsed = residual_started_at.elapsed();
+                    session.push_dense_stage_trace(
+                        "mlp_residual",
+                        "mlp_residual_add",
+                        residual_elapsed,
+                    );
+                    residual_elapsed
+                }
             };
             mlp_stage_metrics.residual_duration += residual_elapsed;
             let elapsed = started_at.elapsed();

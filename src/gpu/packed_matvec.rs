@@ -927,6 +927,19 @@ impl CachedGpuPackedMatvecRunner {
         Ok((gpu_output, download_started.elapsed()))
     }
 
+    pub fn output_slice(&self) -> Result<&[f32], GpuPackedMatvecError> {
+        let byte_len = self.rows * std::mem::size_of::<f32>();
+        if byte_len as u64 > self.output_buffer.size {
+            return Err(GpuPackedMatvecError::Shape(format!(
+                "read {} bytes exceeds mapped buffer size {}",
+                byte_len, self.output_buffer.size
+            )));
+        }
+        Ok(unsafe {
+            std::slice::from_raw_parts(self.output_buffer.mapped_ptr as *const f32, self.rows)
+        })
+    }
+
     pub fn read_output_pair(
         &self,
         first_rows: usize,
