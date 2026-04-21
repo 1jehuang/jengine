@@ -282,6 +282,33 @@ impl CachedGpuQkRopeRunner {
                 1,
                 1,
             );
+            let output_barriers = [
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(q_out_buffer.buffer)
+                    .offset(0)
+                    .size(q_out_buffer.size),
+                vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(k_out_buffer.buffer)
+                    .offset(0)
+                    .size(k_out_buffer.size),
+            ];
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &output_barriers,
+                &[],
+            );
             device.end_command_buffer(command_buffer)?;
         }
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };

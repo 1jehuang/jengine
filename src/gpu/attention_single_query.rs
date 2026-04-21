@@ -305,6 +305,23 @@ impl CachedGpuAttentionSingleQueryRunner {
                 push_bytes,
             );
             device.cmd_dispatch(command_buffer, num_query_heads as u32, 1, 1);
+            let output_barrier = [vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(output_buffer.buffer)
+                .offset(0)
+                .size(output_buffer.size)];
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &output_barrier,
+                &[],
+            );
             device.end_command_buffer(command_buffer)?;
         }
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
