@@ -4,6 +4,23 @@ pub enum PackedDecodeStepResult {
     NextToken(usize),
 }
 
+pub(crate) fn allocate_layer_cache_vec(
+    num_layers: usize,
+    expected_tokens: usize,
+    kv_width: usize,
+    preallocate_cpu_kv: bool,
+) -> Vec<LayerCache> {
+    (0..num_layers)
+        .map(|_| {
+            if preallocate_cpu_kv {
+                LayerCache::with_capacity(expected_tokens, kv_width)
+            } else {
+                LayerCache::without_preallocated_cpu_kv()
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct LayerCache {
     pub keys: Vec<f32>,

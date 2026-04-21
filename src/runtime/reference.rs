@@ -47,7 +47,9 @@ use crate::runtime::gpu_decode_projection_state::{
     ResidentGpuVectorAdd, ResidentPackedPairProjection, ResidentPackedProjection,
 };
 use crate::runtime::gpu_decode_scratch::PackedDecodeScratch;
-use crate::runtime::gpu_decode_session_state::{LayerCache, PackedDecodeStepResult};
+use crate::runtime::gpu_decode_session_state::{
+    LayerCache, PackedDecodeStepResult, allocate_layer_cache_vec,
+};
 use crate::runtime::gpu_decode_state::{GpuKvBinding, GpuTailResult, GpuTailStepReport, ResidentHiddenState};
 use crate::runtime::packed_model::{PackedModelError, PackedModelStore};
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
@@ -169,7 +171,12 @@ impl<'a> PersistentPackedDecodeSession<'a> {
     ) -> Self {
         Self {
             model,
-            cache: model.allocate_layer_cache_vec(expected_tokens, preallocate_cpu_kv),
+            cache: allocate_layer_cache_vec(
+                model.config.num_hidden_layers,
+                expected_tokens,
+                model.config.num_key_value_heads * model.config.head_dim,
+                preallocate_cpu_kv,
+            ),
             gpu_session: PackedGpuSession::new(model),
             gpu_first_session: GpuFirstRunnerCache::new(model, expected_tokens),
             metrics: DecodeMetrics {
@@ -3972,23 +3979,6 @@ impl ReferenceModel {
             + logits
     }
 
-    fn allocate_layer_cache_vec(
-        &self,
-        expected_tokens: usize,
-        preallocate_cpu_kv: bool,
-    ) -> Vec<LayerCache> {
-        let kv_width = self.config.num_key_value_heads * self.config.head_dim;
-        (0..self.config.num_hidden_layers)
-            .map(|_| {
-                if preallocate_cpu_kv {
-                    LayerCache::with_capacity(expected_tokens, kv_width)
-                } else {
-                    LayerCache::without_preallocated_cpu_kv()
-                }
-            })
-            .collect()
-    }
-
     pub fn generate_greedy(
         &self,
         prompt: &str,
@@ -4044,7 +4034,12 @@ impl ReferenceModel {
             mlp_duration: Duration::ZERO,
             logits_duration: Duration::ZERO,
         };
-        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens, true);
+        let mut cache = allocate_layer_cache_vec(
+            self.config.num_hidden_layers,
+            prompt_ids.len() + max_new_tokens,
+            self.config.num_key_value_heads * self.config.head_dim,
+            true,
+        );
 
         let mut last_logits = Vec::new();
         for (position, &token_id) in prompt_ids.iter().enumerate() {
@@ -5411,7 +5406,12 @@ impl ReferenceModel {
             mlp_duration: Duration::ZERO,
             logits_duration: Duration::ZERO,
         };
-        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens, true);
+        let mut cache = allocate_layer_cache_vec(
+            self.config.num_hidden_layers,
+            prompt_ids.len() + max_new_tokens,
+            self.config.num_key_value_heads * self.config.head_dim,
+            true,
+        );
         let mut upload = upload_duration;
         let mut gpu = Duration::ZERO;
         let mut download = Duration::ZERO;
@@ -5516,7 +5516,12 @@ impl ReferenceModel {
             mlp_duration: Duration::ZERO,
             logits_duration: Duration::ZERO,
         };
-        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len(), true);
+        let mut cache = allocate_layer_cache_vec(
+            self.config.num_hidden_layers,
+            prompt_ids.len(),
+            self.config.num_key_value_heads * self.config.head_dim,
+            true,
+        );
         for (position, &token_id) in prompt_ids.iter().enumerate() {
             let _ = self.forward_step(token_id, position, &mut cache, &mut metrics)?;
         }
@@ -6042,7 +6047,12 @@ impl ReferenceModel {
             mlp_duration: Duration::ZERO,
             logits_duration: Duration::ZERO,
         };
-        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens, true);
+        let mut cache = allocate_layer_cache_vec(
+            self.config.num_hidden_layers,
+            prompt_ids.len() + max_new_tokens,
+            self.config.num_key_value_heads * self.config.head_dim,
+            true,
+        );
         let mut compile = q_proj_gpu_compile_duration;
         let mut upload = Duration::ZERO;
         let mut gpu = Duration::ZERO;
