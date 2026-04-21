@@ -102,9 +102,13 @@ pub struct CachedGpuAttentionSingleQueryRunner {
     _shared_context: Arc<SharedGpuPackedContext>,
     device: Device,
     queue: vk::Queue,
-    seq_len: usize,
+    seq_capacity: usize,
     query_len: usize,
-    kv_len: usize,
+    kv_width: usize,
+    kv_capacity_len: usize,
+    num_query_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
     descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     shader_module: vk::ShaderModule,
@@ -123,7 +127,7 @@ pub struct CachedGpuAttentionSingleQueryRunner {
 impl CachedGpuAttentionSingleQueryRunner {
     pub fn new_with_context(
         context: Arc<SharedGpuPackedContext>,
-        seq_len: usize,
+        seq_capacity: usize,
         num_query_heads: usize,
         num_key_value_heads: usize,
         head_dim: usize,
@@ -137,7 +141,8 @@ impl CachedGpuAttentionSingleQueryRunner {
         let shader_path = compile_shader(Path::new("shaders/attention_single_query.comp"))?;
 
         let query_len = num_query_heads * head_dim;
-        let kv_len = seq_len * num_key_value_heads * head_dim;
+        let kv_width = num_key_value_heads * head_dim;
+        let kv_capacity_len = seq_capacity * kv_width;
         let query_buffer = create_host_visible_buffer(
             &instance,
             &device,
@@ -149,14 +154,14 @@ impl CachedGpuAttentionSingleQueryRunner {
             &instance,
             &device,
             physical_device,
-            (kv_len * 4) as u64,
+            (kv_capacity_len * 4) as u64,
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
         let values_buffer = create_host_visible_buffer(
             &instance,
             &device,
             physical_device,
-            (kv_len * 4) as u64,
+            (kv_capacity_len * 4) as u64,
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
         let output_buffer = create_host_visible_buffer(
@@ -167,8 +172,8 @@ impl CachedGpuAttentionSingleQueryRunner {
             vk::BufferUsageFlags::STORAGE_BUFFER,
         )?;
         zero_buffer(&query_buffer, query_len * 4)?;
-        zero_buffer(&keys_buffer, kv_len * 4)?;
-        zero_buffer(&values_buffer, kv_len * 4)?;
+        zero_buffer(&keys_buffer, kv_capacity_len * 4)?;
+        zero_buffer(&values_buffer, kv_capacity_len * 4)?;
         zero_buffer(&output_buffer, query_len * 4)?;
 
         let descriptor_layout_bindings = [
@@ -279,42 +284,84 @@ impl CachedGpuAttentionSingleQueryRunner {
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
         let command_buffer = unsafe { device.allocate_command_buffers(&command_alloc)?[0] };
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
+        let mut runner = Self {
+            _shared_context: context,
+            device,
+            queue,
+            seq_capacity,
+            query_len,
+            kv_width,
+            kv_capacity_len,
+            num_query_heads,
+            num_key_value_heads,
+            head_dim,
+            descriptor_set_layout,
+            pipeline_layout,
+            shader_module,
+            pipeline,
+            descriptor_pool,
+            descriptor_set,
+            command_pool,
+            command_buffer,
+            fence,
+            query_buffer,
+            keys_buffer,
+            values_buffer,
+            output_buffer,
+        };
+        runner.record_command_buffer(1)?;
+        Ok((runner, compile_started.elapsed()))
+    }
+
+    fn record_command_buffer(&mut self, seq_len: usize) -> Result<(), GpuAttentionSingleQueryError> {
+        if seq_len == 0 || seq_len > self.seq_capacity {
+            return Err(GpuAttentionSingleQueryError::Shape(format!(
+                "seq len {} must be in 1..={} for this runner",
+                seq_len, self.seq_capacity
+            )));
+        }
         unsafe {
-            device.begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())?;
-            device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
-            device.cmd_bind_descriptor_sets(
-                command_buffer,
+            self.device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
+            self.device
+                .begin_command_buffer(self.command_buffer, &vk::CommandBufferBeginInfo::default())?;
+            self.device
+                .cmd_bind_pipeline(self.command_buffer, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
-                pipeline_layout,
+                self.pipeline_layout,
                 0,
-                &[descriptor_set],
+                &[self.descriptor_set],
                 &[],
             );
             let push_constants = [
                 seq_len as u32,
-                num_query_heads as u32,
-                num_key_value_heads as u32,
-                head_dim as u32,
+                self.num_query_heads as u32,
+                self.num_key_value_heads as u32,
+                self.head_dim as u32,
             ];
             let push_bytes = std::slice::from_raw_parts(push_constants.as_ptr() as *const u8, 16);
-            device.cmd_push_constants(
-                command_buffer,
-                pipeline_layout,
+            self.device.cmd_push_constants(
+                self.command_buffer,
+                self.pipeline_layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
                 push_bytes,
             );
-            device.cmd_dispatch(command_buffer, num_query_heads as u32, 1, 1);
+            self.device
+                .cmd_dispatch(self.command_buffer, self.num_query_heads as u32, 1, 1);
             let output_barrier = [vk::BufferMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(output_buffer.buffer)
+                .buffer(self.output_buffer.buffer)
                 .offset(0)
-                .size(output_buffer.size)];
-            device.cmd_pipeline_barrier(
-                command_buffer,
+                .size(self.output_buffer.size)];
+            self.device.cmd_pipeline_barrier(
+                self.command_buffer,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
@@ -322,33 +369,19 @@ impl CachedGpuAttentionSingleQueryRunner {
                 &output_barrier,
                 &[],
             );
-            device.end_command_buffer(command_buffer)?;
+            self.device.end_command_buffer(self.command_buffer)?;
         }
-        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
-        Ok((
-            Self {
-                _shared_context: context,
-                device,
-                queue,
-                seq_len,
-                query_len,
-                kv_len,
-                descriptor_set_layout,
-                pipeline_layout,
-                shader_module,
-                pipeline,
-                descriptor_pool,
-                descriptor_set,
-                command_pool,
-                command_buffer,
-                fence,
-                query_buffer,
-                keys_buffer,
-                values_buffer,
-                output_buffer,
-            },
-            compile_started.elapsed(),
-        ))
+        Ok(())
+    }
+
+    fn seq_len_from_kv_len(&self, kv_len: usize) -> Result<usize, GpuAttentionSingleQueryError> {
+        if kv_len == 0 || kv_len > self.kv_capacity_len || !kv_len.is_multiple_of(self.kv_width) {
+            return Err(GpuAttentionSingleQueryError::Shape(format!(
+                "kv len {} must be a positive multiple of kv width {} and <= capacity {}",
+                kv_len, self.kv_width, self.kv_capacity_len
+            )));
+        }
+        Ok(kv_len / self.kv_width)
     }
 
     pub fn run_with_output(
@@ -358,23 +391,23 @@ impl CachedGpuAttentionSingleQueryRunner {
         values: &[f32],
         reference: Option<&[f32]>,
     ) -> Result<(Vec<f32>, GpuAttentionSingleQueryReport), GpuAttentionSingleQueryError> {
-        if query.len() != self.query_len || keys.len() != self.kv_len || values.len() != self.kv_len
-        {
+        let actual_kv_len = keys.len();
+        if query.len() != self.query_len || values.len() != actual_kv_len {
             return Err(GpuAttentionSingleQueryError::Shape(format!(
-                "query len {}, keys len {}, values len {} must match {}, {}, {}",
+                "query len {}, keys len {}, values len {} must match {}, key/value equal length",
                 query.len(),
                 keys.len(),
                 values.len(),
                 self.query_len,
-                self.kv_len,
-                self.kv_len
             )));
         }
+        let seq_len = self.seq_len_from_kv_len(actual_kv_len)?;
         let upload_started = Instant::now();
         self.bind_internal_buffers();
         write_f32_buffer(&self.query_buffer, query)?;
         write_f32_buffer(&self.keys_buffer, keys)?;
         write_f32_buffer(&self.values_buffer, values)?;
+        self.record_command_buffer(seq_len)?;
         let upload_duration = upload_started.elapsed();
         let gpu_duration = self.submit_and_wait()?;
         let download_started = Instant::now();
@@ -388,7 +421,7 @@ impl CachedGpuAttentionSingleQueryRunner {
             output,
             GpuAttentionSingleQueryReport {
                 query_len: self.query_len,
-                seq_len: self.seq_len,
+                seq_len,
                 compile_duration: Duration::ZERO,
                 upload_duration,
                 gpu_duration,
@@ -405,28 +438,28 @@ impl CachedGpuAttentionSingleQueryRunner {
         keys: &[f32],
         values: &[f32],
     ) -> Result<GpuAttentionSingleQueryReport, GpuAttentionSingleQueryError> {
-        if query.len() != self.query_len || keys.len() != self.kv_len || values.len() != self.kv_len
-        {
+        let actual_kv_len = keys.len();
+        if query.len() != self.query_len || values.len() != actual_kv_len {
             return Err(GpuAttentionSingleQueryError::Shape(format!(
-                "query len {}, keys len {}, values len {} must match {}, {}, {}",
+                "query len {}, keys len {}, values len {} must match {}, key/value equal length",
                 query.len(),
                 keys.len(),
                 values.len(),
                 self.query_len,
-                self.kv_len,
-                self.kv_len
             )));
         }
+        let seq_len = self.seq_len_from_kv_len(actual_kv_len)?;
         let upload_started = Instant::now();
         self.bind_internal_buffers();
         write_f32_buffer(&self.query_buffer, query)?;
         write_f32_buffer(&self.keys_buffer, keys)?;
         write_f32_buffer(&self.values_buffer, values)?;
+        self.record_command_buffer(seq_len)?;
         let upload_duration = upload_started.elapsed();
         let gpu_duration = self.submit_and_wait()?;
         Ok(GpuAttentionSingleQueryReport {
             query_len: self.query_len,
-            seq_len: self.seq_len,
+            seq_len,
             compile_duration: Duration::ZERO,
             upload_duration,
             gpu_duration,
@@ -447,17 +480,16 @@ impl CachedGpuAttentionSingleQueryRunner {
         value_len: usize,
         value_buffer_size: u64,
     ) -> Result<GpuAttentionSingleQueryReport, GpuAttentionSingleQueryError> {
-        if query.len() != self.query_len || key_len != self.kv_len || value_len != self.kv_len {
+        if query.len() != self.query_len || key_len != value_len {
             return Err(GpuAttentionSingleQueryError::Shape(format!(
-                "query len {}, key len {}, value len {} must match {}, {}, {}",
+                "query len {}, key len {}, value len {} must match {}, key/value equal length",
                 query.len(),
                 key_len,
                 value_len,
                 self.query_len,
-                self.kv_len,
-                self.kv_len
             )));
         }
+        let seq_len = self.seq_len_from_kv_len(key_len)?;
         let query_upload_started = Instant::now();
         write_f32_buffer(&self.query_buffer, query)?;
         if !Arc::ptr_eq(&self._shared_context, source_context) {
@@ -466,7 +498,7 @@ impl CachedGpuAttentionSingleQueryRunner {
                     .to_string(),
             ));
         }
-        let byte_len = self.kv_len * std::mem::size_of::<f32>();
+        let byte_len = key_len * std::mem::size_of::<f32>();
         if byte_len as u64 > key_buffer_size
             || byte_len as u64 > value_buffer_size
         {
@@ -476,11 +508,12 @@ impl CachedGpuAttentionSingleQueryRunner {
             )));
         }
         self.bind_descriptor_buffers(self.query_buffer.buffer, key_buffer, value_buffer);
+        self.record_command_buffer(seq_len)?;
         let upload_duration = query_upload_started.elapsed();
         let gpu_duration = self.submit_and_wait()?;
         Ok(GpuAttentionSingleQueryReport {
             query_len: self.query_len,
-            seq_len: self.seq_len,
+            seq_len,
             compile_duration: Duration::ZERO,
             upload_duration,
             gpu_duration,
@@ -496,12 +529,13 @@ impl CachedGpuAttentionSingleQueryRunner {
         key: &GpuResidentBuffer,
         value: &GpuResidentBuffer,
     ) -> Result<GpuAttentionSingleQueryReport, GpuAttentionSingleQueryError> {
-        if query.len != self.query_len || key.len != self.kv_len || value.len != self.kv_len {
+        if query.len != self.query_len || key.len != value.len {
             return Err(GpuAttentionSingleQueryError::Shape(format!(
-                "query len {}, key len {}, value len {} must match {}, {}, {}",
-                query.len, key.len, value.len, self.query_len, self.kv_len, self.kv_len
+                "query len {}, key len {}, value len {} must match {}, key/value equal length",
+                query.len, key.len, value.len, self.query_len
             )));
         }
+        let seq_len = self.seq_len_from_kv_len(key.len)?;
         if !Arc::ptr_eq(&self._shared_context, &query.shared_context)
             || !Arc::ptr_eq(&self._shared_context, &key.shared_context)
             || !Arc::ptr_eq(&self._shared_context, &value.shared_context)
@@ -511,7 +545,7 @@ impl CachedGpuAttentionSingleQueryRunner {
             ));
         }
         let query_byte_len = self.query_len * std::mem::size_of::<f32>();
-        let kv_byte_len = self.kv_len * std::mem::size_of::<f32>();
+        let kv_byte_len = key.len * std::mem::size_of::<f32>();
         if query.buffer_size < query_byte_len as u64
             || key.buffer_size < kv_byte_len as u64
             || value.buffer_size < kv_byte_len as u64
@@ -521,11 +555,12 @@ impl CachedGpuAttentionSingleQueryRunner {
             ));
         }
         self.bind_descriptor_buffers(query.buffer, key.buffer, value.buffer);
+        self.record_command_buffer(seq_len)?;
         let upload_duration = Duration::ZERO;
         let gpu_duration = self.submit_and_wait()?;
         Ok(GpuAttentionSingleQueryReport {
             query_len: self.query_len,
-            seq_len: self.seq_len,
+            seq_len,
             compile_duration: Duration::ZERO,
             upload_duration,
             gpu_duration,
@@ -541,12 +576,13 @@ impl CachedGpuAttentionSingleQueryRunner {
         key: &GpuResidentBuffer,
         value: &GpuResidentBuffer,
     ) -> Result<(), GpuAttentionSingleQueryError> {
-        if query.len != self.query_len || key.len != self.kv_len || value.len != self.kv_len {
+        if query.len != self.query_len || key.len != value.len {
             return Err(GpuAttentionSingleQueryError::Shape(format!(
-                "query len {}, key len {}, value len {} must match {}, {}, {}",
-                query.len, key.len, value.len, self.query_len, self.kv_len, self.kv_len
+                "query len {}, key len {}, value len {} must match {}, key/value equal length",
+                query.len, key.len, value.len, self.query_len
             )));
         }
+        let seq_len = self.seq_len_from_kv_len(key.len)?;
         if !Arc::ptr_eq(&self._shared_context, &query.shared_context)
             || !Arc::ptr_eq(&self._shared_context, &key.shared_context)
             || !Arc::ptr_eq(&self._shared_context, &value.shared_context)
@@ -556,7 +592,7 @@ impl CachedGpuAttentionSingleQueryRunner {
             ));
         }
         let query_byte_len = self.query_len * std::mem::size_of::<f32>();
-        let kv_byte_len = self.kv_len * std::mem::size_of::<f32>();
+        let kv_byte_len = key.len * std::mem::size_of::<f32>();
         if query.buffer_size < query_byte_len as u64
             || key.buffer_size < kv_byte_len as u64
             || value.buffer_size < kv_byte_len as u64
@@ -566,6 +602,7 @@ impl CachedGpuAttentionSingleQueryRunner {
             ));
         }
         self.bind_descriptor_buffers(query.buffer, key.buffer, value.buffer);
+        self.record_command_buffer(seq_len)?;
         Ok(())
     }
 

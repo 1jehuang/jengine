@@ -45,7 +45,7 @@ pub struct CachedGpuAttentionBlockRunner {
 impl CachedGpuAttentionBlockRunner {
     pub fn new_with_context(
         context: Arc<SharedGpuPackedContext>,
-        seq_len: usize,
+        seq_capacity: usize,
         num_query_heads: usize,
         num_key_value_heads: usize,
         head_dim: usize,
@@ -55,7 +55,7 @@ impl CachedGpuAttentionBlockRunner {
         let (attention_runner, attention_compile) =
             CachedGpuAttentionSingleQueryRunner::new_with_context(
                 context.clone(),
-                seq_len,
+                seq_capacity,
                 num_query_heads,
                 num_key_value_heads,
                 head_dim,

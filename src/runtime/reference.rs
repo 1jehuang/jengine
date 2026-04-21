@@ -316,6 +316,8 @@ struct LayerTensorNames {
 type CachedProjectionGpuRunner = Rc<RefCell<CachedGpuPackedMatvecRunner>>;
 type CachedTailBlockGpuRunner = Rc<RefCell<CachedGpuTailBlockRunner>>;
 type CachedFullLastLayerGpuRunner = Rc<RefCell<CachedGpuFullLastLayerRunner>>;
+type CachedAttentionBlockGpuRunner = Rc<RefCell<CachedGpuAttentionBlockRunner>>;
+type CachedMlpBlockGpuRunner = Rc<RefCell<CachedGpuMlpBlockRunner>>;
 type CachedProjectionGpuCacheEntry = (CachedProjectionGpuRunner, Duration, Duration, bool);
 type CachedWeightedRmsNormGpuRunner = Rc<RefCell<CachedGpuWeightedRmsNormRunner>>;
 type CachedWeightedRmsNormGpuCacheEntry = (CachedWeightedRmsNormGpuRunner, Duration, bool);
@@ -917,8 +919,8 @@ struct GpuFirstRunnerCache<'a> {
     qk_rope_runner: Option<CachedGpuQkRopeRunner>,
     raw_f32_projection_runners: HashMap<String, CachedGpuPackedMatvecRunner>,
     gpu_kv_caches: HashMap<usize, GpuKvCache>,
-    attention_blocks: HashMap<(usize, usize), CachedGpuAttentionBlockRunner>,
-    mlp_blocks: HashMap<usize, CachedGpuMlpBlockRunner>,
+    attention_blocks: HashMap<usize, CachedAttentionBlockGpuRunner>,
+    mlp_blocks: HashMap<usize, CachedMlpBlockGpuRunner>,
     full_last_layer_block: Option<CachedFullLastLayerGpuRunner>,
     tail_block: Option<CachedTailBlockGpuRunner>,
 }
@@ -1481,12 +1483,12 @@ impl<'a> GpuFirstRunnerCache<'a> {
     ) -> Result<GpuResidentBuffer, ReferenceError> {
         match state {
             ResidentHiddenState::Mlp { layer_idx } => {
-                let runner = self.mlp_blocks.get_mut(&layer_idx).ok_or_else(|| {
+                let runner = self.mlp_blocks.get(&layer_idx).ok_or_else(|| {
                     ReferenceError::Decode(format!(
                         "gpu-first mlp block output missing for layer {layer_idx}"
                     ))
                 })?;
-                Ok(runner.resident_output())
+                Ok(runner.borrow().resident_output())
             }
         }
     }
@@ -1498,12 +1500,13 @@ impl<'a> GpuFirstRunnerCache<'a> {
         match state {
             ResidentHiddenState::Mlp { layer_idx } => self
                 .mlp_blocks
-                .get_mut(&layer_idx)
+                .get(&layer_idx)
                 .ok_or_else(|| {
                     ReferenceError::Decode(format!(
                         "gpu-first mlp block output missing for layer {layer_idx}"
                     ))
                 })?
+                .borrow()
                 .read_output()
                 .map_err(|error| ReferenceError::Decode(error.to_string())),
         }
@@ -1743,85 +1746,28 @@ impl<'a> GpuFirstRunnerCache<'a> {
     fn ensure_attention_block(
         &mut self,
         layer_idx: usize,
-        seq_len: usize,
-    ) -> Result<(Duration, &mut CachedGpuAttentionBlockRunner), ReferenceError> {
-        let cache_key = (layer_idx, seq_len);
-        let compile_duration = if self.attention_blocks.contains_key(&cache_key) {
-            Duration::ZERO
-        } else {
-            let layer_tensors = &self.model.layer_tensors[layer_idx];
-            let o_proj_spec = self.packed_linear_spec(
-                &layer_tensors.o_proj_weight,
-                self.model.config.hidden_size,
-                self.model.config.hidden_size,
-            )?;
-            let context = self.get_or_create_shared_context()?;
-            let runner = CachedGpuAttentionBlockRunner::new_with_context(
-                context,
-                seq_len,
-                self.model.config.num_attention_heads,
-                self.model.config.num_key_value_heads,
-                self.model.config.head_dim,
-                &o_proj_spec,
-            )
-            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-            let compile_duration = runner.compile_duration();
-            self.attention_blocks.insert(cache_key, runner);
-            compile_duration
-        };
-        Ok((
-            compile_duration,
-            self.attention_blocks
-                .get_mut(&cache_key)
-                .expect("attention block runner should exist after creation"),
-        ))
+    ) -> Result<(Duration, CachedAttentionBlockGpuRunner), ReferenceError> {
+        if let Some(runner) = self.attention_blocks.get(&layer_idx).cloned() {
+            return Ok((Duration::ZERO, runner));
+        }
+        let (runner, compile_duration, _gpu_cache_hit) = self
+            .model
+            .get_or_create_attention_block_gpu(layer_idx, self.kv_capacity_tokens.max(1))?;
+        self.attention_blocks.insert(layer_idx, runner.clone());
+        Ok((compile_duration, runner))
     }
 
     fn ensure_mlp_block(
         &mut self,
         layer_idx: usize,
-    ) -> Result<(Duration, &mut CachedGpuMlpBlockRunner), ReferenceError> {
-        let compile_duration = if self.mlp_blocks.contains_key(&layer_idx) {
-            Duration::ZERO
-        } else {
-            let layer_tensors = &self.model.layer_tensors[layer_idx];
-            let pair_cache_key = format!(
-                "gpu_first::layer::{layer_idx}::mlp_pair::{}+{}",
-                layer_tensors.gate_proj_weight, layer_tensors.up_proj_weight
-            );
-            let pair_spec = self.packed_pair_linear_spec(
-                &pair_cache_key,
-                &layer_tensors.gate_proj_weight,
-                self.model.config.intermediate_size,
-                &layer_tensors.up_proj_weight,
-                self.model.config.intermediate_size,
-                self.model.config.hidden_size,
-            )?;
-            let down_spec = self.packed_linear_spec(
-                &layer_tensors.down_proj_weight,
-                self.model.config.hidden_size,
-                self.model.config.intermediate_size,
-            )?;
-            let context = self.get_or_create_shared_context()?;
-            let runner = CachedGpuMlpBlockRunner::new_with_context(
-                context,
-                self.model.config.hidden_size,
-                self.model.config.intermediate_size,
-                self.model.config.rms_norm_eps as f32,
-                &pair_spec,
-                &down_spec,
-            )
-            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-            let compile_duration = runner.compile_duration();
-            self.mlp_blocks.insert(layer_idx, runner);
-            compile_duration
-        };
-        Ok((
-            compile_duration,
-            self.mlp_blocks
-                .get_mut(&layer_idx)
-                .expect("mlp block runner should exist after creation"),
-        ))
+    ) -> Result<(Duration, CachedMlpBlockGpuRunner), ReferenceError> {
+        if let Some(runner) = self.mlp_blocks.get(&layer_idx).cloned() {
+            return Ok((Duration::ZERO, runner));
+        }
+        let (runner, compile_duration, _gpu_cache_hit) =
+            self.model.get_or_create_mlp_block_gpu(layer_idx)?;
+        self.mlp_blocks.insert(layer_idx, runner.clone());
+        Ok((compile_duration, runner))
     }
 
     fn ensure_tail_block(
@@ -1874,7 +1820,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 let _ = self.ensure_gpu_kv_cache(layer_idx)?;
                 if ReferenceModel::packed_use_gpu_attention_block() {
                     for seq_len in 1..=self.kv_capacity_tokens.max(1) {
-                        let _ = self.ensure_attention_block(layer_idx, seq_len)?;
+                    let _ = self.ensure_attention_block(layer_idx)?;
                     }
                 }
             }
@@ -1897,7 +1843,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         if ReferenceModel::packed_use_gpu_full_last_layer() {
             let last_layer_idx = self.model.config.num_hidden_layers - 1;
             for seq_len in 1..=self.kv_capacity_tokens.max(1) {
-                let _ = self.ensure_attention_block(last_layer_idx, seq_len)?;
+            let _ = self.ensure_attention_block(last_layer_idx)?;
             }
             let _ = self.ensure_full_last_layer_block()?;
         }
@@ -1929,12 +1875,13 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let kv_state = self.gpu_kv_state(layer_idx);
         let kv_tensors = self.gpu_kv_tensors(layer_idx);
         let (attention_compile_duration, attention_block) =
-            self.ensure_attention_block(layer_idx, seq_len)?;
+            self.ensure_attention_block(layer_idx)?;
         let attention_report = if let Some(query_resident) = query_resident {
             let (key_tensor, value_tensor) = kv_tensors
                 .as_ref()
                 .expect("gpu kv tensors should exist when resident query is provided");
             attention_block
+                .borrow_mut()
                 .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         } else if let Some((
@@ -1947,6 +1894,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         )) = kv_state
         {
             attention_block
+                .borrow_mut()
                 .run_with_resident_kv(
                     q.expect("host query should exist when resident query is not provided"),
                     key_buffer,
@@ -1960,6 +1908,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         } else {
             attention_block
+                .borrow_mut()
                 .run_resident(
                     q.expect("host query should exist when resident query is not provided"),
                     keys,
@@ -1968,13 +1917,15 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 )
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         };
-        let attention_output = attention_block.resident_output();
+        let attention_output = attention_block.borrow().resident_output();
 
         let (mlp_compile_duration, mlp_block) = self.ensure_mlp_block(layer_idx)?;
         let mlp_report = mlp_block
+            .borrow_mut()
             .run_from_resident_tensor(&attention_output, post_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let (hidden, download_duration) = mlp_block
+            .borrow()
             .read_output()
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
 
@@ -2003,13 +1954,14 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let kv_state = self.gpu_kv_state(layer_idx);
         let kv_tensors = self.gpu_kv_tensors(layer_idx);
         let (attention_compile_duration, attention_block) =
-            self.ensure_attention_block(layer_idx, seq_len)?;
+            self.ensure_attention_block(layer_idx)?;
         let attention_report = if let Some(query_resident) = query_resident {
             let (key_tensor, value_tensor) = kv_tensors
                 .as_ref()
                 .expect("gpu kv tensors should exist when resident query is provided");
             if let Some(residual_resident) = residual_resident {
                 attention_block
+                    .borrow_mut()
                     .run_with_resident_query_kv_and_residual(
                         query_resident,
                         key_tensor,
@@ -2019,6 +1971,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                     .map_err(|error| ReferenceError::Decode(error.to_string()))?
             } else {
                 attention_block
+                    .borrow_mut()
                     .run_with_resident_query_and_kv(
                         query_resident,
                         key_tensor,
@@ -2037,6 +1990,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         )) = kv_state
         {
             attention_block
+                .borrow_mut()
                 .run_with_resident_kv(
                     q.expect("host query should exist when resident query is not provided"),
                     key_buffer,
@@ -2050,6 +2004,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         } else {
             attention_block
+                .borrow_mut()
                 .run_resident(
                     q.expect("host query should exist when resident query is not provided"),
                     keys,
@@ -2058,10 +2013,11 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 )
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         };
-        let attention_output = attention_block.resident_output();
+        let attention_output = attention_block.borrow().resident_output();
 
         let (mlp_compile_duration, mlp_block) = self.ensure_mlp_block(layer_idx)?;
         let mlp_report = mlp_block
+            .borrow_mut()
             .run_from_resident_tensor(&attention_output, post_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
 
@@ -2085,12 +2041,13 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let kv_state = self.gpu_kv_state(layer_idx);
         let kv_tensors = self.gpu_kv_tensors(layer_idx);
         let (attention_compile_duration, attention_block) =
-            self.ensure_attention_block(layer_idx, seq_len)?;
+            self.ensure_attention_block(layer_idx)?;
         let attention_report = if let Some(query_resident) = query_resident {
             let (key_tensor, value_tensor) = kv_tensors
                 .as_ref()
                 .expect("gpu kv tensors should exist when resident query is provided");
             attention_block
+                .borrow_mut()
                 .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         } else if let Some((
@@ -2103,6 +2060,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         )) = kv_state
         {
             attention_block
+                .borrow_mut()
                 .run_with_resident_kv(
                     q.expect("host query should exist when resident query is not provided"),
                     key_buffer,
@@ -2116,6 +2074,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         } else {
             attention_block
+                .borrow_mut()
                 .run_resident(
                     q.expect("host query should exist when resident query is not provided"),
                     keys,
@@ -2125,6 +2084,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         };
         let (hidden, download_duration) = attention_block
+            .borrow()
             .read_output()
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         Ok((
@@ -2149,12 +2109,13 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let kv_state = self.gpu_kv_state(layer_idx);
         let kv_tensors = self.gpu_kv_tensors(layer_idx);
         let (attention_compile_duration, attention_block) =
-            self.ensure_attention_block(layer_idx, seq_len)?;
+            self.ensure_attention_block(layer_idx)?;
         let attention_report = if let Some(query_resident) = query_resident {
             let (key_tensor, value_tensor) = kv_tensors
                 .as_ref()
                 .expect("gpu kv tensors should exist when resident query is provided");
             attention_block
+                .borrow_mut()
                 .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         } else if let Some((
@@ -2167,6 +2128,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         )) = kv_state
         {
             attention_block
+                .borrow_mut()
                 .run_with_resident_kv(
                     q.expect("host query should exist when resident query is not provided"),
                     key_buffer,
@@ -2180,6 +2142,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         } else {
             attention_block
+                .borrow_mut()
                 .run_resident(
                     q.expect("host query should exist when resident query is not provided"),
                     keys,
@@ -2207,13 +2170,14 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let kv_state = self.gpu_kv_state(layer_idx);
         let kv_tensors = self.gpu_kv_tensors(layer_idx);
         let (attention_compile_duration, attention_block) =
-            self.ensure_attention_block(layer_idx, seq_len)?;
+            self.ensure_attention_block(layer_idx)?;
         let attention_report = if let Some(query_resident) = query_resident {
             let (key_tensor, value_tensor) = kv_tensors
                 .as_ref()
                 .expect("gpu kv tensors should exist when resident query is provided");
             if let Some(residual_resident) = residual_resident {
                 attention_block
+                    .borrow_mut()
                     .run_with_resident_query_kv_and_residual(
                         query_resident,
                         key_tensor,
@@ -2223,7 +2187,8 @@ impl<'a> GpuFirstRunnerCache<'a> {
                     .map_err(|error| ReferenceError::Decode(error.to_string()))?
             } else {
                 attention_block
-                    .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
+                    .borrow_mut()
+                .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
                     .map_err(|error| ReferenceError::Decode(error.to_string()))?
             }
         } else if let Some((
@@ -2236,6 +2201,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         )) = kv_state
         {
             attention_block
+                .borrow_mut()
                 .run_with_resident_kv(
                     q.expect("host query should exist when resident query is not provided"),
                     key_buffer,
@@ -2249,6 +2215,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         } else {
             attention_block
+                .borrow_mut()
                 .run_resident(
                     q.expect("host query should exist when resident query is not provided"),
                     keys,
@@ -2257,7 +2224,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 )
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         };
-        let attention_output = attention_block.resident_output();
+        let attention_output = attention_block.borrow().resident_output();
         let (tail_compile_duration, tail_block) = self.ensure_tail_block()?;
         let tail_report = tail_block
             .borrow_mut()
@@ -2280,9 +2247,11 @@ impl<'a> GpuFirstRunnerCache<'a> {
     ) -> Result<(Vec<f32>, GpuMlpBlockReport, Duration, Duration), ReferenceError> {
         let (mlp_compile_duration, mlp_block) = self.ensure_mlp_block(layer_idx)?;
         let mlp_report = mlp_block
+            .borrow_mut()
             .run_with_host_residual(residual, post_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let (hidden, download_duration) = mlp_block
+            .borrow()
             .read_output()
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         Ok((hidden, mlp_report, mlp_compile_duration, download_duration))
@@ -2296,6 +2265,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
     ) -> Result<(GpuMlpBlockReport, Duration), ReferenceError> {
         let (mlp_compile_duration, mlp_block) = self.ensure_mlp_block(layer_idx)?;
         let mlp_report = mlp_block
+            .borrow_mut()
             .run_with_host_residual(residual, post_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         Ok((mlp_report, mlp_compile_duration))
@@ -2310,9 +2280,10 @@ impl<'a> GpuFirstRunnerCache<'a> {
     ) -> Result<(usize, GpuMlpBlockReport, GpuTailBlockReport, Duration), ReferenceError> {
         let (mlp_compile_duration, mlp_block) = self.ensure_mlp_block(layer_idx)?;
         let mlp_report = mlp_block
+            .borrow_mut()
             .run_with_host_residual(residual, post_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-        let mlp_output = mlp_block.resident_output();
+        let mlp_output = mlp_block.borrow().resident_output();
         let (tail_compile_duration, tail_block) = self.ensure_tail_block()?;
         let tail_report = tail_block
             .borrow_mut()
@@ -2351,13 +2322,14 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let kv_state = self.gpu_kv_state(layer_idx);
         let kv_tensors = self.gpu_kv_tensors(layer_idx);
         let (attention_compile_duration, attention_block) =
-            self.ensure_attention_block(layer_idx, seq_len)?;
+            self.ensure_attention_block(layer_idx)?;
         let attention_report = if let Some(query_resident) = query_resident {
             let (key_tensor, value_tensor) = kv_tensors
                 .as_ref()
                 .expect("gpu kv tensors should exist when resident query is provided");
             if let Some(residual_resident) = residual_resident {
                 attention_block
+                    .borrow_mut()
                     .run_with_resident_query_kv_and_residual(
                         query_resident,
                         key_tensor,
@@ -2367,7 +2339,8 @@ impl<'a> GpuFirstRunnerCache<'a> {
                     .map_err(|error| ReferenceError::Decode(error.to_string()))?
             } else {
                 attention_block
-                    .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
+                    .borrow_mut()
+                .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
                     .map_err(|error| ReferenceError::Decode(error.to_string()))?
             }
         } else if let Some((
@@ -2380,6 +2353,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         )) = kv_state
         {
             attention_block
+                .borrow_mut()
                 .run_with_resident_kv(
                     q.expect("host query should exist when resident query is not provided"),
                     key_buffer,
@@ -2393,6 +2367,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         } else {
             attention_block
+                .borrow_mut()
                 .run_resident(
                     q.expect("host query should exist when resident query is not provided"),
                     keys,
@@ -2401,7 +2376,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 )
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         };
-        let attention_output = attention_block.resident_output();
+        let attention_output = attention_block.borrow().resident_output();
 
         let (full_last_layer_compile_duration, full_last_layer_block) =
             self.ensure_full_last_layer_block()?;
@@ -3875,6 +3850,8 @@ pub struct ReferenceModel {
     cached_vector_add_gpu: RefCell<HashMap<usize, CachedVectorAddGpuRunner>>,
     cached_swiglu_combined_gpu: RefCell<Option<CachedSwigluCombinedGpuRunner>>,
     cached_swiglu_pack_f16_pairs_gpu: RefCell<Option<CachedSwigluPackF16PairsGpuRunner>>,
+    cached_attention_block_gpu: RefCell<HashMap<(usize, usize), CachedAttentionBlockGpuRunner>>,
+    cached_mlp_block_gpu: RefCell<HashMap<usize, CachedMlpBlockGpuRunner>>,
     cached_tail_block_gpu: RefCell<Option<CachedTailBlockGpuRunner>>,
     cached_full_last_layer_block_gpu: RefCell<Option<CachedFullLastLayerGpuRunner>>,
     packed_gpu_context: RefCell<Option<Arc<SharedGpuPackedContext>>>,
@@ -4054,6 +4031,8 @@ impl ReferenceModel {
             cached_vector_add_gpu: RefCell::new(HashMap::new()),
             cached_swiglu_combined_gpu: RefCell::new(None),
             cached_swiglu_pack_f16_pairs_gpu: RefCell::new(None),
+            cached_attention_block_gpu: RefCell::new(HashMap::new()),
+            cached_mlp_block_gpu: RefCell::new(HashMap::new()),
             cached_tail_block_gpu: RefCell::new(None),
             cached_full_last_layer_block_gpu: RefCell::new(None),
             packed_gpu_context: RefCell::new(None),
@@ -5130,6 +5109,103 @@ impl ReferenceModel {
         })?;
         let runner = Rc::new(RefCell::new(runner));
         *self.cached_swiglu_pack_f16_pairs_gpu.borrow_mut() = Some(runner.clone());
+        Ok((runner, duration, false))
+    }
+
+    fn get_or_create_attention_block_gpu(
+        &self,
+        layer_idx: usize,
+        seq_capacity: usize,
+    ) -> Result<(CachedAttentionBlockGpuRunner, Duration, bool), ReferenceError> {
+        let cache_key = (layer_idx, seq_capacity);
+        if let Some(cached) = self.cached_attention_block_gpu.borrow().get(&cache_key).cloned() {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let layer_tensors = &self.layer_tensors[layer_idx];
+        let (o_proj_packed, _, _) = self.get_or_create_projection_cache(
+            &layer_tensors.o_proj_weight,
+            self.config.hidden_size,
+            self.config.hidden_size,
+        )?;
+        let o_proj_spec = PackedLinearSpec {
+            code_words: o_proj_packed.code_words.clone(),
+            scales: o_proj_packed.scales.clone(),
+            group_size: o_proj_packed.group_size,
+            rows: o_proj_packed.rows,
+            cols: o_proj_packed.cols,
+        };
+        let context = self.get_or_create_packed_gpu_context()?;
+        let runner = CachedGpuAttentionBlockRunner::new_with_context(
+            context,
+            seq_capacity,
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+            &o_proj_spec,
+        )
+        .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let duration = runner.compile_duration();
+        let runner = Rc::new(RefCell::new(runner));
+        self.cached_attention_block_gpu
+            .borrow_mut()
+            .insert(cache_key, runner.clone());
+        Ok((runner, duration, false))
+    }
+
+    fn get_or_create_mlp_block_gpu(
+        &self,
+        layer_idx: usize,
+    ) -> Result<(CachedMlpBlockGpuRunner, Duration, bool), ReferenceError> {
+        if let Some(cached) = self.cached_mlp_block_gpu.borrow().get(&layer_idx).cloned() {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let layer_tensors = &self.layer_tensors[layer_idx];
+        let pair_cache_key = format!(
+            "gpu_first::layer::{layer_idx}::mlp_pair::{}+{}",
+            layer_tensors.gate_proj_weight, layer_tensors.up_proj_weight
+        );
+        let (pair_packed, _, _) = self.get_or_create_projection_pair_cache(
+            &pair_cache_key,
+            &layer_tensors.gate_proj_weight,
+            self.config.intermediate_size,
+            &layer_tensors.up_proj_weight,
+            self.config.intermediate_size,
+            self.config.hidden_size,
+        )?;
+        let pair_spec = PackedLinearSpec {
+            code_words: pair_packed.code_words.clone(),
+            scales: pair_packed.scales.clone(),
+            group_size: pair_packed.group_size,
+            rows: pair_packed.rows,
+            cols: pair_packed.cols,
+        };
+        let (down_packed, _, _) = self.get_or_create_projection_cache(
+            &layer_tensors.down_proj_weight,
+            self.config.hidden_size,
+            self.config.intermediate_size,
+        )?;
+        let down_spec = PackedLinearSpec {
+            code_words: down_packed.code_words.clone(),
+            scales: down_packed.scales.clone(),
+            group_size: down_packed.group_size,
+            rows: down_packed.rows,
+            cols: down_packed.cols,
+        };
+        let context = self.get_or_create_packed_gpu_context()?;
+        let runner = CachedGpuMlpBlockRunner::new_with_context(
+            context,
+            self.config.hidden_size,
+            self.config.intermediate_size,
+            self.config.rms_norm_eps as f32,
+            &pair_spec,
+            &down_spec,
+        )
+        .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let duration = runner.compile_duration();
+        let runner = Rc::new(RefCell::new(runner));
+        self.cached_mlp_block_gpu
+            .borrow_mut()
+            .insert(layer_idx, runner.clone());
         Ok((runner, duration, false))
     }
 
@@ -8928,7 +9004,7 @@ mod tests {
             .inner
             .gpu_first_session
             .attention_blocks
-            .contains_key(&(0, 1)));
+            .contains_key(&0));
     }
 
     #[test]
@@ -9275,7 +9351,7 @@ mod tests {
                 .inner
                 .gpu_first_session
                 .attention_blocks
-                .contains_key(&(0, 1))
+                .contains_key(&0)
         );
         assert!(session.inner.gpu_first_session.tail_block.is_some());
     }
