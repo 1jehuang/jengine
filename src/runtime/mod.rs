@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod decode_plan;
 pub mod gpu_decode_engine;
+pub mod gpu_decode_metrics;
 pub mod gpu_decode_state;
 pub mod packed;
 pub mod packed_model;

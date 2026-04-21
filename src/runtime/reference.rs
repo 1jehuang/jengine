@@ -24,6 +24,9 @@ use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRun
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::decode_plan::PackedDecodePlan;
 use crate::runtime::gpu_decode_engine::{GpuDecodeEngine, PackedDecodeRequest};
+use crate::runtime::gpu_decode_metrics::{
+    PackedAttentionStageMetrics, PackedGpuSessionMetrics, PackedMlpStageMetrics,
+};
 use crate::runtime::gpu_decode_state::{GpuKvBinding, GpuTailResult, GpuTailStepReport, ResidentHiddenState};
 use crate::runtime::packed_model::{PackedModelError, PackedModelStore};
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
@@ -903,20 +906,6 @@ impl PackedDecodeValidationReport {
             self.enabled_projections, self.prompt_tokens, self.max_abs_diff, self.mean_abs_diff,
         )
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct PackedAttentionStageMetrics {
-    query_duration: Duration,
-    oproj_duration: Duration,
-    residual_duration: Duration,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct PackedMlpStageMetrics {
-    swiglu_duration: Duration,
-    down_duration: Duration,
-    residual_duration: Duration,
 }
 
 struct GpuFirstRunnerCache<'a> {
@@ -2415,24 +2404,6 @@ impl<'a> GpuFirstRunnerCache<'a> {
             compile_duration,
         ))
     }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct PackedGpuSessionMetrics {
-    pack_duration: Duration,
-    compile_duration: Duration,
-    weight_upload_duration: Duration,
-    activation_upload_duration: Duration,
-    upload_duration: Duration,
-    gpu_duration: Duration,
-    download_duration: Duration,
-    pack_cache_hits: usize,
-    gpu_cache_hits: usize,
-    dispatch_count: usize,
-    weight_upload_bytes: usize,
-    activation_upload_bytes: usize,
-    upload_bytes: usize,
-    download_bytes: usize,
 }
 
 struct PreparedProjectionRunner {
