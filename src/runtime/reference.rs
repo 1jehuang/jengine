@@ -1121,7 +1121,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         Ok(())
     }
 
-    fn prewarm_decode_path(
+    pub(crate) fn prewarm_decode_path(
         &mut self,
         use_attention_qkv: bool,
         use_mlp_gu: bool,
@@ -3238,7 +3238,7 @@ pub struct ReferenceModel {
     pub generation_config: GenerationConfig,
     pub tokenizer: Option<TokenizerRuntime>,
     pub weights: WeightStore,
-    packed_model: Option<PackedModelStore>,
+    pub(crate) packed_model: Option<PackedModelStore>,
     rope: YarnRope,
     layer_tensors: Vec<LayerTensorNames>,
     cached_hybrid_qproj: RefCell<HashMap<usize, Rc<HybridQProjCache>>>,
@@ -3399,7 +3399,7 @@ impl ReferenceModel {
         )
     }
 
-    fn prewarm_layer_projection_caches(
+    pub(crate) fn prewarm_layer_projection_caches(
         &self,
         plan: &PackedDecodePlan,
         use_attention_qkv: bool,
@@ -3476,7 +3476,7 @@ impl ReferenceModel {
         Ok(())
     }
 
-    fn prewarm_tail_support_caches(
+    pub(crate) fn prewarm_tail_support_caches(
         &self,
         plan: &PackedDecodePlan,
         use_mlp_gu: bool,
@@ -3515,35 +3515,6 @@ impl ReferenceModel {
             self.config.vocab_size,
             self.config.hidden_size,
         )?;
-        Ok(())
-    }
-
-    pub(crate) fn prewarm_packed_decode_caches_internal(
-        &self,
-        expected_tokens: usize,
-        use_attention_qkv: bool,
-        use_mlp_gu: bool,
-        use_attention_full: bool,
-        use_mlp_full: bool,
-    ) -> Result<(), ReferenceError> {
-        if self.packed_model.is_none() {
-            return Ok(());
-        }
-        let plan = PackedDecodePlan::from_env(use_attention_qkv, use_mlp_gu, false);
-        let kv_rows = self.config.num_key_value_heads * self.config.head_dim;
-        self.prewarm_layer_projection_caches(
-            &plan,
-            use_attention_qkv,
-            use_mlp_gu,
-            use_attention_full,
-            use_mlp_full,
-            kv_rows,
-        )?;
-        self.prewarm_tail_support_caches(&plan, use_mlp_gu)?;
-        if plan.gpu_first_session {
-            let mut gpu_first_cache = GpuFirstRunnerCache::new(self, expected_tokens.max(1));
-            gpu_first_cache.prewarm_decode_path(use_attention_qkv, use_mlp_gu)?;
-        }
         Ok(())
     }
 

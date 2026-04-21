@@ -469,13 +469,29 @@ impl<'a> GpuDecodeEngine<'a> {
     }
 
     pub fn prewarm(&self) -> Result<(), ReferenceError> {
-        self.model.prewarm_packed_decode_caches_internal(
-            self.request.expected_tokens,
+        if self.model.packed_model.is_none() {
+            return Ok(());
+        }
+        let kv_rows = self.model.config.num_key_value_heads * self.model.config.head_dim;
+        self.model.prewarm_layer_projection_caches(
+            &self.plan,
             self.request.use_attention_qkv,
             self.request.use_mlp_gu,
             self.plan.use_attention_full,
             self.plan.use_mlp_full,
-        )
+            kv_rows,
+        )?;
+        self.model
+            .prewarm_tail_support_caches(&self.plan, self.request.use_mlp_gu)?;
+        if self.plan.gpu_first_session {
+            let mut gpu_first_cache =
+                GpuFirstRunnerCache::new(self.model, self.request.expected_tokens.max(1));
+            gpu_first_cache.prewarm_decode_path(
+                self.request.use_attention_qkv,
+                self.request.use_mlp_gu,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn begin_packed_session(&self) -> PackedDecodeSession<'a> {
