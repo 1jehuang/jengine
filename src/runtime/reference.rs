@@ -270,6 +270,13 @@ impl LayerCache {
             values: Vec::with_capacity(capacity),
         }
     }
+
+    fn without_preallocated_cpu_kv() -> Self {
+        Self {
+            keys: Vec::new(),
+            values: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -564,16 +571,17 @@ pub struct PersistentPackedDecodeSession<'a> {
 }
 
 impl<'a> PersistentPackedDecodeSession<'a> {
-    fn new(
+    fn new_with_cpu_kv_preallocation(
         model: &'a ReferenceModel,
         expected_tokens: usize,
         use_attention_qkv: bool,
         use_mlp_gu: bool,
         argmax_only: bool,
+        preallocate_cpu_kv: bool,
     ) -> Self {
         Self {
             model,
-            cache: model.allocate_layer_cache_vec(expected_tokens),
+            cache: model.allocate_layer_cache_vec(expected_tokens, preallocate_cpu_kv),
             gpu_session: PackedGpuSession::new(model),
             gpu_first_session: GpuFirstRunnerCache::new(model, expected_tokens),
             metrics: DecodeMetrics {
@@ -597,6 +605,23 @@ impl<'a> PersistentPackedDecodeSession<'a> {
             use_mlp_full: use_mlp_gu && ReferenceModel::packed_use_mlp_full(),
             argmax_only,
         }
+    }
+
+    fn new(
+        model: &'a ReferenceModel,
+        expected_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        argmax_only: bool,
+    ) -> Self {
+        Self::new_with_cpu_kv_preallocation(
+            model,
+            expected_tokens,
+            use_attention_qkv,
+            use_mlp_gu,
+            argmax_only,
+            true,
+        )
     }
 
     pub fn push_prompt_token(
@@ -706,12 +731,13 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
         use_mlp_gu: bool,
         argmax_only: bool,
     ) -> Self {
-        let mut inner = PersistentPackedDecodeSession::new(
+        let mut inner = PersistentPackedDecodeSession::new_with_cpu_kv_preallocation(
             model,
             expected_tokens,
             use_attention_qkv,
             use_mlp_gu,
             argmax_only,
+            false,
         );
         inner.use_attention_full = use_attention_qkv
             && (ReferenceModel::packed_use_attention_full()
@@ -4224,10 +4250,20 @@ impl ReferenceModel {
             + logits
     }
 
-    fn allocate_layer_cache_vec(&self, expected_tokens: usize) -> Vec<LayerCache> {
+    fn allocate_layer_cache_vec(
+        &self,
+        expected_tokens: usize,
+        preallocate_cpu_kv: bool,
+    ) -> Vec<LayerCache> {
         let kv_width = self.config.num_key_value_heads * self.config.head_dim;
         (0..self.config.num_hidden_layers)
-            .map(|_| LayerCache::with_capacity(expected_tokens, kv_width))
+            .map(|_| {
+                if preallocate_cpu_kv {
+                    LayerCache::with_capacity(expected_tokens, kv_width)
+                } else {
+                    LayerCache::without_preallocated_cpu_kv()
+                }
+            })
             .collect()
     }
 
@@ -4286,7 +4322,7 @@ impl ReferenceModel {
             mlp_duration: Duration::ZERO,
             logits_duration: Duration::ZERO,
         };
-        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens);
+        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens, true);
 
         let mut last_logits = Vec::new();
         for (position, &token_id) in prompt_ids.iter().enumerate() {
@@ -5496,7 +5532,7 @@ impl ReferenceModel {
             mlp_duration: Duration::ZERO,
             logits_duration: Duration::ZERO,
         };
-        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens);
+        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens, true);
         let mut upload = upload_duration;
         let mut gpu = Duration::ZERO;
         let mut download = Duration::ZERO;
@@ -5601,7 +5637,7 @@ impl ReferenceModel {
             mlp_duration: Duration::ZERO,
             logits_duration: Duration::ZERO,
         };
-        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len());
+        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len(), true);
         for (position, &token_id) in prompt_ids.iter().enumerate() {
             let _ = self.forward_step(token_id, position, &mut cache, &mut metrics)?;
         }
@@ -6127,7 +6163,7 @@ impl ReferenceModel {
             mlp_duration: Duration::ZERO,
             logits_duration: Duration::ZERO,
         };
-        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens);
+        let mut cache = self.allocate_layer_cache_vec(prompt_ids.len() + max_new_tokens, true);
         let mut compile = q_proj_gpu_compile_duration;
         let mut upload = Duration::ZERO;
         let mut gpu = Duration::ZERO;
@@ -8521,6 +8557,8 @@ mod tests {
         };
         assert!(session.inner.cache[0].keys.is_empty());
         assert!(session.inner.cache[0].values.is_empty());
+        assert_eq!(session.inner.cache[0].keys.capacity(), 0);
+        assert_eq!(session.inner.cache[0].values.capacity(), 0);
         let kv_cache = session
             .inner
             .gpu_first_session
@@ -8556,6 +8594,8 @@ mod tests {
         };
         assert!(session.inner.cache[0].keys.is_empty());
         assert!(session.inner.cache[0].values.is_empty());
+        assert_eq!(session.inner.cache[0].keys.capacity(), 0);
+        assert_eq!(session.inner.cache[0].values.capacity(), 0);
         let kv_cache = session
             .inner
             .gpu_first_session
