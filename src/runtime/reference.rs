@@ -307,6 +307,8 @@ struct LayerTensorNames {
 }
 
 type CachedProjectionGpuRunner = Rc<RefCell<CachedGpuPackedMatvecRunner>>;
+type CachedTailBlockGpuRunner = Rc<RefCell<CachedGpuTailBlockRunner>>;
+type CachedFullLastLayerGpuRunner = Rc<RefCell<CachedGpuFullLastLayerRunner>>;
 type CachedProjectionGpuCacheEntry = (CachedProjectionGpuRunner, Duration, Duration, bool);
 type CachedWeightedRmsNormGpuRunner = Rc<RefCell<CachedGpuWeightedRmsNormRunner>>;
 type CachedWeightedRmsNormGpuCacheEntry = (CachedWeightedRmsNormGpuRunner, Duration, bool);
@@ -891,8 +893,8 @@ struct GpuFirstRunnerCache<'a> {
     gpu_kv_caches: HashMap<usize, GpuKvCache>,
     attention_blocks: HashMap<(usize, usize), CachedGpuAttentionBlockRunner>,
     mlp_blocks: HashMap<usize, CachedGpuMlpBlockRunner>,
-    full_last_layer_block: Option<CachedGpuFullLastLayerRunner>,
-    tail_block: Option<CachedGpuTailBlockRunner>,
+    full_last_layer_block: Option<CachedFullLastLayerGpuRunner>,
+    tail_block: Option<CachedTailBlockGpuRunner>,
 }
 
 impl<'a> GpuFirstRunnerCache<'a> {
@@ -919,9 +921,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         if let Some(context) = self.shared_context.as_ref().cloned() {
             return Ok(context);
         }
-        let context = SharedGpuPackedContext::new().map_err(|error| {
-            ReferenceError::Decode(format!("gpu-first shared context init failed: {error}"))
-        })?;
+        let context = self.model.get_or_create_packed_gpu_context()?;
         self.shared_context = Some(context.clone());
         Ok(context)
     }
@@ -1674,88 +1674,25 @@ impl<'a> GpuFirstRunnerCache<'a> {
 
     fn ensure_tail_block(
         &mut self,
-    ) -> Result<(Duration, &mut CachedGpuTailBlockRunner), ReferenceError> {
-        let compile_duration = if self.tail_block.is_some() {
-            Duration::ZERO
-        } else {
-            let logits_spec = self.packed_linear_spec(
-                "model.embed_tokens.weight",
-                self.model.config.vocab_size,
-                self.model.config.hidden_size,
-            )?;
-            let context = self.get_or_create_shared_context()?;
-            let runner = CachedGpuTailBlockRunner::new_with_context(
-                context,
-                self.model.config.hidden_size,
-                self.model.config.vocab_size,
-                self.model.config.rms_norm_eps as f32,
-                &logits_spec,
-            )
-            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-            let compile_duration = runner.compile_duration();
-            self.tail_block = Some(runner);
-            compile_duration
-        };
-        Ok((
-            compile_duration,
-            self.tail_block
-                .as_mut()
-                .expect("tail block runner should exist after creation"),
-        ))
+    ) -> Result<(Duration, CachedTailBlockGpuRunner), ReferenceError> {
+        if let Some(runner) = self.tail_block.as_ref().cloned() {
+            return Ok((Duration::ZERO, runner));
+        }
+        let (runner, compile_duration, _gpu_cache_hit) = self.model.get_or_create_tail_block_gpu()?;
+        self.tail_block = Some(runner.clone());
+        Ok((compile_duration, runner))
     }
 
     fn ensure_full_last_layer_block(
         &mut self,
-    ) -> Result<(Duration, &mut CachedGpuFullLastLayerRunner), ReferenceError> {
-        let compile_duration = if self.full_last_layer_block.is_some() {
-            Duration::ZERO
-        } else {
-            let layer_idx = self.model.config.num_hidden_layers - 1;
-            let layer_tensors = &self.model.layer_tensors[layer_idx];
-            let pair_cache_key = format!(
-                "gpu_first::last_layer::mlp_pair::{}+{}",
-                layer_tensors.gate_proj_weight, layer_tensors.up_proj_weight
-            );
-            let pair_spec = self.packed_pair_linear_spec(
-                &pair_cache_key,
-                &layer_tensors.gate_proj_weight,
-                self.model.config.intermediate_size,
-                &layer_tensors.up_proj_weight,
-                self.model.config.intermediate_size,
-                self.model.config.hidden_size,
-            )?;
-            let down_spec = self.packed_linear_spec(
-                &layer_tensors.down_proj_weight,
-                self.model.config.hidden_size,
-                self.model.config.intermediate_size,
-            )?;
-            let logits_spec = self.packed_linear_spec(
-                "model.embed_tokens.weight",
-                self.model.config.vocab_size,
-                self.model.config.hidden_size,
-            )?;
-            let context = self.get_or_create_shared_context()?;
-            let runner = CachedGpuFullLastLayerRunner::new_with_context(
-                context,
-                self.model.config.hidden_size,
-                self.model.config.intermediate_size,
-                self.model.config.vocab_size,
-                self.model.config.rms_norm_eps as f32,
-                &pair_spec,
-                &down_spec,
-                &logits_spec,
-            )
-            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
-            let compile_duration = runner.compile_duration();
-            self.full_last_layer_block = Some(runner);
-            compile_duration
-        };
-        Ok((
-            compile_duration,
-            self.full_last_layer_block
-                .as_mut()
-                .expect("full last-layer runner should exist after creation"),
-        ))
+    ) -> Result<(Duration, CachedFullLastLayerGpuRunner), ReferenceError> {
+        if let Some(runner) = self.full_last_layer_block.as_ref().cloned() {
+            return Ok((Duration::ZERO, runner));
+        }
+        let (runner, compile_duration, _gpu_cache_hit) =
+            self.model.get_or_create_full_last_layer_block_gpu()?;
+        self.full_last_layer_block = Some(runner.clone());
+        Ok((compile_duration, runner))
     }
 
     fn prewarm_decode_path(
@@ -2102,6 +2039,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         seq_len: usize,
         q: Option<&[f32]>,
         query_resident: Option<&GpuResidentBuffer>,
+        residual_resident: Option<&GpuResidentBuffer>,
         keys: &[f32],
         values: &[f32],
         residual: &[f32],
@@ -2116,9 +2054,20 @@ impl<'a> GpuFirstRunnerCache<'a> {
             let (key_tensor, value_tensor) = kv_tensors
                 .as_ref()
                 .expect("gpu kv tensors should exist when resident query is provided");
-            attention_block
-                .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
-                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+            if let Some(residual_resident) = residual_resident {
+                attention_block
+                    .run_with_resident_query_kv_and_residual(
+                        query_resident,
+                        key_tensor,
+                        value_tensor,
+                        residual_resident,
+                    )
+                    .map_err(|error| ReferenceError::Decode(error.to_string()))?
+            } else {
+                attention_block
+                    .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
+                    .map_err(|error| ReferenceError::Decode(error.to_string()))?
+            }
         } else if let Some((
             key_buffer,
             key_len,
@@ -2153,6 +2102,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let attention_output = attention_block.resident_output();
         let (tail_compile_duration, tail_block) = self.ensure_tail_block()?;
         let tail_report = tail_block
+            .borrow_mut()
             .run_argmax_from_resident_tensor(&attention_output, final_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         Ok((
@@ -2207,6 +2157,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let mlp_output = mlp_block.resident_output();
         let (tail_compile_duration, tail_block) = self.ensure_tail_block()?;
         let tail_report = tail_block
+            .borrow_mut()
             .run_argmax_from_resident_tensor(&mlp_output, final_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         Ok((
@@ -2224,6 +2175,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         seq_len: usize,
         q: Option<&[f32]>,
         query_resident: Option<&GpuResidentBuffer>,
+        residual_resident: Option<&GpuResidentBuffer>,
         keys: &[f32],
         values: &[f32],
         residual: &[f32],
@@ -2246,9 +2198,20 @@ impl<'a> GpuFirstRunnerCache<'a> {
             let (key_tensor, value_tensor) = kv_tensors
                 .as_ref()
                 .expect("gpu kv tensors should exist when resident query is provided");
-            attention_block
-                .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
-                .map_err(|error| ReferenceError::Decode(error.to_string()))?
+            if let Some(residual_resident) = residual_resident {
+                attention_block
+                    .run_with_resident_query_kv_and_residual(
+                        query_resident,
+                        key_tensor,
+                        value_tensor,
+                        residual_resident,
+                    )
+                    .map_err(|error| ReferenceError::Decode(error.to_string()))?
+            } else {
+                attention_block
+                    .run_with_resident_query_and_kv(query_resident, key_tensor, value_tensor, residual)
+                    .map_err(|error| ReferenceError::Decode(error.to_string()))?
+            }
         } else if let Some((
             key_buffer,
             key_len,
@@ -2285,6 +2248,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
         let (full_last_layer_compile_duration, full_last_layer_block) =
             self.ensure_full_last_layer_block()?;
         let full_last_layer_report = full_last_layer_block
+            .borrow_mut()
             .run_argmax_from_resident_tensor(&attention_output, post_norm_weight, final_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         Ok((
@@ -2302,6 +2266,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
     ) -> Result<(usize, GpuTailBlockReport, Duration), ReferenceError> {
         let (compile_duration, tail_block) = self.ensure_tail_block()?;
         let report = tail_block
+            .borrow_mut()
             .run_argmax_from_resident_tensor(source, final_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         Ok((report.argmax_index, report, compile_duration))
@@ -2314,6 +2279,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
     ) -> Result<(usize, GpuTailBlockReport, Duration), ReferenceError> {
         let (compile_duration, tail_block) = self.ensure_tail_block()?;
         let report = tail_block
+            .borrow_mut()
             .run_argmax(hidden_input, final_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         Ok((report.argmax_index, report, compile_duration))
@@ -2326,6 +2292,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
     ) -> Result<(Vec<f32>, GpuTailBlockLogitsReport, Duration), ReferenceError> {
         let (compile_duration, tail_block) = self.ensure_tail_block()?;
         let (logits, report) = tail_block
+            .borrow_mut()
             .run_logits_from_resident_tensor(source, final_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         Ok((logits, report, compile_duration))
@@ -2338,6 +2305,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
     ) -> Result<(Vec<f32>, GpuTailBlockLogitsReport, Duration), ReferenceError> {
         let (compile_duration, tail_block) = self.ensure_tail_block()?;
         let (logits, report) = tail_block
+            .borrow_mut()
             .run_logits(hidden_input, final_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         Ok((logits, report, compile_duration))
@@ -3694,6 +3662,8 @@ pub struct ReferenceModel {
     cached_vector_add_gpu: RefCell<HashMap<usize, CachedVectorAddGpuRunner>>,
     cached_swiglu_combined_gpu: RefCell<Option<CachedSwigluCombinedGpuRunner>>,
     cached_swiglu_pack_f16_pairs_gpu: RefCell<Option<CachedSwigluPackF16PairsGpuRunner>>,
+    cached_tail_block_gpu: RefCell<Option<CachedTailBlockGpuRunner>>,
+    cached_full_last_layer_block_gpu: RefCell<Option<CachedFullLastLayerGpuRunner>>,
     packed_gpu_context: RefCell<Option<Arc<SharedGpuPackedContext>>>,
 }
 
@@ -3871,6 +3841,8 @@ impl ReferenceModel {
             cached_vector_add_gpu: RefCell::new(HashMap::new()),
             cached_swiglu_combined_gpu: RefCell::new(None),
             cached_swiglu_pack_f16_pairs_gpu: RefCell::new(None),
+            cached_tail_block_gpu: RefCell::new(None),
+            cached_full_last_layer_block_gpu: RefCell::new(None),
             packed_gpu_context: RefCell::new(None),
         })
     }
@@ -4910,6 +4882,116 @@ impl ReferenceModel {
             .map_err(|error| ReferenceError::Decode(format!("gpu context init failed: {error}")))?;
         *self.packed_gpu_context.borrow_mut() = Some(context.clone());
         Ok(context)
+    }
+
+    fn get_or_create_tail_block_gpu(
+        &self,
+    ) -> Result<(CachedTailBlockGpuRunner, Duration, bool), ReferenceError> {
+        if let Some(cached) = self.cached_tail_block_gpu.borrow().as_ref().cloned() {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let (logits_packed, _pack_duration, _pack_cache_hit) = self.get_or_create_projection_cache(
+            "model.embed_tokens.weight",
+            self.config.vocab_size,
+            self.config.hidden_size,
+        )?;
+        let logits_spec = PackedLinearSpec {
+            code_words: logits_packed.code_words.clone(),
+            scales: logits_packed.scales.clone(),
+            group_size: logits_packed.group_size,
+            rows: logits_packed.rows,
+            cols: logits_packed.cols,
+        };
+        let context = self.get_or_create_packed_gpu_context()?;
+        let runner = CachedGpuTailBlockRunner::new_with_context(
+            context,
+            self.config.hidden_size,
+            self.config.vocab_size,
+            self.config.rms_norm_eps as f32,
+            &logits_spec,
+        )
+        .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let duration = runner.compile_duration();
+        let runner = Rc::new(RefCell::new(runner));
+        *self.cached_tail_block_gpu.borrow_mut() = Some(runner.clone());
+        Ok((runner, duration, false))
+    }
+
+    fn get_or_create_full_last_layer_block_gpu(
+        &self,
+    ) -> Result<(CachedFullLastLayerGpuRunner, Duration, bool), ReferenceError> {
+        if let Some(cached) = self
+            .cached_full_last_layer_block_gpu
+            .borrow()
+            .as_ref()
+            .cloned()
+        {
+            return Ok((cached, Duration::ZERO, true));
+        }
+        let layer_idx = self.config.num_hidden_layers - 1;
+        let layer_tensors = &self.layer_tensors[layer_idx];
+        let pair_cache_key = format!(
+            "gpu_first::last_layer::mlp_pair::{}+{}",
+            layer_tensors.gate_proj_weight, layer_tensors.up_proj_weight
+        );
+        let (pair_packed, _pair_pack_duration, _pair_pack_cache_hit) =
+            self.get_or_create_projection_pair_cache(
+                &pair_cache_key,
+                &layer_tensors.gate_proj_weight,
+                self.config.intermediate_size,
+                &layer_tensors.up_proj_weight,
+                self.config.intermediate_size,
+                self.config.hidden_size,
+            )?;
+        let pair_spec = PackedLinearSpec {
+            code_words: pair_packed.code_words.clone(),
+            scales: pair_packed.scales.clone(),
+            group_size: pair_packed.group_size,
+            rows: pair_packed.rows,
+            cols: pair_packed.cols,
+        };
+        let (down_packed, _down_pack_duration, _down_pack_cache_hit) = self
+            .get_or_create_projection_cache(
+                &layer_tensors.down_proj_weight,
+                self.config.hidden_size,
+                self.config.intermediate_size,
+            )?;
+        let down_spec = PackedLinearSpec {
+            code_words: down_packed.code_words.clone(),
+            scales: down_packed.scales.clone(),
+            group_size: down_packed.group_size,
+            rows: down_packed.rows,
+            cols: down_packed.cols,
+        };
+        let (logits_packed, _logits_pack_duration, _logits_pack_cache_hit) =
+            self.get_or_create_projection_cache(
+                "model.embed_tokens.weight",
+                self.config.vocab_size,
+                self.config.hidden_size,
+            )?;
+        let logits_spec = PackedLinearSpec {
+            code_words: logits_packed.code_words.clone(),
+            scales: logits_packed.scales.clone(),
+            group_size: logits_packed.group_size,
+            rows: logits_packed.rows,
+            cols: logits_packed.cols,
+        };
+        let context = self.get_or_create_packed_gpu_context()?;
+        let runner = CachedGpuFullLastLayerRunner::new_with_context(
+            context,
+            self.config.hidden_size,
+            self.config.intermediate_size,
+            self.config.vocab_size,
+            self.config.rms_norm_eps as f32,
+            &pair_spec,
+            &down_spec,
+            &logits_spec,
+        )
+        .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        let duration = runner.compile_duration();
+        let runner = Rc::new(RefCell::new(runner));
+        *self.cached_full_last_layer_block_gpu.borrow_mut() = Some(runner.clone());
+        Ok((runner, duration, false))
     }
 
     pub fn benchmark_attention_projection_mix(
@@ -6809,6 +6891,7 @@ impl ReferenceModel {
                             position + 1,
                             Some(&q),
                             q_resident.as_ref(),
+                            residual_resident.as_ref(),
                             &layer_cache.keys,
                             &layer_cache.values,
                             &residual,
@@ -6882,6 +6965,7 @@ impl ReferenceModel {
                         position + 1,
                         Some(&q),
                         q_resident.as_ref(),
+                        residual_resident.as_ref(),
                         &layer_cache.keys,
                         &layer_cache.values,
                         &residual,
@@ -8788,6 +8872,60 @@ mod tests {
         };
         assert!(session.inner.gpu_first_session.mlp_blocks.contains_key(&0));
         assert!(session.inner.gpu_first_session.tail_block.is_some());
+    }
+
+    #[test]
+    fn runs_gpu_full_last_layer_from_resident_hidden_path() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_two_layer_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let _guard = lock_env();
+        let _env = ScopedEnvVars::set(&[
+            ("JENGINE_PACKED_ATTENTION_FULL", "1"),
+            ("JENGINE_PACKED_MLP_FULL", "1"),
+            ("JENGINE_GPU_ATTENTION_BLOCK", "1"),
+            ("JENGINE_GPU_SWIGLU_BLOCK", "1"),
+            ("JENGINE_GPU_FULL_LAST_LAYER", "1"),
+        ]);
+
+        let mut session = model.begin_packed_decode_session(2, true, true, true);
+        let _ = session
+            .push_prompt_token(2)
+            .expect("gpu full-last-layer token should decode from resident hidden path");
+
+        let PackedDecodeSession::GpuFirst(session) = session else {
+            panic!("gpu-first session should be selected when gpu full last layer is enabled");
+        };
+        assert!(session.inner.gpu_first_session.full_last_layer_block.is_some());
+        assert!(session.inner.cache[0].keys.is_empty());
+        assert!(session.inner.cache[0].values.is_empty());
+        assert!(session.inner.cache[1].keys.is_empty());
+        assert!(session.inner.cache[1].values.is_empty());
+        assert_eq!(
+            session
+                .inner
+                .gpu_first_session
+                .gpu_kv_caches
+                .get(&0)
+                .expect("layer 0 gpu kv cache should exist")
+                .len_tokens(),
+            1
+        );
+        assert_eq!(
+            session
+                .inner
+                .gpu_first_session
+                .gpu_kv_caches
+                .get(&1)
+                .expect("layer 1 gpu kv cache should exist")
+                .len_tokens(),
+            1
+        );
     }
 
     #[test]
