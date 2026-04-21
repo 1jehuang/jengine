@@ -633,6 +633,33 @@ impl<'a> GpuDecodeEngine<'a> {
         )
         .prefill_logits_from_token_ids(&prompt_ids)
     }
+
+    pub fn benchmark_step_from_token_ids(
+        &self,
+        prompt_ids: &[usize],
+    ) -> Result<PackedDecodeMetrics, ReferenceError> {
+        if prompt_ids.is_empty() {
+            return Err(ReferenceError::Decode(
+                "prompt_ids cannot be empty".to_string(),
+            ));
+        }
+
+        let total_started = Instant::now();
+        let mut session = self.begin_packed_session();
+        for (position, &token_id) in prompt_ids.iter().enumerate() {
+            debug_assert_eq!(position, session.next_position());
+            let _ = session.push_prompt_token(token_id)?;
+        }
+
+        Ok(session.finish_metrics(
+            crate::runtime::gpu_decode_env::packed_enabled_label(
+                self.request.use_attention_qkv,
+                self.request.use_mlp_gu,
+            ),
+            total_started.elapsed(),
+            String::new(),
+        ))
+    }
 }
 
 impl ReferenceModel {
@@ -646,6 +673,19 @@ impl ReferenceModel {
         Ok(self
             .generate_packed_greedy(prompt, max_new_tokens, use_attention_qkv, use_mlp_gu)?
             .metrics)
+    }
+
+    pub fn benchmark_packed_step_from_token_ids(
+        &self,
+        prompt_ids: &[usize],
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+    ) -> Result<PackedDecodeMetrics, ReferenceError> {
+        GpuDecodeEngine::new(
+            self,
+            PackedDecodeRequest::new(prompt_ids.len(), use_attention_qkv, use_mlp_gu, true),
+        )
+        .benchmark_step_from_token_ids(prompt_ids)
     }
 
     pub fn compare_prefill_logits_against(

@@ -6528,33 +6528,6 @@ impl ReferenceModel {
         Ok(metrics)
     }
 
-    pub fn benchmark_packed_step_from_token_ids(
-        &self,
-        prompt_ids: &[usize],
-        use_attention_qkv: bool,
-        use_mlp_gu: bool,
-    ) -> Result<PackedDecodeMetrics, ReferenceError> {
-        if prompt_ids.is_empty() {
-            return Err(ReferenceError::Decode(
-                "prompt_ids cannot be empty".to_string(),
-            ));
-        }
-
-        let total_started = Instant::now();
-        let mut session =
-            self.begin_packed_decode_session(prompt_ids.len(), use_attention_qkv, use_mlp_gu, true);
-        for (position, &token_id) in prompt_ids.iter().enumerate() {
-            debug_assert_eq!(position, session.next_position());
-            let _ = session.push_prompt_token(token_id)?;
-        }
-
-        Ok(session.finish_metrics(
-            packed_enabled_label(use_attention_qkv, use_mlp_gu),
-            total_started.elapsed(),
-            String::new(),
-        ))
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn benchmark_packed_prefill_chunk(
         &self,
