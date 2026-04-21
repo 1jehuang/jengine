@@ -245,18 +245,14 @@ impl CachedGpuFullLastLayerRunner {
                 self.final_norm_runner.output_buffer_size(),
             )
             .map_err(map_pack_f16_pairs_error)?;
-        let logits_report = self
+        let (argmax_index, logits_report) = self
             .logits_runner
-            .run_resident_from_packed_buffer(
+            .run_with_argmax_from_packed_buffer(
                 self.pack_runner.shared_context(),
                 self.pack_runner.output_buffer_handle(),
                 self.pack_runner.packed_len(),
                 self.pack_runner.output_buffer_size(),
             )
-            .map_err(map_packed_matvec_error)?;
-        let (argmax_index, logits_download_duration) = self
-            .logits_runner
-            .argmax_output()
             .map_err(map_packed_matvec_error)?;
 
         Ok(GpuFullLastLayerReport {
@@ -272,7 +268,7 @@ impl CachedGpuFullLastLayerRunner {
             final_norm_gpu_duration: final_norm_report.gpu_duration,
             pack_gpu_duration: pack_report.gpu_duration,
             logits_gpu_duration: logits_report.gpu_duration,
-            logits_download_duration,
+            logits_download_duration: logits_report.download_duration,
             argmax_index,
         })
     }
@@ -421,9 +417,14 @@ impl CachedGpuFullLastLayerRunner {
         }
         .map_err(|error| GpuFullLastLayerError(format!("vulkan fence wait failed: {error:?}")))?;
         let total_gpu_duration = gpu_started.elapsed();
-        let (argmax_index, logits_download_duration) = self
+        let (argmax_index, logits_report) = self
             .logits_runner
-            .argmax_output()
+            .run_with_argmax_from_packed_buffer(
+                self.pack_runner.shared_context(),
+                self.pack_runner.output_buffer_handle(),
+                self.pack_runner.packed_len(),
+                self.pack_runner.output_buffer_size(),
+            )
             .map_err(map_packed_matvec_error)?;
 
         Ok(GpuFullLastLayerReport {
@@ -439,7 +440,7 @@ impl CachedGpuFullLastLayerRunner {
             final_norm_gpu_duration: Duration::ZERO,
             pack_gpu_duration: Duration::ZERO,
             logits_gpu_duration: Duration::ZERO,
-            logits_download_duration,
+            logits_download_duration: logits_report.download_duration,
             argmax_index,
         })
     }
