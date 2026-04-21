@@ -39,6 +39,7 @@ pub struct CachedGpuAttentionBlockRunner {
     o_proj_runner: CachedGpuPackedMatvecRunner,
     residual_seed_runner: CachedGpuVectorAddRunner,
     add_runner: CachedGpuVectorAddRunner,
+    submit_fence: ash::vk::Fence,
 }
 
 impl CachedGpuAttentionBlockRunner {
@@ -74,8 +75,14 @@ impl CachedGpuAttentionBlockRunner {
         let (residual_seed_runner, residual_compile) =
             CachedGpuVectorAddRunner::new_with_context(context.clone(), hidden)
                 .map_err(map_vector_add_error)?;
-        let (add_runner, add_compile) = CachedGpuVectorAddRunner::new_with_context(context, hidden)
+        let (add_runner, add_compile) = CachedGpuVectorAddRunner::new_with_context(context.clone(), hidden)
             .map_err(map_vector_add_error)?;
+        let submit_fence = unsafe {
+            context
+                .device
+                .create_fence(&ash::vk::FenceCreateInfo::default(), None)
+        }
+        .map_err(|error| GpuAttentionBlockError(format!("vulkan fence creation failed: {error:?}")))?;
         Ok(Self {
             hidden,
             compile_duration: attention_compile + oproj_compile + residual_compile + add_compile,
@@ -83,6 +90,7 @@ impl CachedGpuAttentionBlockRunner {
             o_proj_runner,
             residual_seed_runner,
             add_runner,
+            submit_fence,
         })
     }
 
@@ -272,22 +280,19 @@ impl CachedGpuAttentionBlockRunner {
                 residual.len, self.hidden
             )));
         }
-        let attention_report = self
-            .attention_runner
-            .run_resident_from_query_and_kv_tensors(query, key, value)
+        self.attention_runner
+            .prepare_resident_from_query_and_kv_tensors(query, key, value)
             .map_err(map_attention_error)?;
-        let oproj_report = self
-            .o_proj_runner
-            .run_resident_from_f32_buffer(
+        self.o_proj_runner
+            .prepare_resident_from_f32_buffer(
                 self.attention_runner.shared_context(),
                 self.attention_runner.output_buffer_handle(),
                 self.hidden,
                 self.attention_runner.output_buffer_size(),
             )
             .map_err(map_packed_matvec_error)?;
-        let add_report = self
-            .add_runner
-            .run_resident_from_buffers(
+        self.add_runner
+            .prepare_resident_from_buffers(
                 self.o_proj_runner.shared_context(),
                 self.o_proj_runner.output_buffer_handle(),
                 self.hidden,
@@ -297,12 +302,43 @@ impl CachedGpuAttentionBlockRunner {
                 residual.buffer_size,
             )
             .map_err(map_vector_add_error)?;
+        let command_buffers = [
+            self.attention_runner.command_buffer_handle(),
+            self.o_proj_runner.command_buffer_handle(),
+            self.add_runner.command_buffer_handle(),
+        ];
+        let submit_info = [ash::vk::SubmitInfo::default().command_buffers(&command_buffers)];
+        let gpu_started = std::time::Instant::now();
+        unsafe {
+            self.attention_runner
+                .shared_context()
+                .device
+                .reset_fences(&[self.submit_fence])
+        }
+        .map_err(|error| GpuAttentionBlockError(format!("vulkan fence reset failed: {error:?}")))?;
+        unsafe {
+            self.attention_runner.shared_context().device.queue_submit(
+                self.attention_runner.shared_context().queue,
+                &submit_info,
+                self.submit_fence,
+            )
+        }
+        .map_err(|error| GpuAttentionBlockError(format!("vulkan queue submit failed: {error:?}")))?;
+        unsafe {
+            self.attention_runner.shared_context().device.wait_for_fences(
+                &[self.submit_fence],
+                true,
+                u64::MAX,
+            )
+        }
+        .map_err(|error| GpuAttentionBlockError(format!("vulkan fence wait failed: {error:?}")))?;
+        let total_gpu_duration = gpu_started.elapsed();
         Ok(GpuAttentionBlockReport {
             hidden: self.hidden,
             compile_duration: self.compile_duration,
-            attention_gpu_duration: attention_report.gpu_duration,
-            oproj_gpu_duration: oproj_report.gpu_duration,
-            residual_add_gpu_duration: add_report.gpu_duration,
+            attention_gpu_duration: total_gpu_duration,
+            oproj_gpu_duration: Duration::ZERO,
+            residual_add_gpu_duration: Duration::ZERO,
         })
     }
 
@@ -337,6 +373,17 @@ impl CachedGpuAttentionBlockRunner {
 
     pub fn hidden(&self) -> usize {
         self.hidden
+    }
+}
+
+impl Drop for CachedGpuAttentionBlockRunner {
+    fn drop(&mut self) {
+        unsafe {
+            self.attention_runner
+                .shared_context()
+                .device
+                .destroy_fence(self.submit_fence, None);
+        }
     }
 }
 
