@@ -541,6 +541,10 @@ impl<'a> PersistentPackedDecodeSession<'a> {
         self.use_mlp_full = use_mlp_full;
     }
 
+    pub(crate) fn next_position(&self) -> usize {
+        self.next_position
+    }
+
     pub fn push_prompt_token(
         &mut self,
         token_id: usize,
@@ -764,83 +768,6 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
             output_token_ids,
             output_text,
         )
-    }
-}
-
-pub enum PackedDecodeSession<'a> {
-    Legacy(PersistentPackedDecodeSession<'a>),
-    GpuFirst(GpuFirstPackedDecodeSession<'a>),
-}
-
-impl<'a> PackedDecodeSession<'a> {
-    pub fn push_prompt_token(
-        &mut self,
-        token_id: usize,
-    ) -> Result<PackedDecodeStepResult, ReferenceError> {
-        match self {
-            Self::Legacy(session) => session.push_prompt_token(token_id),
-            Self::GpuFirst(session) => session.push_prompt_token(token_id),
-        }
-    }
-
-    pub fn push_generated_token(
-        &mut self,
-        token_id: usize,
-    ) -> Result<PackedDecodeStepResult, ReferenceError> {
-        match self {
-            Self::Legacy(session) => session.push_generated_token(token_id),
-            Self::GpuFirst(session) => session.push_generated_token(token_id),
-        }
-    }
-
-    pub fn next_position(&self) -> usize {
-        match self {
-            Self::Legacy(session) => session.next_position,
-            Self::GpuFirst(session) => session.next_position(),
-        }
-    }
-
-    pub fn is_gpu_first(&self) -> bool {
-        matches!(self, Self::GpuFirst(_))
-    }
-
-    pub fn finish_metrics(
-        self,
-        enabled_projections: String,
-        total_duration: Duration,
-        output_text: String,
-    ) -> PackedDecodeMetrics {
-        match self {
-            Self::Legacy(session) => {
-                session.finish_metrics(enabled_projections, total_duration, output_text)
-            }
-            Self::GpuFirst(session) => {
-                session.finish_metrics(enabled_projections, total_duration, output_text)
-            }
-        }
-    }
-
-    pub fn finish_result(
-        self,
-        enabled_projections: String,
-        total_duration: Duration,
-        output_token_ids: Vec<usize>,
-        output_text: String,
-    ) -> PackedDecodeResult {
-        match self {
-            Self::Legacy(session) => session.finish_result(
-                enabled_projections,
-                total_duration,
-                output_token_ids,
-                output_text,
-            ),
-            Self::GpuFirst(session) => session.finish_result(
-                enabled_projections,
-                total_duration,
-                output_token_ids,
-                output_text,
-            ),
-        }
     }
 }
 
@@ -8493,7 +8420,8 @@ fn attention_single_query(
 
 #[cfg(test)]
 mod tests {
-    use super::{PackedDecodeSession, PackedDecodeStepResult, ReferenceModel};
+    use super::{PackedDecodeStepResult, ReferenceModel};
+    use crate::runtime::gpu_decode_engine::PackedDecodeSession;
     use crate::runtime::gpu_decode_env::{ScopedEnvVars, lock_env, packed_enabled_label};
     use crate::runtime::packed_model::write_packed_model_artifact;
     use half::f16;

@@ -1,7 +1,7 @@
 use crate::runtime::decode_plan::PackedDecodePlan;
 use crate::runtime::gpu_decode_env::{gpu_first_use_attention_full, gpu_first_use_mlp_full};
 use crate::runtime::reference::{
-    GpuFirstPackedDecodeSession, PackedDecodeSession, PersistentPackedDecodeSession,
+    GpuFirstPackedDecodeSession, PackedDecodeMetrics, PersistentPackedDecodeSession,
     ReferenceError, ReferenceModel,
 };
 
@@ -81,6 +81,83 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
             gpu_first_use_mlp_full(use_mlp_gu),
         );
         Self { inner }
+    }
+}
+
+pub enum PackedDecodeSession<'a> {
+    Legacy(PersistentPackedDecodeSession<'a>),
+    GpuFirst(GpuFirstPackedDecodeSession<'a>),
+}
+
+impl<'a> PackedDecodeSession<'a> {
+    pub fn push_prompt_token(
+        &mut self,
+        token_id: usize,
+    ) -> Result<crate::runtime::gpu_decode_session_state::PackedDecodeStepResult, ReferenceError> {
+        match self {
+            Self::Legacy(session) => session.push_prompt_token(token_id),
+            Self::GpuFirst(session) => session.push_prompt_token(token_id),
+        }
+    }
+
+    pub fn push_generated_token(
+        &mut self,
+        token_id: usize,
+    ) -> Result<crate::runtime::gpu_decode_session_state::PackedDecodeStepResult, ReferenceError> {
+        match self {
+            Self::Legacy(session) => session.push_generated_token(token_id),
+            Self::GpuFirst(session) => session.push_generated_token(token_id),
+        }
+    }
+
+    pub fn next_position(&self) -> usize {
+        match self {
+            Self::Legacy(session) => session.next_position(),
+            Self::GpuFirst(session) => session.next_position(),
+        }
+    }
+
+    pub fn is_gpu_first(&self) -> bool {
+        matches!(self, Self::GpuFirst(_))
+    }
+
+    pub fn finish_metrics(
+        self,
+        enabled_projections: String,
+        total_duration: std::time::Duration,
+        output_text: String,
+    ) -> PackedDecodeMetrics {
+        match self {
+            Self::Legacy(session) => {
+                session.finish_metrics(enabled_projections, total_duration, output_text)
+            }
+            Self::GpuFirst(session) => {
+                session.finish_metrics(enabled_projections, total_duration, output_text)
+            }
+        }
+    }
+
+    pub fn finish_result(
+        self,
+        enabled_projections: String,
+        total_duration: std::time::Duration,
+        output_token_ids: Vec<usize>,
+        output_text: String,
+    ) -> crate::runtime::gpu_decode_output::PackedDecodeResult {
+        match self {
+            Self::Legacy(session) => session.finish_result(
+                enabled_projections,
+                total_duration,
+                output_token_ids,
+                output_text,
+            ),
+            Self::GpuFirst(session) => session.finish_result(
+                enabled_projections,
+                total_duration,
+                output_token_ids,
+                output_text,
+            ),
+        }
     }
 }
 
