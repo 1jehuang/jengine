@@ -1872,7 +1872,11 @@ impl<'a> GpuFirstRunnerCache<'a> {
             let _ = self.ensure_qk_rope_runner()?;
             for layer_idx in 0..self.model.config.num_hidden_layers {
                 let _ = self.ensure_gpu_kv_cache(layer_idx)?;
-                let _ = self.ensure_attention_block(layer_idx, 1)?;
+                if ReferenceModel::packed_use_gpu_attention_block() {
+                    for seq_len in 1..=self.kv_capacity_tokens.max(1) {
+                        let _ = self.ensure_attention_block(layer_idx, seq_len)?;
+                    }
+                }
             }
         }
 
@@ -1892,7 +1896,9 @@ impl<'a> GpuFirstRunnerCache<'a> {
 
         if ReferenceModel::packed_use_gpu_full_last_layer() {
             let last_layer_idx = self.model.config.num_hidden_layers - 1;
-            let _ = self.ensure_attention_block(last_layer_idx, 1)?;
+            for seq_len in 1..=self.kv_capacity_tokens.max(1) {
+                let _ = self.ensure_attention_block(last_layer_idx, seq_len)?;
+            }
             let _ = self.ensure_full_last_layer_block()?;
         }
 
@@ -4145,6 +4151,23 @@ impl ReferenceModel {
         use_attention_full: bool,
         use_mlp_full: bool,
     ) -> Result<(), ReferenceError> {
+        self.prewarm_packed_decode_caches_with_expected_tokens(
+            1,
+            use_attention_qkv,
+            use_mlp_gu,
+            use_attention_full,
+            use_mlp_full,
+        )
+    }
+
+    pub fn prewarm_packed_decode_caches_with_expected_tokens(
+        &self,
+        expected_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        use_attention_full: bool,
+        use_mlp_full: bool,
+    ) -> Result<(), ReferenceError> {
         if self.packed_model.is_none() {
             return Ok(());
         }
@@ -4249,7 +4272,7 @@ impl ReferenceModel {
             self.config.hidden_size,
         )?;
         if Self::packed_use_gpu_first_session() {
-            let mut gpu_first_cache = GpuFirstRunnerCache::new(self, 1);
+            let mut gpu_first_cache = GpuFirstRunnerCache::new(self, expected_tokens.max(1));
             gpu_first_cache.prewarm_decode_path(use_attention_qkv, use_mlp_gu)?;
         }
         Ok(())

@@ -76,9 +76,15 @@ fn main() {
     if std::env::var_os("JENGINE_PREWARM_PACKED").is_some() {
         let use_attention_full = std::env::var_os("JENGINE_PACKED_ATTENTION_FULL").is_some();
         let use_mlp_full = std::env::var_os("JENGINE_PACKED_MLP_FULL").is_some();
+        let expected_tokens = packed
+            .prompt_analysis(&prompt)
+            .expect("prompt analysis should succeed")
+            .token_count
+            + max_new_tokens;
         run_stage("prewarm_packed", || {
             packed
-                .prewarm_packed_decode_caches(
+                .prewarm_packed_decode_caches_with_expected_tokens(
+                    expected_tokens,
                     use_attention_qkv,
                     use_mlp_gu,
                     use_attention_full,
