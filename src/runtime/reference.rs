@@ -27,6 +27,7 @@ use crate::runtime::gpu_decode_engine::{GpuDecodeEngine, PackedDecodeRequest};
 use crate::runtime::gpu_decode_metrics::{
     PackedAttentionStageMetrics, PackedGpuSessionMetrics, PackedMlpStageMetrics,
 };
+use crate::runtime::gpu_decode_model_state::{HybridQProjCache, LayerTensorNames};
 use crate::runtime::gpu_decode_projection_state::{
     PackedProjectionCache, PreparedProjectionRunner, ResidentGpuFinalNorm,
     ResidentGpuPackedActivation, ResidentGpuPackedActivationKeepalive, ResidentGpuSwigluCombined,
@@ -258,31 +259,6 @@ pub struct DecodeResult {
     pub output_token_ids: Vec<usize>,
     pub output_text: String,
     pub metrics: DecodeMetrics,
-}
-
-#[derive(Debug, Clone)]
-struct HybridQProjCache {
-    layer_idx: usize,
-    rows: usize,
-    cols: usize,
-    group_size: usize,
-    code_words: Vec<u32>,
-    scales: Vec<f32>,
-}
-
-#[derive(Debug, Clone)]
-struct LayerTensorNames {
-    input_layernorm_weight: String,
-    post_attention_layernorm_weight: String,
-    q_norm_weight: String,
-    k_norm_weight: String,
-    q_proj_weight: String,
-    k_proj_weight: String,
-    v_proj_weight: String,
-    o_proj_weight: String,
-    gate_proj_weight: String,
-    up_proj_weight: String,
-    down_proj_weight: String,
 }
 
 type CachedProjectionGpuRunner = Rc<RefCell<CachedGpuPackedMatvecRunner>>;
