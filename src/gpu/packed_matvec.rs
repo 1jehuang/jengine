@@ -2,6 +2,7 @@ use crate::gpu::resident_buffer::GpuResidentBuffer;
 use ash::util::read_spv;
 use ash::{Device, Entry, Instance, vk};
 use half::f16;
+use rayon::prelude::*;
 use std::ffi::{CStr, CString};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -1293,8 +1294,9 @@ fn read_f32_buffer(
             byte_len, buffer.size
         )));
     }
-    let mut out = vec![0.0f32; len];
+    let mut out = Vec::<f32>::with_capacity(len);
     unsafe {
+        out.set_len(len);
         std::ptr::copy_nonoverlapping(buffer.mapped_ptr as *const f32, out.as_mut_ptr(), len);
     }
     Ok(out)
@@ -1313,18 +1315,30 @@ fn argmax_f32_buffer(buffer: &BufferAllocation, len: usize) -> Result<usize, Gpu
             "argmax requires at least one output element".to_string(),
         ));
     }
-    let mut values = vec![0.0f32; len];
+    let mut values = Vec::<f32>::with_capacity(len);
     unsafe {
+        values.set_len(len);
         std::ptr::copy_nonoverlapping(buffer.mapped_ptr as *const f32, values.as_mut_ptr(), len);
     }
-    let mut best_index = 0usize;
-    let mut best_value = values[0];
-    for (index, value) in values.iter().enumerate().skip(1) {
-        if *value > best_value {
-            best_value = *value;
-            best_index = index;
+    if len < 16_384 {
+        let mut best_index = 0usize;
+        let mut best_value = values[0];
+        for (index, value) in values.iter().enumerate().skip(1) {
+            if *value > best_value {
+                best_value = *value;
+                best_index = index;
+            }
         }
+        return Ok(best_index);
     }
+    let (best_index, _) = values
+        .par_iter()
+        .enumerate()
+        .map(|(index, value)| (index, *value))
+        .reduce_with(|left, right| if right.1 > left.1 { right } else { left })
+        .ok_or_else(|| {
+            GpuPackedMatvecError::Shape("argmax requires at least one output element".to_string())
+        })?;
     Ok(best_index)
 }
 

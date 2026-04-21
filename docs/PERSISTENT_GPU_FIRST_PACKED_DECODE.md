@@ -106,19 +106,20 @@ The current bundled profiler script is:
 
 A fresh matrix capture was written to:
 
-- `.artifacts/gpu-first-matrix/20260420-235327/`
+- `.artifacts/gpu-first-matrix/20260421-000412/`
 
 with summary:
 
-- `strong_packed`: `380.334 ms` total, `193.555 ms` GPU, `69.244 ms` download, `14.629 ms` compile, `55.523 ms` non-offloaded dense, `226` dispatches
-- `gpu_full_last_layer`: `452.187 ms` total, `209.921 ms` GPU, `68.935 ms` download, `17.672 ms` compile, `94.777 ms` non-offloaded dense, `238` dispatches
-- `gpu_attention_swiglu_block`: `37737.417 ms` total, `1592.747 ms` GPU, `20.665 ms` download, `35621.795 ms` compile, `44.050 ms` non-offloaded dense, `58` dispatches
+- `strong_packed`: `426.096 ms` total, `199.039 ms` GPU, `34.196 ms` download, `45.452 ms` compile, `102.299 ms` non-offloaded dense, `226` dispatches
+- `gpu_full_last_layer`: `542.730 ms` total, `299.385 ms` GPU, `43.097 ms` download, `19.257 ms` compile, `106.955 ms` non-offloaded dense, `238` dispatches
+- `gpu_attention_swiglu_block`: `38444.302 ms` total, `2096.847 ms` GPU, `25.174 ms` download, `35840.335 ms` compile, `80.458 ms` non-offloaded dense, `58` dispatches
 
-This reinforces the current branch priority:
+Interpretation:
 
-- the broad attention+swiglu block path is still unusable
-- the strong packed baseline remains slightly ahead right now
-- the full-last-layer GPU-first branch is the viable branch to keep improving
+- the broad attention+swiglu block path remains unusable
+- the latest branch matrix is noisier than the previous checkpoint, but it still shows that the real remaining bottlenecks are not hot-path compile in the viable branches
+- the strongest recent localized win is on logits-side mapped-buffer handling: `argmax_f32_buffer` now copies into normal RAM and uses a parallel scan for large vocab buffers, which helps keep logits download/scan cost from dominating as badly as direct mapped-memory traversal
+- the practical next focus remains reducing CPU dense glue and dispatch count in the viable strong-packed and full-last-layer branches
 
 
 ## Current architecture
