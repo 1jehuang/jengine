@@ -401,23 +401,20 @@ impl CachedGpuVectorAddRunner {
         right_len: usize,
         right_buffer_size: u64,
     ) -> Result<GpuVectorAddReport, GpuVectorAddError> {
-        let left_copy_duration = self.copy_buffer_to_input(
+        let copy_duration = self.copy_buffers_to_inputs(
             source_context,
             left_buffer,
             left_len,
             left_buffer_size,
             self.left_buffer.buffer,
             self.left_buffer.size,
-        )?;
-        let right_copy_duration = self.copy_buffer_to_input(
-            source_context,
             right_buffer,
             right_len,
             right_buffer_size,
             self.right_buffer.buffer,
             self.right_buffer.size,
         )?;
-        let upload_duration = left_copy_duration + right_copy_duration;
+        let upload_duration = copy_duration;
         let gpu_duration = self.submit_and_wait()?;
         Ok(GpuVectorAddReport {
             len: self.len,
@@ -499,6 +496,79 @@ impl CachedGpuVectorAddRunner {
             let region = [vk::BufferCopy::default().size(byte_len as u64)];
             self.device
                 .cmd_copy_buffer(copy_command, source_buffer, destination_buffer, &region);
+            self.device.end_command_buffer(copy_command)?;
+            self.device.reset_fences(&[self.fence])?;
+        }
+        let submit_info =
+            [vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&copy_command))];
+        let started = Instant::now();
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &submit_info, self.fence)?;
+            self.device.wait_for_fences(&[self.fence], true, u64::MAX)?;
+            self.device
+                .free_command_buffers(self.command_pool, &[copy_command]);
+        }
+        Ok(started.elapsed())
+    }
+
+    fn copy_buffers_to_inputs(
+        &self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        left_source_buffer: vk::Buffer,
+        left_source_len: usize,
+        left_source_buffer_size: u64,
+        left_destination_buffer: vk::Buffer,
+        left_destination_buffer_size: u64,
+        right_source_buffer: vk::Buffer,
+        right_source_len: usize,
+        right_source_buffer_size: u64,
+        right_destination_buffer: vk::Buffer,
+        right_destination_buffer_size: u64,
+    ) -> Result<Duration, GpuVectorAddError> {
+        if left_source_len != self.len || right_source_len != self.len {
+            return Err(GpuVectorAddError::Shape(format!(
+                "source lens {}/{} do not match destination len {}",
+                left_source_len, right_source_len, self.len
+            )));
+        }
+        if !Arc::ptr_eq(&self._shared_context, source_context) {
+            return Err(GpuVectorAddError::Shape(
+                "resident chaining requires runners to share the same Vulkan context".to_string(),
+            ));
+        }
+        let byte_len = self.len * std::mem::size_of::<f32>();
+        if byte_len as u64 > left_source_buffer_size
+            || byte_len as u64 > left_destination_buffer_size
+            || byte_len as u64 > right_source_buffer_size
+            || byte_len as u64 > right_destination_buffer_size
+        {
+            return Err(GpuVectorAddError::Shape(format!(
+                "paired copy {} bytes exceeds one or more source/destination buffer sizes",
+                byte_len
+            )));
+        }
+        let alloc = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let copy_command = unsafe { self.device.allocate_command_buffers(&alloc)?[0] };
+        unsafe {
+            self.device
+                .begin_command_buffer(copy_command, &vk::CommandBufferBeginInfo::default())?;
+            let region = [vk::BufferCopy::default().size(byte_len as u64)];
+            self.device.cmd_copy_buffer(
+                copy_command,
+                left_source_buffer,
+                left_destination_buffer,
+                &region,
+            );
+            self.device.cmd_copy_buffer(
+                copy_command,
+                right_source_buffer,
+                right_destination_buffer,
+                &region,
+            );
             self.device.end_command_buffer(copy_command)?;
             self.device.reset_fences(&[self.fence])?;
         }
