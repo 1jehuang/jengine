@@ -7,6 +7,7 @@ use crate::runtime::gpu_decode_output::PackedDecodeResult;
 use crate::runtime::gpu_decode_session_state::{
     LayerCache, PackedDecodeStepResult, allocate_layer_cache_vec,
 };
+use crate::runtime::gpu_decode_state::PackedResidentDecodeState;
 use crate::runtime::reference::{GpuFirstRunnerCache, PackedGpuSession, ReferenceModel};
 use crate::runtime::reference_error::ReferenceError;
 
@@ -55,6 +56,7 @@ pub struct PersistentPackedDecodeSession<'a> {
     pub(crate) attention_stage_metrics: PackedAttentionStageMetrics,
     pub(crate) mlp_stage_metrics: PackedMlpStageMetrics,
     pub(crate) non_offloaded_dense_duration: std::time::Duration,
+    pub(crate) resident_decode_state: PackedResidentDecodeState,
     pub(crate) next_position: usize,
     pub(crate) use_attention_qkv: bool,
     pub(crate) use_mlp_gu: bool,
@@ -100,6 +102,7 @@ impl<'a> PersistentPackedDecodeSession<'a> {
             attention_stage_metrics: PackedAttentionStageMetrics::default(),
             mlp_stage_metrics: PackedMlpStageMetrics::default(),
             non_offloaded_dense_duration: std::time::Duration::ZERO,
+            resident_decode_state: PackedResidentDecodeState::default(),
             next_position: 0,
             use_attention_qkv,
             use_mlp_gu,
@@ -165,6 +168,7 @@ impl<'a> PersistentPackedDecodeSession<'a> {
             &mut self.attention_stage_metrics,
             &mut self.mlp_stage_metrics,
             &mut self.non_offloaded_dense_duration,
+            &mut self.resident_decode_state,
             &mut self.gpu_session,
             &mut self.gpu_first_session,
             self.use_attention_qkv,

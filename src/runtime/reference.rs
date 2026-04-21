@@ -8003,6 +8003,7 @@ impl ReferenceModel {
         attention_stage_metrics: &mut PackedAttentionStageMetrics,
         mlp_stage_metrics: &mut PackedMlpStageMetrics,
         non_offloaded_dense_duration: &mut Duration,
+        resident_decode_state: &mut PackedResidentDecodeState,
         session: &mut PackedGpuSession<'_>,
         gpu_first_session: &mut GpuFirstRunnerCache<'_>,
         use_attention_qkv: bool,
@@ -8024,7 +8025,7 @@ impl ReferenceModel {
         }
 
         let (cos, sin) = rope_cos_sin(&self.rope, &[position]);
-        let mut resident_decode_state = PackedResidentDecodeState::default();
+        *resident_decode_state = PackedResidentDecodeState::default();
 
         for (layer_idx, layer_cache) in cache
             .iter_mut()
@@ -8050,7 +8051,7 @@ impl ReferenceModel {
                 use_mlp_full,
                 argmax_only,
                 &mut hidden,
-                &mut resident_decode_state,
+                resident_decode_state,
             )? {
                 PackedDecodeLayerStepOutcome::Continue => {}
                 PackedDecodeLayerStepOutcome::NextToken(next_token) => {
