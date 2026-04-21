@@ -1599,6 +1599,18 @@ impl<'a> GpuFirstRunnerCache<'a> {
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         Ok((report.argmax_index, report, compile_duration))
     }
+
+    fn run_tail_argmax_from_host_hidden(
+        &mut self,
+        hidden_input: &[f32],
+        final_norm_weight: &[f32],
+    ) -> Result<(usize, GpuTailBlockReport, Duration), ReferenceError> {
+        let (compile_duration, tail_block) = self.ensure_tail_block()?;
+        let report = tail_block
+            .run_argmax(hidden_input, final_norm_weight)
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        Ok((report.argmax_index, report, compile_duration))
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -6367,6 +6379,19 @@ impl ReferenceModel {
                     + tail_report.logits_gpu_duration;
                 session.metrics.download_duration += tail_report.logits_download_duration;
                 next_token
+            } else if Self::packed_use_gpu_tail() {
+                let (next_token, tail_report, compile_duration) =
+                    gpu_first_session.run_tail_argmax_from_host_hidden(&hidden, &final_norm_weight)?;
+                metrics.norm_duration += norm_started.elapsed();
+                metrics.logits_duration += tail_report.pack_gpu_duration
+                    + tail_report.logits_gpu_duration
+                    + tail_report.logits_download_duration;
+                session.metrics.compile_duration += compile_duration;
+                session.metrics.gpu_duration += tail_report.final_norm_gpu_duration
+                    + tail_report.pack_gpu_duration
+                    + tail_report.logits_gpu_duration;
+                session.metrics.download_duration += tail_report.logits_download_duration;
+                next_token
             } else if Self::packed_use_gpu_final_norm() {
                 let final_norm = session.run_final_norm_resident(&hidden, &final_norm_weight)?;
                 metrics.norm_duration += norm_started.elapsed();
@@ -7334,6 +7359,30 @@ mod tests {
             panic!("gpu-first session should be selected when gpu mlp is enabled");
         };
         assert!(session.inner.gpu_first_session.mlp_blocks.contains_key(&0));
+    }
+
+    #[test]
+    fn runs_gpu_tail_block_without_resident_hidden_pipeline() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let model =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed-first model should load");
+        let _guard = lock_env();
+        let _env = ScopedEnvVars::set(&[("JENGINE_GPU_TAIL", "1")]);
+
+        let mut session = model.begin_packed_decode_session(2, true, true, true);
+        let _ = session
+            .push_prompt_token(2)
+            .expect("gpu tail token should decode");
+
+        let PackedDecodeSession::GpuFirst(session) = session else {
+            panic!("gpu-first session should be selected when gpu tail is enabled");
+        };
+        assert!(session.inner.gpu_first_session.tail_block.is_some());
     }
 
     #[test]
