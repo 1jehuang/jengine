@@ -222,6 +222,66 @@ impl<'a> GpuFirstPackedDecodeSession<'a> {
             output_text,
         )
     }
+
+    pub(crate) fn has_qk_rope_runner(&self) -> bool {
+        self.inner.gpu_first_session.has_qk_rope_runner()
+    }
+
+    pub(crate) fn has_raw_f32_projection_runner(&self, key: &str) -> bool {
+        self.inner
+            .gpu_first_session
+            .has_raw_f32_projection_runner(key)
+    }
+
+    pub(crate) fn gpu_kv_len_tokens(&self, layer_idx: usize) -> Option<usize> {
+        self.inner.gpu_first_session.gpu_kv_len_tokens(layer_idx)
+    }
+
+    pub(crate) fn cpu_kv_is_empty(&self, layer_idx: usize) -> Option<bool> {
+        self.inner
+            .cache
+            .get(layer_idx)
+            .map(|cache| cache.cpu_kv_is_empty())
+    }
+
+    pub(crate) fn cpu_kv_capacities(&self, layer_idx: usize) -> Option<(usize, usize)> {
+        self.inner
+            .cache
+            .get(layer_idx)
+            .map(|cache| (cache.keys_capacity(), cache.values_capacity()))
+    }
+
+    pub(crate) fn gpu_kv_snapshot_lengths(
+        &self,
+        layer_idx: usize,
+    ) -> Result<Option<(usize, usize)>, ReferenceError> {
+        self.inner
+            .gpu_first_session
+            .gpu_kv_snapshot_lengths(layer_idx)
+    }
+
+    pub(crate) fn has_attention_block(&self, layer_idx: usize) -> bool {
+        self.inner.gpu_first_session.has_attention_block(layer_idx)
+    }
+
+    pub(crate) fn has_mlp_block(&self, layer_idx: usize) -> bool {
+        self.inner.gpu_first_session.has_mlp_block(layer_idx)
+    }
+
+    pub(crate) fn has_tail_block(&self) -> bool {
+        self.inner.gpu_first_session.has_tail_block()
+    }
+
+    pub(crate) fn has_full_last_layer_block(&self) -> bool {
+        self.inner.gpu_first_session.has_full_last_layer_block()
+    }
+
+    pub(crate) fn embedding_lookup_output(
+        &mut self,
+        token_id: usize,
+    ) -> Result<Option<Vec<f32>>, ReferenceError> {
+        self.inner.gpu_first_session.embedding_lookup_output(token_id)
+    }
 }
 
 pub enum PackedDecodeSession<'a> {
