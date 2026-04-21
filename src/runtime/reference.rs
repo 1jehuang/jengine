@@ -23,7 +23,7 @@ use crate::model::config::{BonsaiModelConfig, GenerationConfig};
 use crate::model::tokenizer::{PromptAnalysis, TokenizerDiagnostics, TokenizerRuntime};
 use crate::runtime::assets::{AssetError, BonsaiAssetPaths};
 use crate::runtime::decode_plan::PackedDecodePlan;
-use crate::runtime::gpu_decode_engine::GpuDecodeEngine;
+use crate::runtime::gpu_decode_engine::{GpuDecodeEngine, PackedDecodeRequest};
 use crate::runtime::gpu_decode_state::{GpuKvBinding, GpuTailResult, GpuTailStepReport, ResidentHiddenState};
 use crate::runtime::packed_model::{PackedModelError, PackedModelStore};
 use crate::runtime::repack::{matvec_packed_ternary, pack_ternary_g128};
@@ -4524,10 +4524,12 @@ impl ReferenceModel {
     ) -> PackedDecodeSession<'_> {
         GpuDecodeEngine::new(
             self,
-            expected_tokens,
-            use_attention_qkv,
-            use_mlp_gu,
-            argmax_only,
+            PackedDecodeRequest {
+                expected_tokens,
+                use_attention_qkv,
+                use_mlp_gu,
+                argmax_only,
+            },
         )
         .begin_packed_session()
     }
