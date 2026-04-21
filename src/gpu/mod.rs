@@ -1,6 +1,7 @@
 pub mod fp16_matvec;
 pub mod pack_f16_pairs;
 pub mod packed_matvec;
+pub mod packed_pair_swiglu_pack;
 pub mod swiglu;
 pub mod swiglu_combined;
 pub mod swiglu_pack_f16_pairs;

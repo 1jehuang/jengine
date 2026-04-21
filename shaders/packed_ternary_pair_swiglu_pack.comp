@@ -1,0 +1,85 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer CodeBuffer {
+    uint code_words[];
+};
+
+layout(std430, binding = 1) readonly buffer ScaleBuffer {
+    float scales[];
+};
+
+layout(std430, binding = 2) readonly buffer VectorBuffer {
+    uint vector_data[];
+};
+
+layout(std430, binding = 3) writeonly buffer OutputBuffer {
+    uint output_data[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+    uint group_size;
+    uint packed_cols;
+} pc;
+
+float ternary_value(uint element_index) {
+    uint word_index = element_index / 16u;
+    uint bit_shift = (element_index % 16u) * 2u;
+    uint code = (code_words[word_index] >> bit_shift) & 0x3u;
+    float scale = scales[element_index / pc.group_size];
+    if (code == 1u) {
+        return scale;
+    }
+    if (code == 2u) {
+        return -scale;
+    }
+    return 0.0;
+}
+
+float row_dot(uint row) {
+    float sum = 0.0;
+    uint row_start = row * pc.cols;
+    for (uint pair_idx = 0u; pair_idx < pc.packed_cols; ++pair_idx) {
+        vec2 v = unpackHalf2x16(vector_data[pair_idx]);
+        uint col0 = pair_idx * 2u;
+        float m0 = ternary_value(row_start + col0);
+        sum += m0 * v.x;
+        if (col0 + 1u < pc.cols) {
+            float m1 = ternary_value(row_start + col0 + 1u);
+            sum += m1 * v.y;
+        }
+    }
+    return sum;
+}
+
+float sigmoid(float x) {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+void main() {
+    uint packed_row = gl_GlobalInvocationID.x;
+    uint packed_rows = (pc.rows + 1u) / 2u;
+    if (packed_row >= packed_rows) {
+        return;
+    }
+
+    uint row0 = packed_row * 2u;
+    uint row1 = row0 + 1u;
+    uint up_offset = pc.rows;
+
+    float gate0 = row_dot(row0);
+    float up0 = row_dot(row0 + up_offset);
+    float out0 = (gate0 * sigmoid(gate0)) * up0;
+
+    float out1 = 0.0;
+    if (row1 < pc.rows) {
+        float gate1 = row_dot(row1);
+        float up1 = row_dot(row1 + up_offset);
+        out1 = (gate1 * sigmoid(gate1)) * up1;
+    }
+
+    output_data[packed_row] = packHalf2x16(vec2(out0, out1));
+}
