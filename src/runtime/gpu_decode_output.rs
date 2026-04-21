@@ -1,5 +1,4 @@
-use crate::runtime::gpu_decode_metrics::PackedDecodeMetrics;
-use crate::runtime::reference::DecodeMetrics;
+use crate::runtime::gpu_decode_metrics::{DecodeMetrics, PackedDecodeMetrics};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct PackedDispatchTrace {
@@ -21,6 +20,13 @@ pub struct PackedDispatchTrace {
     pub weight_upload_bytes: usize,
     pub activation_upload_bytes: usize,
     pub download_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodeResult {
+    pub output_token_ids: Vec<usize>,
+    pub output_text: String,
+    pub metrics: DecodeMetrics,
 }
 
 #[derive(Debug, Clone, PartialEq)]

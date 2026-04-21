@@ -1,5 +1,6 @@
 use crate::model::tokenizer::PromptAnalysis;
-use crate::runtime::reference::{DecodeMetrics, MemoryReport};
+use crate::runtime::gpu_decode_metrics::DecodeMetrics;
+use crate::runtime::reference::MemoryReport;
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -239,7 +240,7 @@ fn csv_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{BenchIterationRecord, BenchReport};
-    use crate::runtime::reference::DecodeMetrics;
+    use crate::runtime::gpu_decode_metrics::DecodeMetrics;
     use std::time::Duration;
 
     #[test]

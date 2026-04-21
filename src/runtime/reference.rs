@@ -30,12 +30,14 @@ use crate::runtime::gpu_decode_env::{
     packed_use_gpu_tail, packed_use_mlp_full,
 };
 use crate::runtime::gpu_decode_metrics::{
-    AttentionProjectionMixMetrics, HybridProjectionDecodeMetrics, MlpProjectionMixMetrics,
-    PackedAttentionStageMetrics, PackedDecodeMetrics, PackedDecodeValidationReport,
-    PackedGpuSessionMetrics, PackedMlpStageMetrics,
+    AttentionProjectionMixMetrics, DecodeMetrics, HybridProjectionDecodeMetrics,
+    MlpProjectionMixMetrics, PackedAttentionStageMetrics, PackedDecodeMetrics,
+    PackedDecodeValidationReport, PackedGpuSessionMetrics, PackedMlpStageMetrics,
 };
 use crate::runtime::gpu_decode_model_state::{HybridQProjCache, LayerTensorNames};
-use crate::runtime::gpu_decode_output::{PackedDecodeResult, PackedDispatchTrace};
+use crate::runtime::gpu_decode_output::{
+    DecodeResult, PackedDecodeResult, PackedDispatchTrace,
+};
 use crate::runtime::gpu_decode_projection_state::{
     PackedProjectionCache, PreparedProjectionRunner, ResidentGpuFinalNorm,
     ResidentGpuPackedActivation, ResidentGpuPackedActivationKeepalive, ResidentGpuSwigluCombined,
@@ -167,49 +169,6 @@ impl ProjectionComparison {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct DecodeMetrics {
-    pub prompt_tokens: usize,
-    pub generated_tokens: usize,
-    pub total_duration: Duration,
-    pub embedding_duration: Duration,
-    pub norm_duration: Duration,
-    pub qkv_duration: Duration,
-    pub attention_duration: Duration,
-    pub mlp_duration: Duration,
-    pub logits_duration: Duration,
-}
-
-impl DecodeMetrics {
-    pub fn generated_tokens_per_second(&self) -> f64 {
-        let seconds = self.total_duration.as_secs_f64();
-        if self.generated_tokens == 0 || seconds <= f64::EPSILON {
-            0.0
-        } else {
-            self.generated_tokens as f64 / seconds
-        }
-    }
-
-    pub fn total_sequence_tokens(&self) -> usize {
-        self.prompt_tokens + self.generated_tokens
-    }
-
-    pub fn summarize(&self) -> String {
-        format!(
-            "prompt_tokens={} generated_tokens={} total_ms={:.3} embed_ms={:.3} norm_ms={:.3} qkv_ms={:.3} attention_ms={:.3} mlp_ms={:.3} logits_ms={:.3}",
-            self.prompt_tokens,
-            self.generated_tokens,
-            self.total_duration.as_secs_f64() * 1_000.0,
-            self.embedding_duration.as_secs_f64() * 1_000.0,
-            self.norm_duration.as_secs_f64() * 1_000.0,
-            self.qkv_duration.as_secs_f64() * 1_000.0,
-            self.attention_duration.as_secs_f64() * 1_000.0,
-            self.mlp_duration.as_secs_f64() * 1_000.0,
-            self.logits_duration.as_secs_f64() * 1_000.0,
-        )
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryReport {
     pub prompt_tokens: usize,
@@ -260,13 +219,6 @@ impl MemoryReport {
             human_bytes(self.estimated_runtime_working_set_bytes),
         )
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct DecodeResult {
-    pub output_token_ids: Vec<usize>,
-    pub output_text: String,
-    pub metrics: DecodeMetrics,
 }
 
 type CachedProjectionGpuRunner = Rc<RefCell<CachedGpuPackedMatvecRunner>>;
