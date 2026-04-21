@@ -5259,6 +5259,89 @@ impl ReferenceModel {
         residual_elapsed
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn finish_argmax_tail_result(
+        &self,
+        gpu_first_session: &mut GpuFirstRunnerCache<'_>,
+        session: &mut PackedGpuSession<'_>,
+        hidden: &[f32],
+        final_hidden_gpu: Option<&ResidentGpuVectorAdd>,
+        metrics: &mut DecodeMetrics,
+        non_offloaded_dense_duration: &mut Duration,
+    ) -> Result<usize, ReferenceError> {
+        let norm_started = Instant::now();
+        let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
+        let next_token = if let Some(hidden_gpu) = final_hidden_gpu {
+            let (tail_result, tail_report, compile_duration) =
+                gpu_first_session.run_tail_from_resident_hidden(
+                    &hidden_gpu.tensor,
+                    &final_norm_weight,
+                    true,
+                )?;
+            let next_token = match tail_result {
+                GpuTailResult::NextToken(token_id) => token_id,
+                GpuTailResult::Logits(_) => unreachable!("argmax-only tail should return a token"),
+            };
+            metrics.norm_duration += norm_started.elapsed();
+            metrics.logits_duration += tail_report.pack_gpu_duration
+                + tail_report.logits_gpu_duration
+                + tail_report.logits_download_duration;
+            session.metrics.compile_duration += hidden_gpu.compile_duration + compile_duration;
+            session.metrics.gpu_duration += hidden_gpu.report.gpu_duration
+                + tail_report.final_norm_gpu_duration
+                + tail_report.pack_gpu_duration
+                + tail_report.logits_gpu_duration;
+            session.metrics.download_duration += tail_report.logits_download_duration;
+            next_token
+        } else if packed_use_gpu_tail() {
+            let (tail_result, tail_report, compile_duration) =
+                gpu_first_session.run_tail_from_host_hidden(hidden, &final_norm_weight, true)?;
+            let next_token = match tail_result {
+                GpuTailResult::NextToken(token_id) => token_id,
+                GpuTailResult::Logits(_) => unreachable!("argmax-only tail should return a token"),
+            };
+            metrics.norm_duration += norm_started.elapsed();
+            metrics.logits_duration += tail_report.pack_gpu_duration
+                + tail_report.logits_gpu_duration
+                + tail_report.logits_download_duration;
+            session.metrics.compile_duration += compile_duration;
+            session.metrics.gpu_duration += tail_report.final_norm_gpu_duration
+                + tail_report.pack_gpu_duration
+                + tail_report.logits_gpu_duration;
+            session.metrics.download_duration += tail_report.logits_download_duration;
+            next_token
+        } else if packed_use_gpu_final_norm() {
+            let final_norm = session.run_final_norm_resident(hidden, &final_norm_weight)?;
+            metrics.norm_duration += norm_started.elapsed();
+            let logits_started = Instant::now();
+            let packed_activation = session.run_pack_f16_pairs_resident(final_norm)?;
+            let next_token = session.run_projection_argmax_from_packed_activation(
+                "model.embed_tokens.weight",
+                self.config.vocab_size,
+                self.config.hidden_size,
+                packed_activation,
+            )?;
+            metrics.logits_duration += logits_started.elapsed();
+            next_token
+        } else {
+            let hidden = weighted_rms_norm(hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
+            let norm_elapsed = norm_started.elapsed();
+            metrics.norm_duration += norm_elapsed;
+            *non_offloaded_dense_duration += norm_elapsed;
+            session.push_dense_stage_trace("final_norm", "model.norm.weight", norm_elapsed);
+            let logits_started = Instant::now();
+            let next_token = session.run_projection_argmax(
+                "model.embed_tokens.weight",
+                self.config.vocab_size,
+                self.config.hidden_size,
+                &hidden,
+            )?;
+            metrics.logits_duration += logits_started.elapsed();
+            next_token
+        };
+        Ok(next_token)
+    }
+
     fn encode_prompt_ids(
         &self,
         tokenizer: &TokenizerRuntime,
@@ -7948,77 +8031,14 @@ impl ReferenceModel {
         }
 
         let result = if argmax_only {
-            let norm_started = Instant::now();
-            let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
-            let next_token = if let Some(hidden_gpu) = final_hidden_gpu {
-                let (tail_result, tail_report, compile_duration) = gpu_first_session
-                    .run_tail_from_resident_hidden(&hidden_gpu.tensor, &final_norm_weight, true)?;
-                let next_token = match tail_result {
-                    GpuTailResult::NextToken(token_id) => token_id,
-                    GpuTailResult::Logits(_) => {
-                        unreachable!("argmax-only tail should return a token")
-                    }
-                };
-                metrics.norm_duration += norm_started.elapsed();
-                metrics.logits_duration += tail_report.pack_gpu_duration
-                    + tail_report.logits_gpu_duration
-                    + tail_report.logits_download_duration;
-                session.metrics.compile_duration += hidden_gpu.compile_duration + compile_duration;
-                session.metrics.gpu_duration += hidden_gpu.report.gpu_duration
-                    + tail_report.final_norm_gpu_duration
-                    + tail_report.pack_gpu_duration
-                    + tail_report.logits_gpu_duration;
-                session.metrics.download_duration += tail_report.logits_download_duration;
-                next_token
-            } else if packed_use_gpu_tail() {
-                let (tail_result, tail_report, compile_duration) = gpu_first_session
-                    .run_tail_from_host_hidden(&hidden, &final_norm_weight, true)?;
-                let next_token = match tail_result {
-                    GpuTailResult::NextToken(token_id) => token_id,
-                    GpuTailResult::Logits(_) => {
-                        unreachable!("argmax-only tail should return a token")
-                    }
-                };
-                metrics.norm_duration += norm_started.elapsed();
-                metrics.logits_duration += tail_report.pack_gpu_duration
-                    + tail_report.logits_gpu_duration
-                    + tail_report.logits_download_duration;
-                session.metrics.compile_duration += compile_duration;
-                session.metrics.gpu_duration += tail_report.final_norm_gpu_duration
-                    + tail_report.pack_gpu_duration
-                    + tail_report.logits_gpu_duration;
-                session.metrics.download_duration += tail_report.logits_download_duration;
-                next_token
-            } else if packed_use_gpu_final_norm() {
-                let final_norm = session.run_final_norm_resident(&hidden, &final_norm_weight)?;
-                metrics.norm_duration += norm_started.elapsed();
-                let logits_started = Instant::now();
-                let packed_activation = session.run_pack_f16_pairs_resident(final_norm)?;
-                let next_token = session.run_projection_argmax_from_packed_activation(
-                    "model.embed_tokens.weight",
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                    packed_activation,
-                )?;
-                metrics.logits_duration += logits_started.elapsed();
-                next_token
-            } else {
-                let hidden =
-                    weighted_rms_norm(&hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
-                let norm_elapsed = norm_started.elapsed();
-                metrics.norm_duration += norm_elapsed;
-                *non_offloaded_dense_duration += norm_elapsed;
-                session.push_dense_stage_trace("final_norm", "model.norm.weight", norm_elapsed);
-                let logits_started = Instant::now();
-                let next_token = session.run_projection_argmax(
-                    "model.embed_tokens.weight",
-                    self.config.vocab_size,
-                    self.config.hidden_size,
-                    &hidden,
-                )?;
-                metrics.logits_duration += logits_started.elapsed();
-                next_token
-            };
+            let next_token = self.finish_argmax_tail_result(
+                gpu_first_session,
+                session,
+                &hidden,
+                final_hidden_gpu.as_ref(),
+                metrics,
+                non_offloaded_dense_duration,
+            )?;
             PackedDecodeStepResult::NextToken(next_token)
         } else {
             let norm_started = Instant::now();
