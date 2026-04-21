@@ -4222,12 +4222,30 @@ impl ReferenceModel {
             1,
             use_attention_qkv,
             use_mlp_gu,
-            use_attention_full,
-            use_mlp_full,
+            false,
         )
     }
 
     pub fn prewarm_packed_decode_caches_with_expected_tokens(
+        &self,
+        expected_tokens: usize,
+        use_attention_qkv: bool,
+        use_mlp_gu: bool,
+        argmax_only: bool,
+    ) -> Result<(), ReferenceError> {
+        GpuDecodeEngine::new(
+            self,
+            PackedDecodeRequest {
+                expected_tokens,
+                use_attention_qkv,
+                use_mlp_gu,
+                argmax_only,
+            },
+        )
+        .prewarm()
+    }
+
+    pub(crate) fn prewarm_packed_decode_caches_internal(
         &self,
         expected_tokens: usize,
         use_attention_qkv: bool,

@@ -48,7 +48,7 @@ impl<'a> GpuDecodeEngine<'a> {
     }
 
     pub fn prewarm(&self) -> Result<(), crate::runtime::reference::ReferenceError> {
-        self.model.prewarm_packed_decode_caches_with_expected_tokens(
+        self.model.prewarm_packed_decode_caches_internal(
             self.request.expected_tokens,
             self.request.use_attention_qkv,
             self.request.use_mlp_gu,
