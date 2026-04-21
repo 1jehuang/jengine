@@ -16,7 +16,9 @@ use crate::gpu::qk_rope::{CachedGpuQkRopeRunner, GpuQkRopeReport};
 use crate::gpu::resident_buffer::GpuResidentBuffer;
 use crate::gpu::swiglu_combined::CachedGpuSwigluCombinedRunner;
 use crate::gpu::swiglu_pack_f16_pairs::CachedGpuSwigluPackF16PairsRunner;
-use crate::gpu::tail_block::{CachedGpuTailBlockRunner, GpuTailBlockReport};
+use crate::gpu::tail_block::{
+    CachedGpuTailBlockRunner, GpuTailBlockLogitsReport, GpuTailBlockReport,
+};
 use crate::gpu::vector_add::CachedGpuVectorAddRunner;
 use crate::gpu::weighted_rms_norm::{CachedGpuWeightedRmsNormRunner, GpuWeightedRmsNormReport};
 use crate::model::config::{BonsaiModelConfig, GenerationConfig};
@@ -2134,6 +2136,30 @@ impl<'a> GpuFirstRunnerCache<'a> {
             .run_argmax(hidden_input, final_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         Ok((report.argmax_index, report, compile_duration))
+    }
+
+    fn run_tail_logits_from_resident_hidden(
+        &mut self,
+        source: &GpuResidentBuffer,
+        final_norm_weight: &[f32],
+    ) -> Result<(Vec<f32>, GpuTailBlockLogitsReport, Duration), ReferenceError> {
+        let (compile_duration, tail_block) = self.ensure_tail_block()?;
+        let (logits, report) = tail_block
+            .run_logits_from_resident_tensor(source, final_norm_weight)
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        Ok((logits, report, compile_duration))
+    }
+
+    fn run_tail_logits_from_host_hidden(
+        &mut self,
+        hidden_input: &[f32],
+        final_norm_weight: &[f32],
+    ) -> Result<(Vec<f32>, GpuTailBlockLogitsReport, Duration), ReferenceError> {
+        let (compile_duration, tail_block) = self.ensure_tail_block()?;
+        let (logits, report) = tail_block
+            .run_logits(hidden_input, final_norm_weight)
+            .map_err(|error| ReferenceError::Decode(error.to_string()))?;
+        Ok((logits, report, compile_duration))
     }
 }
 
@@ -7128,22 +7154,58 @@ impl ReferenceModel {
         } else {
             let norm_started = Instant::now();
             let final_norm_weight = self.load_vector_f32_resolved("model.norm.weight")?;
-            let hidden =
-                weighted_rms_norm(&hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
-            let norm_elapsed = norm_started.elapsed();
-            metrics.norm_duration += norm_elapsed;
-            *non_offloaded_dense_duration += norm_elapsed;
-            session.push_dense_stage_trace("final_norm", "model.norm.weight", norm_elapsed);
-            let logits_started = Instant::now();
-            let logits = self.matvec_f16_resolved("model.embed_tokens.weight", &hidden)?;
-            let logits_elapsed = logits_started.elapsed();
-            metrics.logits_duration += logits_elapsed;
-            *non_offloaded_dense_duration += logits_elapsed;
-            session.push_dense_stage_trace(
-                "logits_dense",
-                "model.embed_tokens.weight",
-                logits_elapsed,
-            );
+            let logits = if let Some(hidden_gpu) = final_hidden_gpu {
+                let hidden_gpu_output = GpuResidentBuffer::new(
+                    hidden_gpu.runner.borrow().shared_context().clone(),
+                    hidden_gpu.runner.borrow().output_buffer_handle(),
+                    hidden_gpu.runner.borrow().len(),
+                    hidden_gpu.runner.borrow().output_buffer_size(),
+                );
+                let (logits, tail_report, compile_duration) = gpu_first_session
+                    .run_tail_logits_from_resident_hidden(&hidden_gpu_output, &final_norm_weight)?;
+                metrics.norm_duration += norm_started.elapsed();
+                metrics.logits_duration += tail_report.pack_gpu_duration
+                    + tail_report.logits_gpu_duration
+                    + tail_report.logits_download_duration;
+                session.metrics.compile_duration += hidden_gpu.compile_duration + compile_duration;
+                session.metrics.gpu_duration += hidden_gpu.report.gpu_duration
+                    + tail_report.final_norm_gpu_duration
+                    + tail_report.pack_gpu_duration
+                    + tail_report.logits_gpu_duration;
+                session.metrics.download_duration += tail_report.logits_download_duration;
+                logits
+            } else if Self::packed_use_gpu_tail() {
+                let (logits, tail_report, compile_duration) =
+                    gpu_first_session.run_tail_logits_from_host_hidden(&hidden, &final_norm_weight)?;
+                metrics.norm_duration += norm_started.elapsed();
+                metrics.logits_duration += tail_report.pack_gpu_duration
+                    + tail_report.logits_gpu_duration
+                    + tail_report.logits_download_duration;
+                session.metrics.compile_duration += compile_duration;
+                session.metrics.gpu_duration += tail_report.final_norm_gpu_duration
+                    + tail_report.pack_gpu_duration
+                    + tail_report.logits_gpu_duration;
+                session.metrics.download_duration += tail_report.logits_download_duration;
+                logits
+            } else {
+                let hidden =
+                    weighted_rms_norm(&hidden, &final_norm_weight, self.config.rms_norm_eps as f32);
+                let norm_elapsed = norm_started.elapsed();
+                metrics.norm_duration += norm_elapsed;
+                *non_offloaded_dense_duration += norm_elapsed;
+                session.push_dense_stage_trace("final_norm", "model.norm.weight", norm_elapsed);
+                let logits_started = Instant::now();
+                let logits = self.matvec_f16_resolved("model.embed_tokens.weight", &hidden)?;
+                let logits_elapsed = logits_started.elapsed();
+                metrics.logits_duration += logits_elapsed;
+                *non_offloaded_dense_duration += logits_elapsed;
+                session.push_dense_stage_trace(
+                    "logits_dense",
+                    "model.embed_tokens.weight",
+                    logits_elapsed,
+                );
+                logits
+            };
             PackedDecodeStepResult::Logits(logits)
         };
         Ok(result)
@@ -8493,6 +8555,27 @@ mod tests {
         assert_eq!(attention.max_abs_diff, 0.0);
         assert_eq!(mlp.max_abs_diff, 0.0);
         assert_eq!(combined.max_abs_diff, 0.0);
+    }
+
+    #[test]
+    fn compares_prefill_logits_with_gpu_tail_against_dense_reference() {
+        let dir = tempdir().expect("tempdir should be created");
+        write_synthetic_model(dir.path());
+        let artifact_dir = tempdir().expect("artifact dir should be created");
+        write_packed_model_artifact(dir.path(), artifact_dir.path())
+            .expect("packed artifact should be written");
+        let dense = ReferenceModel::load_from_root(dir.path()).expect("dense model should load");
+        let packed =
+            ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
+                .expect("packed model should load");
+        let _guard = lock_env();
+        let _env = ScopedEnvVars::set(&[("JENGINE_GPU_TAIL", "1")]);
+
+        let report = packed
+            .compare_prefill_logits_against(&dense, "tok2", true, true)
+            .expect("gpu tail logits validation should succeed");
+
+        assert_eq!(report.max_abs_diff, 0.0);
     }
 
     #[test]

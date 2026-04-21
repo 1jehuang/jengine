@@ -21,6 +21,17 @@ pub struct GpuTailBlockReport {
     pub argmax_index: usize,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuTailBlockLogitsReport {
+    pub hidden: usize,
+    pub vocab: usize,
+    pub compile_duration: Duration,
+    pub final_norm_gpu_duration: Duration,
+    pub pack_gpu_duration: Duration,
+    pub logits_gpu_duration: Duration,
+    pub logits_download_duration: Duration,
+}
+
 #[derive(Debug)]
 pub struct GpuTailBlockError(String);
 
@@ -122,6 +133,56 @@ impl CachedGpuTailBlockRunner {
         })
     }
 
+    pub fn run_logits(
+        &mut self,
+        hidden_input: &[f32],
+        final_norm_weight: &[f32],
+    ) -> Result<(Vec<f32>, GpuTailBlockLogitsReport), GpuTailBlockError> {
+        if hidden_input.len() != self.hidden || final_norm_weight.len() != self.hidden {
+            return Err(GpuTailBlockError(
+                "tail block host inputs must match hidden size".to_string(),
+            ));
+        }
+        let final_norm_report = self
+            .final_norm_runner
+            .run_resident(hidden_input, final_norm_weight)
+            .map_err(map_weighted_rms_norm_error)?;
+        let pack_report = self
+            .pack_runner
+            .run_resident_from_f32_buffer(
+                self.final_norm_runner.shared_context(),
+                self.final_norm_runner.output_buffer_handle(),
+                self.hidden,
+                self.final_norm_runner.output_buffer_size(),
+            )
+            .map_err(map_pack_f16_pairs_error)?;
+        let logits_report = self
+            .logits_runner
+            .run_resident_from_packed_buffer(
+                self.pack_runner.shared_context(),
+                self.pack_runner.output_buffer_handle(),
+                self.pack_runner.packed_len(),
+                self.pack_runner.output_buffer_size(),
+            )
+            .map_err(map_packed_matvec_error)?;
+        let (logits, logits_download_duration) = self
+            .logits_runner
+            .read_output()
+            .map_err(map_packed_matvec_error)?;
+        Ok((
+            logits,
+            GpuTailBlockLogitsReport {
+                hidden: self.hidden,
+                vocab: self.vocab,
+                compile_duration: self.compile_duration,
+                final_norm_gpu_duration: final_norm_report.gpu_duration,
+                pack_gpu_duration: pack_report.gpu_duration,
+                logits_gpu_duration: logits_report.gpu_duration,
+                logits_download_duration,
+            },
+        ))
+    }
+
     pub fn run_argmax_from_resident_hidden(
         &mut self,
         source_context: &Arc<SharedGpuPackedContext>,
@@ -179,12 +240,85 @@ impl CachedGpuTailBlockRunner {
         })
     }
 
+    pub fn run_logits_from_resident_hidden(
+        &mut self,
+        source_context: &Arc<SharedGpuPackedContext>,
+        source_buffer: ash::vk::Buffer,
+        source_len: usize,
+        source_buffer_size: u64,
+        final_norm_weight: &[f32],
+    ) -> Result<(Vec<f32>, GpuTailBlockLogitsReport), GpuTailBlockError> {
+        if source_len != self.hidden || final_norm_weight.len() != self.hidden {
+            return Err(GpuTailBlockError(
+                "tail block resident inputs must match hidden size".to_string(),
+            ));
+        }
+        let final_norm_report = self
+            .final_norm_runner
+            .run_resident_from_f32_buffer(
+                source_context,
+                source_buffer,
+                source_len,
+                source_buffer_size,
+                final_norm_weight,
+            )
+            .map_err(map_weighted_rms_norm_error)?;
+        let pack_report = self
+            .pack_runner
+            .run_resident_from_f32_buffer(
+                self.final_norm_runner.shared_context(),
+                self.final_norm_runner.output_buffer_handle(),
+                self.hidden,
+                self.final_norm_runner.output_buffer_size(),
+            )
+            .map_err(map_pack_f16_pairs_error)?;
+        let logits_report = self
+            .logits_runner
+            .run_resident_from_packed_buffer(
+                self.pack_runner.shared_context(),
+                self.pack_runner.output_buffer_handle(),
+                self.pack_runner.packed_len(),
+                self.pack_runner.output_buffer_size(),
+            )
+            .map_err(map_packed_matvec_error)?;
+        let (logits, logits_download_duration) = self
+            .logits_runner
+            .read_output()
+            .map_err(map_packed_matvec_error)?;
+        Ok((
+            logits,
+            GpuTailBlockLogitsReport {
+                hidden: self.hidden,
+                vocab: self.vocab,
+                compile_duration: self.compile_duration,
+                final_norm_gpu_duration: final_norm_report.gpu_duration,
+                pack_gpu_duration: pack_report.gpu_duration,
+                logits_gpu_duration: logits_report.gpu_duration,
+                logits_download_duration,
+            },
+        ))
+    }
+
     pub fn run_argmax_from_resident_tensor(
         &mut self,
         source: &GpuResidentBuffer,
         final_norm_weight: &[f32],
     ) -> Result<GpuTailBlockReport, GpuTailBlockError> {
         self.run_argmax_from_resident_hidden(
+            &source.shared_context,
+            source.buffer,
+            source.len,
+            source.buffer_size,
+            final_norm_weight,
+        )
+    }
+
+    pub fn run_logits_from_resident_tensor(
+        &mut self,
+        source: &GpuResidentBuffer,
+        final_norm_weight: &[f32],
+    ) -> Result<(Vec<f32>, GpuTailBlockLogitsReport), GpuTailBlockError> {
+        self.run_logits_from_resident_hidden(
             &source.shared_context,
             source.buffer,
             source.len,
