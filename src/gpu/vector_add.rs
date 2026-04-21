@@ -1,3 +1,4 @@
+use crate::gpu::resident_buffer::GpuResidentBuffer;
 use ash::util::read_spv;
 use ash::{Device, Instance, vk};
 use std::ffi::CString;
@@ -522,6 +523,15 @@ impl CachedGpuVectorAddRunner {
         let download_started = Instant::now();
         let output = read_f32_buffer(&self.output_buffer, self.len)?;
         Ok((output, download_started.elapsed()))
+    }
+
+    pub fn resident_output(&self) -> GpuResidentBuffer {
+        GpuResidentBuffer::new(
+            self.shared_context().clone(),
+            self.output_buffer_handle(),
+            self.len(),
+            self.output_buffer_size(),
+        )
     }
 
     pub fn output_buffer_handle(&self) -> vk::Buffer {

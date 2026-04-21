@@ -9,6 +9,7 @@ use crate::gpu::packed_matvec::{
     CachedGpuPackedMatvecRunner, GpuPackedMatvecError, PackedRunnerInputMode,
     SharedGpuPackedContext,
 };
+use crate::gpu::resident_buffer::GpuResidentBuffer;
 use crate::gpu::vector_add::{CachedGpuVectorAddRunner, GpuVectorAddError};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -223,6 +224,15 @@ impl CachedGpuAttentionBlockRunner {
 
     pub fn output_buffer_size(&self) -> u64 {
         self.add_runner.output_buffer_size()
+    }
+
+    pub fn resident_output(&self) -> GpuResidentBuffer {
+        GpuResidentBuffer::new(
+            self.shared_context().clone(),
+            self.output_buffer_handle(),
+            self.hidden(),
+            self.output_buffer_size(),
+        )
     }
 
     pub fn hidden(&self) -> usize {

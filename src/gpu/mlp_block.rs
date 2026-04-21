@@ -6,6 +6,7 @@ use crate::gpu::packed_matvec::{
     CachedGpuPackedMatvecRunner, GpuPackedMatvecError, PackedRunnerInputMode,
     SharedGpuPackedContext,
 };
+use crate::gpu::resident_buffer::GpuResidentBuffer;
 use crate::gpu::swiglu_pack_f16_pairs::{
     CachedGpuSwigluPackF16PairsRunner, GpuSwigluPackF16PairsError,
 };
@@ -249,6 +250,20 @@ impl CachedGpuMlpBlockRunner {
         })
     }
 
+    pub fn run_from_resident_tensor(
+        &mut self,
+        source: &GpuResidentBuffer,
+        post_norm_weight: &[f32],
+    ) -> Result<GpuMlpBlockReport, GpuMlpBlockError> {
+        self.run_from_resident_residual(
+            &source.shared_context,
+            source.buffer,
+            source.len,
+            source.buffer_size,
+            post_norm_weight,
+        )
+    }
+
     pub fn compile_duration(&self) -> Duration {
         self.compile_duration
     }
@@ -263,6 +278,15 @@ impl CachedGpuMlpBlockRunner {
 
     pub fn output_buffer_size(&self) -> u64 {
         self.add_runner.output_buffer_size()
+    }
+
+    pub fn resident_output(&self) -> GpuResidentBuffer {
+        GpuResidentBuffer::new(
+            self.shared_context().clone(),
+            self.output_buffer_handle(),
+            self.hidden(),
+            self.output_buffer_size(),
+        )
     }
 
     pub fn hidden(&self) -> usize {

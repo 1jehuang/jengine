@@ -1416,20 +1416,11 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 .run_resident(q, keys, values, residual)
                 .map_err(|error| ReferenceError::Decode(error.to_string()))?
         };
-        let attention_context = attention_block.shared_context().clone();
-        let attention_output = attention_block.output_buffer_handle();
-        let attention_output_size = attention_block.output_buffer_size();
-        let attention_hidden = attention_block.hidden();
+        let attention_output = attention_block.resident_output();
 
         let (mlp_compile_duration, mlp_block) = self.ensure_mlp_block(layer_idx)?;
         let mlp_report = mlp_block
-            .run_from_resident_residual(
-                &attention_context,
-                attention_output,
-                attention_hidden,
-                attention_output_size,
-                post_norm_weight,
-            )
+            .run_from_resident_tensor(&attention_output, post_norm_weight)
             .map_err(|error| ReferenceError::Decode(error.to_string()))?;
         let (hidden, download_duration) = mlp_block
             .read_output()
