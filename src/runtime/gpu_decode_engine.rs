@@ -47,6 +47,16 @@ impl<'a> GpuDecodeEngine<'a> {
         }
     }
 
+    pub fn prewarm(&self) -> Result<(), crate::runtime::reference::ReferenceError> {
+        self.model.prewarm_packed_decode_caches_with_expected_tokens(
+            self.request.expected_tokens,
+            self.request.use_attention_qkv,
+            self.request.use_mlp_gu,
+            self.plan.use_attention_full,
+            self.plan.use_mlp_full,
+        )
+    }
+
     pub fn begin_packed_session(&self) -> PackedDecodeSession<'a> {
         match self.session_mode() {
             GpuDecodeSessionMode::GpuFirst => PackedDecodeSession::GpuFirst(
