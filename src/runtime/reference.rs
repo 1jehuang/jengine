@@ -859,6 +859,7 @@ struct PackedMlpStageMetrics {
 
 struct GpuFirstRunnerCache<'a> {
     model: &'a ReferenceModel,
+    shared_context: Option<Arc<SharedGpuPackedContext>>,
     attention_blocks: HashMap<(usize, usize), CachedGpuAttentionBlockRunner>,
     mlp_blocks: HashMap<usize, CachedGpuMlpBlockRunner>,
     full_last_layer_block: Option<CachedGpuFullLastLayerRunner>,
@@ -869,11 +870,23 @@ impl<'a> GpuFirstRunnerCache<'a> {
     fn new(model: &'a ReferenceModel, _expected_tokens: usize) -> Self {
         Self {
             model,
+            shared_context: None,
             attention_blocks: HashMap::new(),
             mlp_blocks: HashMap::new(),
             full_last_layer_block: None,
             tail_block: None,
         }
+    }
+
+    fn get_or_create_shared_context(&mut self) -> Result<Arc<SharedGpuPackedContext>, ReferenceError> {
+        if let Some(context) = self.shared_context.as_ref().cloned() {
+            return Ok(context);
+        }
+        let context = SharedGpuPackedContext::new().map_err(|error| {
+            ReferenceError::Decode(format!("gpu-first shared context init failed: {error}"))
+        })?;
+        self.shared_context = Some(context.clone());
+        Ok(context)
     }
 
     fn packed_linear_spec(
@@ -934,7 +947,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 self.model.config.hidden_size,
                 self.model.config.hidden_size,
             )?;
-            let context = self.model.get_or_create_packed_gpu_context()?;
+            let context = self.get_or_create_shared_context()?;
             let runner = CachedGpuAttentionBlockRunner::new_with_context(
                 context,
                 seq_len,
@@ -981,7 +994,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 self.model.config.hidden_size,
                 self.model.config.intermediate_size,
             )?;
-            let context = self.model.get_or_create_packed_gpu_context()?;
+            let context = self.get_or_create_shared_context()?;
             let runner = CachedGpuMlpBlockRunner::new_with_context(
                 context,
                 self.model.config.hidden_size,
@@ -1012,7 +1025,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 self.model.config.vocab_size,
                 self.model.config.hidden_size,
             )?;
-            let context = self.model.get_or_create_packed_gpu_context()?;
+            let context = self.get_or_create_shared_context()?;
             let runner = CachedGpuTailBlockRunner::new_with_context(
                 context,
                 self.model.config.hidden_size,
@@ -1063,7 +1076,7 @@ impl<'a> GpuFirstRunnerCache<'a> {
                 self.model.config.vocab_size,
                 self.model.config.hidden_size,
             )?;
-            let context = self.model.get_or_create_packed_gpu_context()?;
+            let context = self.get_or_create_shared_context()?;
             let runner = CachedGpuFullLastLayerRunner::new_with_context(
                 context,
                 self.model.config.hidden_size,
@@ -6394,6 +6407,12 @@ mod tests {
         unsafe { std::env::remove_var(key) }
     }
 
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     struct ScopedEnvVars(Vec<(&'static str, Option<String>)>);
 
     impl ScopedEnvVars {
@@ -6447,7 +6466,7 @@ mod tests {
         let model =
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed-first model should load");
-        let _guard = env_lock().lock().expect("env lock should be acquired");
+        let _guard = lock_env();
         let result = model
             .generate_packed_greedy("tok2", 1, true, true)
             .expect("packed gpu decode should succeed");
@@ -6502,7 +6521,7 @@ mod tests {
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed-first model should load");
 
-        let _guard = env_lock().lock().expect("env lock should be acquired");
+        let _guard = lock_env();
         let _env = ScopedEnvVars::set(&[
             ("JENGINE_PACKED_ATTENTION_FULL", "1"),
             ("JENGINE_PACKED_MLP_FULL", "1"),
@@ -6533,7 +6552,7 @@ mod tests {
         let model =
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed-first model should load");
-        let _guard = env_lock().lock().expect("env lock should be acquired");
+        let _guard = lock_env();
         let mut session = model.begin_packed_decode_session(2, true, true, true);
         let predicted = match session
             .push_prompt_token(2)
@@ -6574,7 +6593,7 @@ mod tests {
         let model =
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed-first model should load");
-        let _guard = env_lock().lock().expect("env lock should be acquired");
+        let _guard = lock_env();
 
         let legacy = model.begin_packed_decode_session(2, true, true, true);
         assert!(!legacy.is_gpu_first());
@@ -6676,7 +6695,7 @@ mod tests {
         let packed =
             ReferenceModel::load_from_root_with_packed_artifact(dir.path(), artifact_dir.path())
                 .expect("packed model should load");
-        let _guard = env_lock().lock().expect("env lock should be acquired");
+        let _guard = lock_env();
 
         let attention = packed
             .compare_prefill_logits_against(&dense, "tok2", true, false)
